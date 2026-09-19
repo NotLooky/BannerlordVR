@@ -82,9 +82,9 @@ the moment it changes.
 
 ## Melee combat feels terrible
 
-Accurate. It is the top item on the list — full 6DoF motion controls for combat
-are what is being built now. Motion hands exist today as an **experimental**
-toggle in the `End` panel; the gamepad emulation is unaffected either way.
+Accurate, and known. Full 6DoF motion controls for combat are what is being
+built now. Until they land, melee runs on the gamepad mapping like everything
+else.
 
 ---
 

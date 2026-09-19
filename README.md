@@ -6,16 +6,17 @@ rendering, OpenXR.
 Both eye views are rendered by the game's own engine into an OpenXR swapchain —
 not a flat image reprojected into a headset. The world is at 1:1 scale.
 
-> **Alpha.** The mod hooks a closed-source engine. Menus can be broken, crashes
-> happen, some features are experimental. No game files are redistributed.
+> **Alpha.** The mod hooks a closed-source engine. Menus can be broken and
+> crashes happen. No game files are redistributed.
 
 ## Features
 
 * Full 6DoF head movement
 * Native stereo rendering — both eyes rendered by the game engine
 * AFR (Alternate Frame Rendering) for performance
+* Depth reprojection — experimental, see Render modes
 * Head-based aiming
-* Motion controllers as a gamepad — not yet 6DoF
+* Motion controllers as a gamepad
 * DLSS
 * OpenXR
 
@@ -24,7 +25,6 @@ not a flat image reprojected into a headset. The world is at 1:1 scale.
 * Melee is awkward in VR
 * Native stereo is very performance intensive
 * Some UI elements are broken
-* No 6DoF controller interaction yet
 
 ## In development
 
@@ -173,19 +173,33 @@ Only in menus. During play those are your weapons.
   the right — and feed the pad's single cluster. Nothing is lost.
 * Triggers stay analog. Grips are a threshold.
 * Turn the pad off with `gamepad = 0`.
-* **Motion hands** in the settings panel is separate and experimental: hands and
-  melee that track your controllers in space. The pad above works either way.
+
+## Render modes
+
+Switch in the `End` panel. Takes effect at the next mission.
+
+| Mode | How the second eye is produced | Cost |
+| ---- | ------------------------------ | ---- |
+| **AFR** — default | One eye is rendered per frame. The other is its own last real render, submitted with the pose it was drawn at so the compositor reprojects it. Exact geometry, one frame old. | Lowest |
+| **Native stereo** | Both eyes rendered for real, from one engine frame. | Highest |
+| **Depth reprojection** — experimental | One eye is rendered and the other is rebuilt from its depth buffer, so both eyes are the same instant. | Low |
+
+**Depth reprojection has missing edges on the right eye.** Where a near object
+hid something the rendered eye never saw, there is no data to rebuild from, so
+those slivers are filled in rather than drawn. Most visible along the edges of
+things close to you. Try it for the frame rate; expect the artifact.
+
+Config: `stereo_mode = afr`, `nativestereo` or `depth`.
 
 ## In-VR settings
 
 Press `End`. Changes save immediately.
 
-* Stereo mode — AFR or native stereo (applies at the next mission)
+* Stereo mode — see above
 * World scale
 * Resolution scale
 * Sharpening
 * Hide body — on by default
-* Motion hands — experimental
 * UI overlay width and distance
 * Flat-screen geometry
 * Hand calibration

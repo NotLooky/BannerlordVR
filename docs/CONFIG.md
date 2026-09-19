@@ -56,7 +56,6 @@ Deleting the file puts everything back to defaults.
 | `gamepad` | Controllers act as an Xbox pad. |
 | `gamepad_deadzone` | Stick deadzone. |
 | `stick_mouse`, `stick_mouse_speed`, `stick_mouse_stick` | Drive the mouse cursor from a stick, for menus. Exclusive with real mouse input — touch the mouse and it hands back. |
-| `motion_hands` | Experimental motion-control hands and melee. The gamepad emulation keeps working either way. |
 | `grip_align_key`, `grip_calibrate_key`, `grip_default_key` | Rebind the calibration keys (`F11`, `Home`, `Insert`). |
 
 ### Screens and UI
@@ -71,7 +70,7 @@ Deleting the file puts everything back to defaults.
 
 | Key | What it does |
 |---|---|
-| `stereo_mode` | `afr` (the shipping path, cheapest) or `nativestereo` (both eyes rendered for real, much more expensive). Also on the panel; a change takes effect at the next mission. |
+| `stereo_mode` | `afr` (the shipping path, cheapest), `nativestereo` (both eyes rendered for real, much more expensive) or `depth` (experimental depth reprojection — cheap, with missing edges on the right eye). Also on the panel; a change takes effect at the next mission. |
 
 ---
 
