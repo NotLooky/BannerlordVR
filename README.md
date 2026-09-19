@@ -204,21 +204,6 @@ Press `End`. Changes save immediately.
 * Flat-screen geometry
 * Hand calibration
 
-## Configuration
-
-Optional. The built-in defaults are the tested configuration, and the settings
-panel writes the file itself.
-
-To set something by hand, create:
-
-```text
-Documents\Mount and Blade II Bannerlord\Configs\BannerlordVR.cfg
-```
-
-`key = value` per line, `#` or `;` for comments. Only keys you write are
-overridden. Deleting the file restores defaults.
-
-Keys worth touching: [docs/CONFIG.md](docs/CONFIG.md).
 
 ## Logs
 
@@ -234,10 +219,6 @@ as `*.prev.log`.
 
 Common failures: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-## Build from source
-
-Requires an installed copy of the game; the mod compiles against its assemblies
-and none are redistributed here. See [docs/BUILDING.md](docs/BUILDING.md).
 
 ## License
 
@@ -255,3 +236,4 @@ TaleWorlds Entertainment. No game files or assemblies are redistributed.
 **Single-player only.** `MultiplayerModule` is disabled deliberately: camera and
 input hooks are indistinguishable from cheating to other players and to
 TaleWorlds' server logic. Do not work around it.
+This mod was build with the help of Claude code.
