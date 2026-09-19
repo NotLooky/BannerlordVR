@@ -58,7 +58,7 @@ Other headsets may work through SteamVR. Untested — open an issue either way.
 > [Releases](../../releases) page.
 
 1. Install and enable **Bannerlord.Harmony**.
-2. Download the release ZIP.
+2. Download the **BannerlordVR** release ZIP.
 3. Extract into your Bannerlord folder:
 
    ```text
@@ -77,9 +77,7 @@ Other headsets may work through SteamVR. Untested — open an issue either way.
 4. Start your OpenXR runtime (Virtual Desktop Streamer or SteamVR) and confirm
    it is the active one.
 5. Launch Bannerlord, enable **Bannerlord VR** in the launcher, below Harmony.
-6. Load a custom battle.
 
-No config file is needed.
 
 Greyed-out checkbox in the launcher = Harmony missing or not enabled.
 
@@ -102,16 +100,14 @@ prompt works unchanged.
 | X — left controller | X | Kick |
 | Y — left controller | Y | Interact — pick up, open, talk |
 | Right grip | RB | Switch equipment |
-| Left grip | LB | Show indicators |
-| Right stick click | R3 | Lock target |
-| Left stick click | L3 | Toggle camera |
+| Left grip | LB | Show indicators/command army |
 
-Attack direction follows the right stick, as on a pad.
+Attack direction follows the Left stick movement, Make sure you choose **Attack and Block by movement**.
 
-### D-pad — hold left stick click, push right stick
+### D-pad — press and hold left stick , move right stick up,down,right,or left
 
 VR controllers have no D-pad and several screens bind nothing else. So it is a
-chord: **hold the left thumbstick in, then push the right thumbstick.**
+chord: **press and hold left stick , move right stick up,down,right,or left**
 
 | Direction | In a battle | In the order menu |
 | --------- | ----------- | ----------------- |
