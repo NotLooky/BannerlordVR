@@ -1,0 +1,28 @@
+name: Feedback or feature request
+description: How something feels in VR, hardware that worked or did not, or something you want
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Comfort and "how it feels" reports are as useful as bug reports on a VR
+        mod, and much harder to get. So are reports of a headset or runtime
+        nobody has tried yet — say what happened either way.
+
+        Already known and being worked on, no need to file: melee combat being
+        awkward, native stereo being expensive, broken UI elements, and motion
+        controls not being full 6DoF yet.
+
+  - type: textarea
+    id: body
+    attributes:
+      label: What is on your mind
+    validations:
+      required: true
+
+  - type: input
+    id: setup
+    attributes:
+      label: Headset, runtime and GPU
+      description: Only if it is relevant to what you are describing.
+      placeholder: "Quest 3, VDXR, RTX 4080"

@@ -1,0 +1,128 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- =====================================================================
+       BannerlordVR - managed layer (game logic, camera, UI, input)
+       Targets net472 because Bannerlord hosts Mono with .NET Framework
+       reference assemblies. Must be x64 to P/Invoke BannerlordVR.Native.dll.
+       ===================================================================== -->
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <Deterministic>true</Deterministic>
+    <DebugType>portable</DebugType>
+
+    <!-- Build into a local staging dir. tools\deploy.ps1 (invoked after build)
+         copies ONLY our own artifacts into the game. This is deliberate: writing
+         straight into the module folder is how it filled up with copies of the
+         game's own assemblies. -->
+    <OutputPath>$(MSBuildThisFileDirectory)..\..\build\managed\</OutputPath>
+
+    <!-- Override with: dotnet build -p:BannerlordDir="D:\path\to\Bannerlord" -->
+    <BannerlordDir Condition="'$(BannerlordDir)' == ''">E:\steam\steamapps\common\Mount &amp; Blade II Bannerlord</BannerlordDir>
+    <GameBinDir>$(BannerlordDir)\bin\Win64_Shipping_Client</GameBinDir>
+    <NativeModuleBinDir>$(BannerlordDir)\Modules\Native\bin\Win64_Shipping_Client</NativeModuleBinDir>
+    <ModuleDeployDir>$(BannerlordDir)\Modules\BannerlordVR</ModuleDeployDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reference assemblies for net472, so the build does not depend on a
+         machine-wide targeting pack being installed. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+
+    <!-- Compile-time only. The Bannerlord.Harmony module supplies 0Harmony.dll
+         at runtime, so ShipHarmonyPrivately is false and we do not copy it -
+         but the reference must STAY or HarmonyLib will not resolve at build.
+         Compiled against 2.2.2, runs against whatever that module ships (2.4.2
+         today). Safe because 0Harmony is not strong-named, so the loader
+         ignores the reference version entirely. -->
+    <PackageReference Include="Lib.Harmony" Version="2.2.2" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <ShipHarmonyPrivately>false</ShipHarmonyPrivately>
+  </PropertyGroup>
+
+  <!-- =====================================================================
+       Game assemblies. Private=false on EVERY one of these.
+       Without it, MSBuild copies the entire game into the module folder and
+       Mono can bind against the duplicates, producing type-identity errors
+       that surface as unrelated-looking crashes.
+       ===================================================================== -->
+  <ItemGroup>
+    <!-- Core -->
+    <GameReference Include="TaleWorlds.MountAndBlade" />
+    <GameReference Include="TaleWorlds.Engine" />
+    <GameReference Include="TaleWorlds.Library" />
+    <GameReference Include="TaleWorlds.Core" />
+    <GameReference Include="TaleWorlds.DotNet" />
+    <GameReference Include="TaleWorlds.ScreenSystem" />
+    <GameReference Include="TaleWorlds.InputSystem" />
+    <GameReference Include="TaleWorlds.Localization" />
+    <GameReference Include="TaleWorlds.ObjectSystem" />
+    <GameReference Include="TaleWorlds.CampaignSystem" />
+
+    <!-- Gauntlet / 2D stack (Phase 5) -->
+    <GameReference Include="TaleWorlds.GauntletUI" />
+    <GameReference Include="TaleWorlds.GauntletUI.Data" />
+    <GameReference Include="TaleWorlds.Engine.GauntletUI" />
+    <GameReference Include="TaleWorlds.TwoDimension" />
+
+    <!-- ViewModelCollection also lives in bin\ -->
+    <GameReference Include="TaleWorlds.MountAndBlade.ViewModelCollection" />
+
+    <!-- The View layer lives in the Native MODULE folder, not bin\ -->
+    <NativeModuleReference Include="TaleWorlds.MountAndBlade.View" />
+    <NativeModuleReference Include="TaleWorlds.MountAndBlade.GauntletUI" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Private=false on every one of these. Without it MSBuild copies the whole
+         game into the module folder (see the DeployToGame comment above). -->
+    <Reference Include="@(GameReference)">
+      <HintPath>$(GameBinDir)\%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="@(NativeModuleReference)">
+      <HintPath>$(NativeModuleBinDir)\%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- =====================================================================
+       Guard rail: fail loudly and early if the game path is wrong, rather than
+       emitting 40 confusing "type or namespace not found" errors.
+       ===================================================================== -->
+  <Target Name="VerifyGamePaths" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(GameBinDir)\TaleWorlds.Engine.dll')"
+           Text="Bannerlord not found at '$(BannerlordDir)'. Pass -p:BannerlordDir=&quot;...&quot;." />
+    <Error Condition="!Exists('$(NativeModuleBinDir)\TaleWorlds.MountAndBlade.View.dll')"
+           Text="Native module assemblies not found at '$(NativeModuleBinDir)'." />
+  </Target>
+
+  <!-- =====================================================================
+       Deploy. Copies our artifacts only; never the game's own assemblies.
+       ===================================================================== -->
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">
+    <ItemGroup>
+      <DeployBin Include="$(OutputPath)BannerlordVR.dll" />
+      <DeployBin Include="$(OutputPath)BannerlordVR.pdb" Condition="Exists('$(OutputPath)BannerlordVR.pdb')" />
+      <DeployBin Include="$(OutputPath)0Harmony.dll" Condition="'$(ShipHarmonyPrivately)' == 'true' And Exists('$(OutputPath)0Harmony.dll')" />
+      <DeployNative Include="$(MSBuildThisFileDirectory)..\..\build\native\*.dll" />
+      <DeployModule Include="$(MSBuildThisFileDirectory)..\..\module\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(DeployBin)" DestinationFolder="$(ModuleDeployDir)\bin\Win64_Shipping_Client\" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(DeployNative)" DestinationFolder="$(ModuleDeployDir)\bin\Win64_Shipping_Client\" SkipUnchangedFiles="true" Condition="'@(DeployNative)' != ''" />
+    <Copy SourceFiles="@(DeployModule)" DestinationFiles="@(DeployModule->'$(ModuleDeployDir)\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="BannerlordVR deployed -> $(ModuleDeployDir)" />
+  </Target>
+
+</Project>

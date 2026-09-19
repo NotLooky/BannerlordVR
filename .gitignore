@@ -1,0 +1,23 @@
+build/
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+CMakeCache.txt
+CMakeFiles/
+
+# native/thirdparty/ holds git submodules. They are tracked as gitlinks, so they
+# must NOT be ignored - ignoring them makes `git submodule add` fail outright.
+
+# release zips
+dist/
+
+# tooling scratch
+tools/__pycache__/
+
+# Research notes kept out of the public repo: static RE of the engine, and
+# technique notes on other VR mods. They stay on disk; they are not published.
+docs/engine-re-findings.md
+docs/reference-vr-mods.md

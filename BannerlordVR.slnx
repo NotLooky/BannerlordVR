@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/managed/">
+    <Project Path="managed/BannerlordVR/BannerlordVR.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BannerlordVR.MathTests/BannerlordVR.MathTests.csproj" />
+  </Folder>
+</Solution>

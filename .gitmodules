@@ -1,0 +1,6 @@
+[submodule "native/thirdparty/minhook"]
+	path = native/thirdparty/minhook
+	url = https://github.com/TsudaKageyu/minhook.git
+[submodule "native/thirdparty/OpenXR-SDK"]
+	path = native/thirdparty/OpenXR-SDK
+	url = https://github.com/KhronosGroup/OpenXR-SDK.git

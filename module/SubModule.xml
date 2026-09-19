@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Module>
+  <Name value="Bannerlord VR" />
+  <Id value="BannerlordVR" />
+  <Version value="v0.1.0" />
+  <SingleplayerModule value="true" />
+
+  <!-- Deliberately false. The camera and input hooks are indistinguishable from
+       cheating to other players and to TaleWorlds' server logic. -->
+  <MultiplayerModule value="false" />
+
+  <DependedModules>
+    <DependedModule Id="Native" />
+    <DependedModule Id="SandBoxCore" />
+    <!-- "Sandbox", lowercase b. The FOLDER is Modules\SandBox, but the Id
+         declared inside its SubModule.xml is "Sandbox". Matching the folder
+         name here makes the dependency unresolvable and the launcher greys
+         out our checkbox. -->
+    <DependedModule Id="Sandbox" />
+    <DependedModule Id="StoryMode" />
+    <!-- Verified against Modules/Bannerlord.Harmony/SubModule.xml: the Id is
+         "Bannerlord.Harmony". Its <Name> is the bare "Harmony", which is what
+         the launcher DISPLAYS - declaring that as the Id greys us out exactly
+         the way the Sandbox case above does. -->
+    <DependedModule Id="Bannerlord.Harmony" />
+  </DependedModules>
+
+  <SubModules>
+    <SubModule>
+      <Name value="BannerlordVR" />
+      <DLLName value="BannerlordVR.dll" />
+      <SubModuleClassType value="BannerlordVR.SubModule" />
+      <Tags>
+        <Tag key="DedicatedServerType" value="none" />
+        <Tag key="IsNoRenderModeElement" value="false" />
+      </Tags>
+    </SubModule>
+  </SubModules>
+</Module>

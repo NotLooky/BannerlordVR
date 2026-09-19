@@ -1,0 +1,124 @@
+name: Bug report
+description: Something is broken, crashing, or not appearing in the headset
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: **[docs/TROUBLESHOOTING.md](../blob/main/docs/TROUBLESHOOTING.md)**
+        covers the common ones, including a black headset, no head tracking, and
+        the module being greyed out in the launcher.
+
+        This is an alpha. Rough edges are expected — the useful reports are the
+        ones with logs attached.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+      placeholder: |
+        Loaded a custom battle in AFR. About ten seconds in, the headset froze
+        while the monitor kept running at full speed.
+    validations:
+      required: true
+
+  - type: input
+    id: game-version
+    attributes:
+      label: Bannerlord version
+      description: The mod supports 1.4.8. Anything else is very likely the cause.
+      placeholder: "1.4.8"
+    validations:
+      required: true
+
+  - type: input
+    id: mod-version
+    attributes:
+      label: BannerlordVR version
+      description: From the launcher's Mods tab, or the first line of BannerlordVR.log.
+      placeholder: "v0.1.0-alpha.1"
+    validations:
+      required: true
+
+  - type: input
+    id: headset
+    attributes:
+      label: Headset
+      placeholder: "Quest 3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: OpenXR runtime
+      options:
+        - VDXR (Virtual Desktop)
+        - SteamVR
+        - MetaXR / Oculus (not supported)
+        - Other (say which below)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Stereo mode
+      description: From the in-VR panel (End key).
+      options:
+        - AFR
+        - Native stereo
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: GPU and CPU
+      placeholder: "RTX 4080 SUPER, 9800X3D"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        **Attach both files.** Drag them into this box.
+
+        ```
+        Documents\Mount and Blade II Bannerlord\Logs\BannerlordVR.log
+        Documents\Mount and Blade II Bannerlord\Logs\BannerlordVR.Native.log
+        ```
+
+        They are rewritten on every launch, so grab them before relaunching. If
+        the game crashed and you have already restarted, the previous run is
+        still there as `BannerlordVR.prev.log` and `BannerlordVR.Native.prev.log`.
+
+        The native log records where the game died. Without it, a crash report
+        cannot be acted on.
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Changed config settings
+      description: |
+        If you edited `BannerlordVR.cfg`, paste the lines you changed. If you
+        have not touched it, say so — that is useful too.
+      render: ini
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: Bannerlord.Harmony is installed, enabled, and above BannerlordVR in the load order
+          required: true
+        - label: My OpenXR runtime was running before I launched the game
+          required: true
+        - label: I searched the existing issues
+          required: true
