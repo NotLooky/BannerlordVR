@@ -89,7 +89,7 @@ namespace BannerlordVR.VR
         // BodyYaw is integrated from the mouse now and never reads the game look,
         // so the two are no longer in tension: the head turns the view whatever
         // the injection does. See the class note.
-        private static readonly bool DriveYaw = VrConfig.Bool("head_drive_yaw", false);
+        private static readonly bool DriveYaw = VrConfig.Bool("head_drive_yaw", true);
 
         // Pitch has no such problem and stays on. The anchor is yaw-only by
         // construction, so head pitch is never taken back out of the view and the

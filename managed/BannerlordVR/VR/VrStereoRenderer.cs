@@ -72,7 +72,7 @@ namespace BannerlordVR.VR
         private static readonly bool UseShadows = VrConfig.Bool("eye_shadows", false);
         private static readonly bool UsePostfx = VrConfig.Bool("eye_postfx", false);
         private static readonly int RenderOrder = VrConfig.Int("eye_order", -10);
-        private static readonly bool PushCamerasEveryFrame = VrConfig.Bool("eye_pushcam", false);
+        private static readonly bool PushCamerasEveryFrame = VrConfig.Bool("eye_pushcam", true);
         private static readonly bool StereoEnabled = VrConfig.Bool("stereo", true);
         private static readonly bool UseContour = VrConfig.Bool("eye_contour", false);
         private static readonly bool SceneOcclusion = VrConfig.Bool("scene_occlusion", true);

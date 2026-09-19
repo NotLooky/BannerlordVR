@@ -106,7 +106,10 @@ namespace BannerlordVR.VR
                 { "afr_camera_mode", "engine" },  // move CombatCamera itself
                 { "afr_engine_fov",  "1" },       // and give it the headset frustum
                 { "vp_patch",        "0" },       // nothing left downstream to fix
-                { "engine_aim",      "0" },       // nothing left to steer by proxy
+                // engine_aim is NOT in this bundle, though the reasoning above
+                // says it should be: every tested config has overridden it back
+                // to 1, so the bundle's 0 has never actually run. Leaving it here
+                // would mean the no-config player is the only one getting it.
                 { "symmetric_fov",   "1" },       // one frustum for both eyes
             };
 
@@ -140,9 +143,14 @@ namespace BannerlordVR.VR
             get
             {
                 Load();
+                // engine-camera, not vp, because a player who never opens the
+                // config file must get the architecture this was tested on. The
+                // note above says getting three of the four keys right is worse
+                // than either mode; defaulting to the mode that was never played
+                // is the same trap with no config file to blame it on.
                 return Values.TryGetValue("mode", out string value) && value.Length > 0
                     ? value.Trim().ToLowerInvariant()
-                    : "vp";
+                    : "engine-camera";
             }
         }
 

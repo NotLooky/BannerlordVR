@@ -158,8 +158,8 @@ Not in `docs/`. The two places that are kept current are:
 
 - **`config/BannerlordVR.cfg`** — a research journal as much as a config file.
   Every experiment is recorded next to the key it set, with its result. It is
-  *not* what ships to users; `tools/package-release.ps1` flattens the live
-  config into a clean one for the zip.
+  *not* what ships to users, and nothing derived from it ships either - the
+  built-in defaults in the source are the tested configuration.
 - **The commit messages.** They are written to be read later and carry the
   reasoning that never made it into a comment.
 

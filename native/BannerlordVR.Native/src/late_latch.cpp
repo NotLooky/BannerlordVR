@@ -61,7 +61,7 @@ bool probe_on()
 bool latch_on()
 {
     static bool cached = false, have = false;
-    if (!have) { have = true; cached = config_bool("late_latch", false); }
+    if (!have) { have = true; cached = config_bool("late_latch", true); }
     return cached;
 }
 

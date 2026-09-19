@@ -9,10 +9,10 @@
     was played and judged on. Packaging anything else ships something nobody
     tested.
 
-    The config is flattened rather than copied. config\BannerlordVR.cfg and the
-    live one in Documents are both research journals - hundreds of kilobytes of
-    recorded experiments, with the same key set a dozen times and the last one
-    winning. Users get the resolved values, one line each, with a short header.
+    No config file is shipped. The mod's built-in defaults are the tested
+    configuration, so an absent BannerlordVR.cfg is the correct starting state -
+    and shipping one would mean shipping whatever probes, experiments and hand
+    calibration happened to be in it on the day.
 
 .EXAMPLE
     pwsh tools\package-release.ps1 -Version 0.1.0-alpha.1
@@ -24,10 +24,6 @@ param(
     [string]$Version,
 
     [string]$BannerlordDir = 'E:\steam\steamapps\common\Mount & Blade II Bannerlord',
-
-    # The config the release is built from. Defaults to the live one, because
-    # that is the file the game actually read during testing.
-    [string]$ConfigSource = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Mount and Blade II Bannerlord\Configs\BannerlordVR.cfg'),
 
     [string]$OutDir
 )
@@ -72,62 +68,7 @@ if ($declared -notlike "*$Version*") {
     Write-Warning "SubModule.xml declares '$declared' but this release is '$Version'."
 }
 
-# --- 2. flatten the config ------------------------------------------------
-if (-not (Test-Path $ConfigSource)) {
-    throw "Config not found at '$ConfigSource'."
-}
-
-$order = New-Object System.Collections.Generic.List[string]
-$values = @{}
-$duplicates = 0
-
-foreach ($line in Get-Content $ConfigSource) {
-    $trimmed = $line.Trim()
-    if ($trimmed -eq '' -or $trimmed.StartsWith('#') -or $trimmed.StartsWith(';')) { continue }
-
-    $eq = $trimmed.IndexOf('=')
-    if ($eq -lt 1) { continue }
-
-    $key = $trimmed.Substring(0, $eq).Trim()
-    $value = $trimmed.Substring($eq + 1)
-
-    # Strip a trailing comment, which the journal uses heavily.
-    foreach ($marker in '#', ';') {
-        $at = $value.IndexOf($marker)
-        if ($at -ge 0) { $value = $value.Substring(0, $at) }
-    }
-    $value = $value.Trim()
-
-    if ($values.ContainsKey($key)) { $duplicates++ } else { $order.Add($key) }
-    $values[$key] = $value
-}
-
-Write-Host ""
-Write-Host "Config: $($order.Count) settings ($duplicates duplicate assignments resolved, last wins)"
-
-$header = @(
-    '# ==========================================================================='
-    "#  BannerlordVR $Version - tested configuration"
-    '#'
-    '#  Read by both the managed mod and the native DLL at startup. Edit, save,'
-    '#  and restart the game.'
-    '#'
-    '#  Every line is key = value. A line starting with # or ; is a comment.'
-    '#'
-    '#  These are the values this release was tested on, with the development'
-    '#  journal stripped out. Most settings also live on the in-VR panel (End),'
-    '#  which writes its changes back here.'
-    '#'
-    '#  See docs/CONFIG.md for which keys are meant to be touched. A key that is'
-    '#  not listed there is development machinery - changing one is how you get a'
-    '#  build that behaves like nothing anyone can reproduce.'
-    '# ==========================================================================='
-    ''
-)
-
-$body = foreach ($key in $order) { "$key = $($values[$key])" }
-
-# --- 3. stage and zip -----------------------------------------------------
+# --- 2. stage and zip -----------------------------------------------------
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) "bvr-release-$Version"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 
@@ -139,8 +80,6 @@ if ($PSCmdlet.ShouldProcess($stage, 'stage release')) {
 
     # PDBs are useful to us and noise to everyone else.
     Get-ChildItem $stageModule -Recurse -Filter *.pdb | Remove-Item -Force
-
-    ($header + $body) | Set-Content (Join-Path $stage 'BannerlordVR.cfg') -Encoding utf8
 
     foreach ($doc in 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md') {
         Copy-Item (Join-Path $repoRoot $doc) -Destination $stage -Force

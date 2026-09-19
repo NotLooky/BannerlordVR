@@ -48,6 +48,23 @@ Note down what is broken. It goes in the release notes rather than into an
 issue tracker after the fact — an alpha that lists its own faults gets useful
 reports back, and one that does not gets the same three duplicates.
 
+### Then play it once with no config file
+
+**Rename your own `BannerlordVR.cfg` out of the way and play a battle.** Users
+have no config file, so the built-in defaults are the only thing they get, and
+this is the only check that they still are what you play on.
+
+The defaults drift. Every setting proven in a test run gets written into the
+live config and nowhere else, so the source keeps whatever it was born with
+while the config quietly becomes the real specification. `late_latch` spent its
+whole life defaulting to off. Anything you find here is a source change, not a
+config to ship:
+
+```powershell
+# what your config overrides, and what the code would have used instead
+git grep -hoE '(config_bool|config_float|config_int|config_string|VrConfig\.(Bool|Float|Int|String))\("[a-z_]+", *[^)]+' -- managed native
+```
+
 ## 4. Changelog
 
 Write it from the commit messages. They carry the reasoning; the changelog
@@ -59,8 +76,9 @@ carries what a player notices.
 pwsh tools\package-release.ps1 -Version 0.1.0-alpha.1
 ```
 
-This packages the module **from the game folder** — what you just played — and
-flattens the live config into a clean one. It writes `dist\BannerlordVR-<version>.zip`.
+This packages the module **from the game folder** — what you just played. No
+config is shipped: the built-in defaults are the tested configuration. It writes
+`dist\BannerlordVR-<version>.zip`.
 
 ## 6. Verify the zip on a clean module folder
 

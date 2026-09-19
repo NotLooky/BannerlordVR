@@ -41,7 +41,7 @@ namespace BannerlordVR.VR
         /// currently running. Turning this off takes AFR off the menu entirely
         /// rather than leaving a toggle that silently does nothing.
         /// </summary>
-        private static readonly bool Allowed = VrConfig.Bool("afr", false);
+        private static readonly bool Allowed = VrConfig.Bool("afr", true);
 
         /// <summary>
         /// True while alternate-frame rendering is the active strategy. Everything

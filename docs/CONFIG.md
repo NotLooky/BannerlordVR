@@ -1,26 +1,29 @@
 # Configuration
 
-One file, read by both halves of the mod at startup:
+**There is no config file until you make one, and you do not need one.** The
+mod's built-in defaults are the settings it was tested on, and the in-VR panel
+(`End`) covers what you actually want to change while playing — it creates the
+file itself and writes to it as soon as you change something.
+
+If you want to set something by hand, create:
 
 ```
 Documents\Mount and Blade II Bannerlord\Configs\BannerlordVR.cfg
 ```
 
-Every line is `key = value`. `#` or `;` starts a comment. Edit it, save it, and
+Every line is `key = value`. `#` or `;` starts a comment. Only the keys present
+in the file are overridden; everything else keeps its default. Edit, save, and
 restart the game — launch it however you normally do, Steam included.
 
-**Most people never need to open this file.** The in-VR panel (`End`) covers
-what you actually want to change while playing, and writes it back here as soon
-as you change it.
+Deleting the file puts everything back to defaults.
 
 > **A warning worth taking seriously.** The config file exposes nearly every
 > internal switch in the mod, including the ones an experiment was hung on for
 > an afternoon. **If a key is not listed on this page, treat it as development
 > machinery rather than a setting** — that goes double for anything named
 > `*_probe`, `*_census`, `*_measure` or `*_debug`. Some combinations are known
-> to be broken with each other. If you change one and the mod misbehaves,
-> restore the `BannerlordVR.cfg` that came with the release before reporting
-> anything.
+> to be broken with each other. If you change one and the mod misbehaves, delete
+> the file and restart before reporting anything.
 
 ---
 
@@ -72,10 +75,12 @@ as you change it.
 
 ---
 
-## Rebuilding a clean config
+## Starting over
 
-If your config gets into a state you cannot explain, delete it and copy the
-`BannerlordVR.cfg` from the release zip back in. That file is generated from the
-exact configuration the release was tested on, with every duplicate resolved —
-it is not the same file as `config/BannerlordVR.cfg` in this repository, which is
-a development journal and is not meant to be played on.
+If your config gets into a state you cannot explain, **delete the file**. The
+built-in defaults are the tested configuration, so an absent file is a known-good
+one.
+
+Note that `config/BannerlordVR.cfg` in this repository is *not* a config to copy
+in. It is a development journal — the same key set dozens of times with each
+experiment's result recorded next to it — and it is not meant to be played on.

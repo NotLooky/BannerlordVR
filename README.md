@@ -104,24 +104,7 @@ Mount & Blade II Bannerlord\
 The `bin` folder belongs **inside** `Modules\BannerlordVR`, not in the game's own
 `bin` folder at the root of the installation.
 
-### 4. Install the configuration file
-
-Copy:
-
-```text
-BannerlordVR.cfg
-```
-
-to:
-
-```text
-Documents\Mount and Blade II Bannerlord\Configs
-```
-
-A tested configuration is included with the release. If no configuration file is
-found, the mod will use its built-in defaults.
-
-### 5. Start your OpenXR runtime
+### 4. Start your OpenXR runtime
 
 Start your preferred OpenXR runtime before launching Bannerlord.
 
@@ -132,13 +115,13 @@ For example:
 
 Make sure the correct OpenXR runtime is active before starting the game.
 
-### 6. Launch Bannerlord
+### 5. Launch Bannerlord
 
 Start Bannerlord and enable **Bannerlord VR** in the launcher.
 
 Make sure **Bannerlord VR is loaded below Harmony** in the module load order.
 
-### 7. Start a mission
+### 6. Start a mission
 
 Load into a mission or custom battle.
 
@@ -290,7 +273,7 @@ Available settings include:
 * World scale
 * Resolution scale
 * Sharpening
-* Hide body
+* Hide body — on by default; turn it off to see your own body
 * Motion hands — experimental
 * UI overlay width
 * UI overlay distance
@@ -301,16 +284,21 @@ Some settings, such as stereo mode, take effect on the next mission.
 
 ## Configuration
 
-The configuration file is located at:
+**You do not need a configuration file.** The mod ships with the settings it was
+tested on as its built-in defaults, and the in-VR panel covers the rest. This
+section is for tuning, not for installing.
+
+If you want to change something the panel does not offer, create:
 
 ```text
 Documents\Mount and Blade II Bannerlord\Configs\BannerlordVR.cfg
 ```
 
-The configuration uses simple `key = value` entries. A line beginning with `#`
-or `;` is a comment.
+The file uses simple `key = value` entries. A line beginning with `#` or `;` is
+a comment. Only the keys you write are overridden; everything else keeps its
+default. Some changes require restarting the game.
 
-Some changes require restarting the game.
+Deleting the file puts everything back to defaults.
 
 More information is available in [docs/CONFIG.md](docs/CONFIG.md).
 
