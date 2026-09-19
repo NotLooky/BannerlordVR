@@ -81,9 +81,9 @@ Other headsets may work through SteamVR. Untested — open an issue either way.
 
 Greyed-out checkbox in the launcher = Harmony missing or not enabled.
 
-## Controls
+## Motion Controls as gamepad
 
-Your head is the camera. Your controllers are an **Xbox gamepad** — the game
+Your head is the camera. Your motioncontrollers are an **Xbox gamepad** — the game
 never learns they are VR controllers, so every gamepad binding and on-screen
 prompt works unchanged.
 
