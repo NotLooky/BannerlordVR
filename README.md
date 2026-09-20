@@ -170,7 +170,7 @@ Config: `stereo_mode = afr`, `nativestereo` or `depth`.
 
 ## What i noticed to improved performance
 * Disable **Screen space reflection** for better performance
-* Disable **Dynamic shadows** cost is high 
+* Disable **Dynamic shadows**  
 * Lower **Army Max sizes**
 * Lower Resolution Scale
 * Enable DLSS
