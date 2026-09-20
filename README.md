@@ -52,6 +52,7 @@ Bannerlord is CPU-bound before VR is involved. VR adds to that.
 
 Other headsets may work through SteamVR. Untested — open an issue either way.
 
+
 ## Installation
 
 >BannerlordVR ZIP will be posted on the
@@ -89,6 +90,7 @@ Greyed-out checkbox in the launcher = Harmony missing or not enabled.
 | `F10` | Recenter |
 
 
+
 ## Motion Controls as gamepad
 
 Your head is the camera. Your motioncontrollers are an **Xbox gamepad** — the game
@@ -124,12 +126,6 @@ chord: **press and hold left stick , move right stick up,down,right,or left**
 | Left | View character | Select left formation |
 | Right | Push to talk | Select right formation |
 
-Triggers, grips and face buttons keep working while you hold it. Only the right
-stick is borrowed. Holding the stick in also sends L3, so the camera toggle
-fires as you take the chord.
-
-Disable with `dpad_chord = 0`.
-
 ### Giving orders
 
 | VR input | Pad | Order |
@@ -152,25 +148,6 @@ Disable with `dpad_chord = 0`.
 | Left stick click | L3 | Camera follow mode |
 | Right stick click | R3 | Track settlement |
 
-### Menus
-
-The left stick drives a real mouse pointer, because the map, the inventory grid
-and anything with a scrollbar assume one.
-
-| VR input | Does |
-| -------- | ---- |
-| Left stick | Move the pointer |
-| Right trigger | Left click |
-| Left trigger | Right click |
-
-Only in menus. During play those are your weapons.
-
-### Notes
-
-* Face buttons split across two controllers — X and Y on the left, A and B on
-  the right — and feed the pad's single cluster. Nothing is lost.
-* Triggers stay analog. Grips are a threshold.
-* Turn the pad off with `gamepad = 0`.
 
 ## Render modes
 
@@ -189,6 +166,17 @@ things close to you. Try it for the frame rate; expect the artifact.
 
 Config: `stereo_mode = afr`, `nativestereo` or `depth`.
 
+
+
+## What i noticed to improved performance
+* Disable **Screen space reflection** for better performance
+* Disable **Dynamic shadows** cost is high 
+* Lower **Army Max sizes**
+* Lower Resolution Scale
+* Enable DLSS
+
+
+
 ## In-VR settings
 
 Press `End`. Changes save immediately.
@@ -196,11 +184,10 @@ Press `End`. Changes save immediately.
 * Stereo mode — see above
 * World scale
 * Resolution scale
-* Sharpening
-* Hide body — on by default
+* CAS Sharpening
 * UI overlay width and distance
 * Flat-screen geometry
-* Hand calibration
+
 
 
 ## Logs
