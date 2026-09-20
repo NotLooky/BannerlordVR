@@ -81,6 +81,14 @@ Other headsets may work through SteamVR. Untested — open an issue either way.
 
 Greyed-out checkbox in the launcher = Harmony missing or not enabled.
 
+### VR-Settings
+
+| Key | Action |
+| --- | ------ |
+| `End` | In-VR settings panel |
+| `F10` | Recenter |
+
+
 ## Motion Controls as gamepad
 
 Your head is the camera. Your motioncontrollers are an **Xbox gamepad** — the game
@@ -156,16 +164,6 @@ and anything with a scrollbar assume one.
 | Left trigger | Right click |
 
 Only in menus. During play those are your weapons.
-
-### Keyboard
-
-| Key | Action |
-| --- | ------ |
-| `End` | In-VR settings panel |
-| `F10` | Recenter |
-| `Home` | Start grip calibration |
-| `F11` | Restore grip calibration |
-| `Insert` | Default grip |
 
 ### Notes
 
