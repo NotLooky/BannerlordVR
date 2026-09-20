@@ -217,6 +217,7 @@ OpenXR SDK loader, JsonCpp, Harmony. See
 
 Unofficial fan project. Not affiliated with, approved by or endorsed by
 TaleWorlds Entertainment. No game files or assemblies are redistributed.
+This project is build with the help of Claude code.
 
 **Single-player only.** `MultiplayerModule` is disabled deliberately: camera and
 input hooks are indistinguishable from cheating to other players and to
