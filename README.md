@@ -57,7 +57,7 @@ Other headsets may work through SteamVR. Untested — open an issue either way.
 > No download yet. The first alpha will be posted on the
 > [Releases](../../releases) page.
 
-1. Install and enable **Bannerlord.Harmony**.
+1. Install and enable **[Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)**.
 2. Download the **BannerlordVR** release ZIP.
 3. Extract into your Bannerlord folder:
 
