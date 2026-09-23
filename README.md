@@ -25,7 +25,8 @@ not a flat image reprojected into a headset. The world is at 1:1 scale.
 * Melee is awkward in VR
 * Native stereo is very performance intensive
 * Some UI elements are broken
-
+* for some reason Windows security block the mod dll, you can bypass that by adding an exclusion in
+windows security -> virus and threat protection -> virus and threat protection settings Manage settings-> add exclusion to the mod folder.
 ## In development
 
 * Full 6DoF motion controls
