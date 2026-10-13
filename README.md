@@ -4,6 +4,7 @@
 
 Swing your sword, raise your shield, draw a bow by hand, and reach for weapons on your body. Look around naturally with six degrees of freedom (6DoF) head tracking, with stereo views produced by the game's renderer.
 
+Disclaimer: The mod is build with the help of Claude Code.
 [Downloads](https://github.com/NotLooky/BannerlordVR/releases) · [Report a bug](https://github.com/NotLooky/BannerlordVR/issues/new/choose)
 
 > **v0.2.0-alpha.1 is available:** [download the physical-controls build](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.0-alpha.1). **Native stereo and 1.00 resolution scale are the release defaults.** This ZIP was built and tested against Bannerlord v1.5.5. Alpha quality: expect glitches, unfinished UI, and crashes. [Changelog](CHANGELOG.md).
