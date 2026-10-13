@@ -6,21 +6,19 @@ Swing your sword, raise your shield, draw a bow by hand, and reach for weapons o
 
 [Downloads](https://github.com/NotLooky/BannerlordVR/releases) · [Report a bug](https://github.com/NotLooky/BannerlordVR/issues/new/choose)
 
-> **Physical-controls build: in development.** This README covers the new version. The older **v0.1.0** release does **not** include the physical controls described here, and the development implementation is not yet on the public `main` branch. Use a release explicitly marked as including physical controls when one is published. This is an alpha mod; expect glitches, unfinished UI, and crashes.
+> **v0.2.0-alpha.1 is available:** [download the physical-controls build](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.0-alpha.1). **Native stereo and 1.00 resolution scale are the release defaults.** This ZIP was built and tested against Bannerlord v1.5.5. Alpha quality: expect glitches, unfinished UI, and crashes. [Changelog](CHANGELOG.md).
 
 ## Contents
 
 - [Features](#features)
 - [Requirements and headset support](#requirements-and-headset-support)
 - [Installation](#installation)
-- [First-time setup](#first-time-setup)
 - [Motion-control bindings](#motion-control-bindings)
 - [Weapons and physical combat](#weapons-and-physical-combat)
 - [Movement, riding, and siege equipment](#movement-riding-and-siege-equipment)
 - [Menus, campaign map, and army orders](#menus-campaign-map-and-army-orders)
 - [VR settings and calibration](#vr-settings-and-calibration)
 - [Rendering and performance](#rendering-and-performance)
-- [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Bug reports and feedback](#bug-reports-and-feedback)
 - [Updating and uninstalling](#updating-and-uninstalling)
@@ -63,7 +61,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Download the Latest build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) **when available**. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Download **BannerlordVR-0.2.0-alpha.1.zip** from the [v0.2.0 alpha release](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.0-alpha.1). GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text
@@ -75,8 +73,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
            └── bin/
                └── Win64_Shipping_Client/
                    ├── BannerlordVR.dll
-                   ├── BannerlordVR.Native.dll
-                   └── openxr_loader.dll
+                   └── BannerlordVR.Native.dll
    ```
 
    The mod's `bin` belongs **inside `Modules/BannerlordVR`**. Avoid a second nested `BannerlordVR` folder.
@@ -329,7 +326,7 @@ Logs are rewritten each launch. Copy them before relaunching; the previous run m
 
 ## Development and license
 
-Build instructions and toolchain details: [docs/BUILDING.md](docs/BUILDING.md). An installed copy of Bannerlord is required to compile against the game's assemblies. The physical-controls implementation is still being prepared for publication; building the current public `main` branch does not produce this version.
+Build instructions and toolchain details: [docs/BUILDING.md](docs/BUILDING.md). An installed copy of Bannerlord is required to compile against the game's assemblies. The release ZIP includes the physical-controls build. The public source branch may lag this binary release; see the ZIP's `BUILD-INFO.json` for the source commit and module hashes.
 
 For contributions, describe the issue or proposed change in an issue or pull request and include relevant validation. Rendering or input bugs benefit from exact runtime and hardware details.
 
