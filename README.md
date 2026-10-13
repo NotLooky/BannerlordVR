@@ -34,14 +34,14 @@ Swing your sword, raise your shield, draw a bow by hand, and reach for weapons o
 - **Body holsters and grabbing:** draw equipped weapons by reaching for them, pick up nearby weapons, and release to stow or drop them.
 - **Two-handed weapons:** hold a sword or polearm with both hands and adjust your grip along the shaft.
 - **Manual ranged combat:** take arrows and bolts from behind your shoulder, draw bows, span crossbows, and physically throw throwing weapons.
-- **Body tracking from head and hands:** body movement, arm IK, and room-scale movement without requiring external body trackers.
+- **Body tracking from head and hands:** body movement, arm IK, and room-scale movement.
 - **Physical interactions:** horse reins, saddle mounting, ladder climbing, and siege controls.
 - **VR interface:** controller pointing, wrist HUD, campaign-map controls, and an in-headset settings panel.
 - **Rendering options:** AFR, native stereo, experimental depth reprojection, DLSS support, and optional NVIDIA variable rate shading.
 
 ## Requirements and headset support
 
-- **Mount & Blade II: Bannerlord v1.4.8.** Other game versions are not verified. Steam is the tested installation.
+- **Mount & Blade II: Bannerlord v1.4.8. OR v1.5.5 Beta** Other game versions are not verified. Steam is the tested installation.
 - **Windows 10 or 11, 64-bit**, with a PCVR-capable system.
 - **[Bannerlord.Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)** installed and enabled.
 - A PCVR headset, tracked motion controllers, and an active **OpenXR runtime**.
@@ -63,7 +63,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Download the physical-controls build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) **when available**. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Download the Latest build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) **when available**. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text
@@ -84,17 +84,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 6. Launch Bannerlord. Enable **Bannerlord VR** in the Mods tab and place it **below Harmony**, with its required base-game modules enabled.
 7. Start a single-player mission. A small Custom Battle is a useful place to learn the controls.
 
-Keep the managed DLL, native DLL, loader, and shipped default config from the **same build** together.
 
-## First-time setup
-
-1. Enter a mission, stand in a comfortable neutral pose, and recenter with **F10**. You can also hold the **left stick click for 3 seconds**, keeping the right stick centered.
-2. Open the VR panel with **End**. With both hands empty, holding **both grips for 2 seconds** also toggles it with the shipped control layout.
-3. Under **Motion controls**, enable **Motion controls - full physical combat**. This combines tracked hands, physical combat, body IK, and room-scale movement.
-4. Check height, world scale, and hand alignment. Use the panel's calibration tools if weapons sit incorrectly in your hands.
-5. Draw a weapon from its holster and **keep holding the grip**. Hands can start empty even when weapons are equipped.
-
-These instructions use the new build's shipped layout: `controls_swap_trigger_grip = 1` and `grip_hold = 1`. Your personal config overrides the shipped defaults.
 
 ## Motion-control bindings
 
@@ -104,7 +94,6 @@ These instructions use the new build's shipped layout: `controls_swap_trigger_gr
 
 | Physical input | Action with physical controls enabled |
 | --- | --- |
-| Move your head | Look around; lean and move the viewpoint |
 | Left stick | Move; also provides conventional riding and climbing input |
 | Right stick | Turn / camera control, depending on context |
 | Grip near a weapon or holster | Grab or draw; **hold it to keep holding** |
@@ -127,15 +116,6 @@ These instructions use the new build's shipped layout: `controls_swap_trigger_gr
 
 Face-button names above describe the equivalent button positions. PSVR2 can report as a Touch controller through SteamVR; use the game's Xbox prompts as the reference. Context actions follow Bannerlord's own gamepad bindings and can change if you rebind them.
 
-### Trigger/grip swap
-
-The new layout uses **grips for holding** and index triggers for firing or bumper actions. If your buttons behave the other way around, check your personal config:
-
-```ini
-controls_swap_trigger_grip = 1
-```
-
-Restart after changing it. With `0`, **swap grip and trigger throughout these instructions**, including holsters, bow drawing, menu shortcuts, and the gamepad mapping. Stick and face-button bindings stay the same.
 
 ### D-pad without a D-pad
 
@@ -186,7 +166,7 @@ Weapon weight can make the weapon lag behind quick controller movements. Friendl
 3. Keep holding and bring the arrow to the bow to nock it.
 4. Pull the string hand back, aim along the arrow, and **release that grip to shoot**.
 
-A longer draw gives more power. Releasing before the minimum draw returns the arrow without spending it. `bow_full_draw_m` adjusts the distance needed for full power.
+A longer draw gives more power. Releasing before the minimum draw returns the arrow without spending it. 
 
 ### Crossbow
 
@@ -207,7 +187,7 @@ Draw a javelin, throwing axe, knife, or other throwing weapon, hold the grip, th
 | --- | --- |
 | Room-scale movement | Walk within your play area; the avatar follows through the game's movement system |
 | Physical crouch / lean | Move your head and body with body IK enabled |
-| Mount a riderless horse | With a free hand, grip near its saddle |
+| Mount a horse | With a free hand, grip near its saddle |
 | Hold reins | Grip the reins with a free hand |
 | Steer with reins | Move the holding hand left or right from its grab position |
 | Increase riding speed | Flick the rein hand up, then down |
@@ -260,7 +240,7 @@ These are context bindings, not fixed troop commands. Follow the current on-scre
 
 ## VR settings and calibration
 
-Open the panel with **End**, or hold both grips for **2 seconds with empty hands**. Point at its controls and click with A / Cross. Changes are saved as you make them, except calibration edits that have an explicit **Save** button.
+Open the panel with **End**, or hold both grips for **2 seconds with empty hands**. Point at its controls and click with A / Cross. Changes are saved as you make them.
 
 | Panel area | Useful settings |
 | --- | --- |
@@ -273,26 +253,21 @@ Open the panel with **End**, or hold both grips for **2 seconds with empty hands
 
 1. Enter a mission and stand still with the controllers in a neutral holding pose.
 2. Open **Motion controls → Calibration** and select your controller preset: **Generic**, **PSVR2**, or **Quest**. Presets are selected manually, since runtimes can report different controllers under the same profile.
-3. Use **Automatic** to sample alignment, or **Manual** to adjust each hand's position and rotation.
-4. Check the weapon and shield hands separately, then **Save**. Use **Cancel** to discard manual edits or **Reset this hand** to return to its baseline.
 
 | Keyboard key | Action |
 | --- | --- |
 | `End` | Open / close VR settings |
 | `F10` | Recenter and re-measure body height |
-| `Home` | Open manual hand calibration |
-| `F11` | Restore saved grip alignment |
-| `Insert` | Make the current grip the saved default baseline |
 
 ## Rendering and performance
 
-Choose a mode in the Render tab. **Stereo-mode changes take effect at the next mission.**
+Choose a mode in the Render tab.
 
 | Mode | What it does | Tradeoff |
 | --- | --- | --- |
-| **AFR** | Renders alternating eyes; the runtime reprojects each eye's latest real image | Lower rendering cost; the eyes can differ by one frame, especially noticeable when frame rate drops |
 | **Native stereo** | Renders both eyes for the same engine frame | Highest rendering cost |
-| **Depth reprojection** | Renders one eye and rebuilds the other from depth | Experimental; missing or duplicated edges around nearby objects |
+| **AFR** | Renders alternating eyes; the runtime reprojects each eye's latest real image | Lower rendering cost; the eyes can differ by one frame, especially noticeable when frame rate drops |
+| **Depth reprojection** | Renders one eye and rebuilds the other from depth | Very Experimental; missing or duplicated edges around nearby objects |
 
 Bannerlord can be CPU-limited in large battles. Start with a small battle, then adjust:
 
@@ -300,39 +275,11 @@ Bannerlord can be CPU-limited in large battles. Start with a small battle, then 
 2. Lower **resolution scale** in the VR panel. Lowering can apply live; increasing can require **Apply now**, with a brief black view while targets rebuild.
 3. Try **DLSS** in the game's graphics settings.
 4. Reduce shadows, screen-space reflections, and battle size according to the bottleneck.
-5. On supported NVIDIA hardware, try **VRS** in native stereo. Eye-following VRS needs a runtime that exposes eye tracking; otherwise it uses a fixed center.
+5. On supported NVIDIA hardware, try **VRS** in native stereo.  VRS it uses a fixed center.
 
 There is no guaranteed frame rate or universal graphics preset. Compare one setting at a time on your headset and runtime.
 
-## Configuration
 
-Start with the settings panel. The new build layers configuration in this order:
-
-1. Built-in fallback values.
-2. The release's `Modules\BannerlordVR\BannerlordVR.default.cfg`.
-3. Your personal overrides in:
-
-   ```text
-   Documents\Mount and Blade II Bannerlord\Configs\BannerlordVR.cfg
-   ```
-
-Keep the shipped default file with its build. Edit your **personal** file rather than the shipped file. The format is one `key = value` per line; lines beginning with `#` or `;` are comments. Restart after manual edits unless the panel applies that setting live.
-
-| Key | Purpose |
-| --- | --- |
-| `controls_swap_trigger_grip = 1` | Grips hold items; index triggers serve firing / bumper actions |
-| `grip_hold = 1` | Hold to keep an item; release to stow, drop, or throw |
-| `holster = 1` | Enable body holsters |
-| `bow_manual = 1` | Manual arrow pickup, nocking, and drawing |
-| `xbow_manual = 1` | Manual crossbow loading and spanning |
-| `stereo_mode = afr` | Select `afr`, `nativestereo`, or `depth` |
-| `dpad_chord = 1` | Left-stick-click + right-stick D-pad shortcut |
-| `recenter_hold_seconds = 3` | Controller recenter hold time; `0` disables it |
-| `menu_hold_seconds = 2` | Empty-hand panel shortcut hold time; `0` disables it |
-| `gamepad_deadzone` | Stick deadzone |
-| `bow_full_draw_m` | Physical draw distance for full bow power |
-
-To reset personal overrides, close the game and **back up, then rename** your personal config. On the next launch, the shipped defaults take over. Do not copy the repository's `config/BannerlordVR.cfg` into your Documents folder: it is a development journal, not a player preset.
 
 ## Troubleshooting
 
