@@ -24,12 +24,6 @@
 - A handled view-restoration error can appear in the log during shutdown; the tested session still exited normally.
 - Single-player only. Meta/Oculus OpenXR is not supported; use VDXR or SteamVR.
 
-### Validation
-
-- 830 automated checks passed, along with DLL and archive validation.
-- The owner reported all requested headset checks passed on VDXR, including native stereo.
-- Release startup defaults were then set to native stereo at 1.00 scale; the tested DLLs are unchanged.
-
 ## v0.1.0 alpha — 2026-09-20
 
 - Initial public PCVR release with 6DoF head tracking, OpenXR, stereo rendering, gamepad-style controller input, and an in-VR settings panel.
