@@ -8,7 +8,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 [Downloads](https://github.com/NotLooky/BannerlordVR/releases) · [Report a bug](https://github.com/NotLooky/BannerlordVR/issues/new/choose)
 
-> **v0.2.0-alpha.1 is available:** [download the physical-controls build](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.0-alpha.1). **Native stereo and 1.00 resolution scale are the release defaults.** This ZIP was built and tested against Bannerlord v1.5.5. Alpha quality: expect glitches, unfinished UI, and crashes. [Changelog](CHANGELOG.md).
+> **v0.2.5 is available:** [download the new build](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.5). Sharper VR UI, improved pre-battle controls, and clickable commander portraits. **Native stereo at 1.00 resolution scale is the default. AMD graphics cards are not fully supported.** Built against Bannerlord v1.5.5; headset testing of this exact ZIP is pending. Development quality: glitches and crashes are possible. [Changelog](CHANGELOG.md).
 
 ## Contents
 
@@ -43,6 +43,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 - **Mount & Blade II: Bannerlord v1.4.8. OR v1.5.5 Beta** Other game versions are not verified. Steam is the tested installation.
 - **Windows 10 or 11, 64-bit**, with a PCVR-capable system.
+- **AMD graphics cards are not fully supported.**
 - **[Bannerlord.Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)** installed and enabled.
 - A PCVR headset, tracked motion controllers, and an active **OpenXR runtime**.
 
@@ -63,7 +64,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Download **BannerlordVR-0.2.0-alpha.1.zip** from the [v0.2.0 alpha release](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.0-alpha.1). GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Download **BannerlordVR-0.2.5.zip** from the [v0.2.5 release](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.5). GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text

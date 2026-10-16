@@ -1,4 +1,14 @@
-﻿# Changelog
+# Changelog
+
+## v0.2.5 — 2026-10-16
+
+- Sharper, steadier VR menus, HUD and campaign-map labels.
+- Better pre-battle formation controls; commander portraits on the left-hand panel are now clickable.
+- Fixed black banners, stereo artifacts, disappearing fingers and mounted positioning.
+- Improved crossbow handling, throwing-weapon weight and siege interactions.
+- Updated default settings and saved controller/weapon calibration. Native stereo at 1.00 resolution scale remains the default.
+
+Built against **Bannerlord v1.5.5**. **AMD graphics cards are not fully supported.** Development quality; glitches and crashes are possible.
 
 ## v0.2.0-alpha.1 — 2026-10-13
 
