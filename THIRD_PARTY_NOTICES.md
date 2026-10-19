@@ -15,6 +15,7 @@ Nothing here changes the license of BannerlordVR's own source code; see
 | MinHook | Tsuda Kageyu | BSD-2-Clause | Compiled into `BannerlordVR.Native.dll` |
 | Hacker Disassembler Engine 32/64 | Vyacheslav Patkov | BSD-2-Clause | Bundled inside MinHook |
 | OpenXR SDK loader | The Khronos Group Inc. | Apache-2.0 | Compiled into `BannerlordVR.Native.dll` |
+| NVAPI (`nvapi64.lib`) | NVIDIA Corporation | MIT | Compiled into `BannerlordVR.Native.dll`; loads the NVIDIA driver's own `nvapi64.dll` at runtime |
 | JsonCpp | Baptiste Lepilleur and The JsonCpp Authors | Public Domain or MIT | Bundled inside the OpenXR loader |
 
 ### Not redistributed
@@ -27,6 +28,7 @@ and are **not** included in any BannerlordVR release:
   rights; no game assembly is redistributed by this project.
 - **Microsoft.NETFramework.ReferenceAssemblies** — build-time only
   (`PrivateAssets="all"`).
+- **NVIDIA DLSS runtime (`nvngx_dlss.dll`)** - resolved from the game/driver installation; no NVIDIA DLSS binary is included in this release.
 - **Direct3D 11, DXGI, and D3DCompiler** — Windows system components supplied by
   the operating system.
 
@@ -442,4 +444,38 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 
 limitations under the License.
+```
+
+---
+
+## NVAPI
+
+Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+<https://github.com/NVIDIA/nvapi>
+
+`nvapi64.lib` is linked statically for NVIDIA Variable Rate Shading. The
+NVAPI runtime itself (`nvapi64.dll`) is part of the NVIDIA display driver and
+is not redistributed.
+
+```
+SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: MIT
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ```

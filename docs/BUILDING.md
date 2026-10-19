@@ -76,8 +76,8 @@ throwing once per frame.
 
 `BannerlordVR.Native.log` prints it on every launch:
 
-- `0.2.0-openxr` — the real build.
-- `0.2.0-stub` — OpenXR was compiled out. It loads fine and then reports
+- `0.2.6-openxr` — the real build.
+- `0.2.6-stub` — OpenXR was compiled out. It loads fine and then reports
   `bvr_init failed: NoRuntime`, which is indistinguishable from a missing
   headset or a broken runtime, so it will send you debugging the wrong machine.
   Cause is a configure without `BVR_ENABLE_OPENXR`. CMake defaults it from
