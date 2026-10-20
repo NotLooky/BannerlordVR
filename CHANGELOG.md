@@ -5,7 +5,7 @@ against as well as their own number: every release states the Bannerlord
 version it was tested on, because a mismatch there is the single most common
 cause of "it does not work".
 
-## v0.2.6-alpha.1 ? 2026-10-20
+## v0.2.6-alpha.2 ? 2026-10-20
 
 Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Headset testing of this exact ZIP is pending.
 
@@ -16,7 +16,7 @@ Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Headset test
 - Fixed disappearing hands and weapons in the practice arena.
 - Menus and screens now follow the configured auto-recentre angle. Large modded mounts retain first-person view.
 - Added detailed field-of-view crop controls; removed the experimental true-vertical panel control.
-- Native stereo at 1.00 render scale and hold-to-grab remain the defaults. DLSS uses the runtime supplied by the game/driver; no separate DLSS binary is bundled.
+- Native stereo at 1.00 render scale and hold-to-grab remain the defaults. Bundled NVIDIA DLSS 310.9.1.0 upgrades an older game runtime at startup, preserving its original backup and any equal/newer installed version. Restart once if the old runtime was already loaded.
 - **AMD graphics cards are not fully supported.** Single-player only; use SteamVR or VDXR.
 
 ## v0.2.5 — 2026-10-16

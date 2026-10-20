@@ -8,7 +8,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 [Downloads](https://github.com/NotLooky/BannerlordVR/releases) · [Report a bug](https://github.com/NotLooky/BannerlordVR/issues/new/choose)
 
-> **v0.2.6-alpha.1.** Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Other game versions are unverified. Expect glitches, unfinished UI, and crashes. Headset acceptance with this exact ZIP is pending.
+> **v0.2.6-alpha.2.** Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Other game versions are unverified. Expect glitches, unfinished UI, and crashes. Headset acceptance with this exact ZIP is pending.
 
 ## Contents
 
@@ -66,19 +66,21 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Use the included **BannerlordVR-0.2.6-alpha.1.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Use the included **BannerlordVR-0.2.6-alpha.2.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text
    Mount & Blade II Bannerlord/
-   └── Modules/
-       └── BannerlordVR/
-           ├── SubModule.xml
-           ├── BannerlordVR.default.cfg
-           └── bin/
-               └── Win64_Shipping_Client/
-                   ├── BannerlordVR.dll
-                   └── BannerlordVR.Native.dll
+   `-- Modules/
+       `-- BannerlordVR/
+           |-- SubModule.xml
+           |-- BannerlordVR.default.cfg
+           |-- NVIDIA-DLSS-LICENSE.txt
+           `-- bin/
+               `-- Win64_Shipping_Client/
+                   |-- BannerlordVR.dll
+                   |-- BannerlordVR.Native.dll
+                   `-- nvngx_dlss.dll
    ```
 
    The mod's `bin` belongs **inside `Modules/BannerlordVR`**. Avoid a second nested `BannerlordVR` folder.
@@ -88,7 +90,9 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 The OpenXR loader is linked into the native DLL; a separate `openxr_loader.dll` is not needed.
 
-Keep the managed DLL, native DLL, and shipped default config from the **same build** together.
+Keep the managed DLL, native DLL, bundled DLSS DLL, NVIDIA license, and shipped default config from the **same build** together.
+
+The package includes NVIDIA DLSS **310.9.1.0**. When the mod loads, it upgrades an older game `bin/Win64_Shipping_Client/nvngx_dlss.dll` and saves the first original beside it as `nvngx_dlss.dll.bannerlordvr-original.bak`. Equal or newer versions are preserved. If the old DLSS was already loaded, restart Bannerlord once to use the upgrade; the managed log records this. The game bin folder must be writable; failures are logged and the game continues with its existing DLL.
 
 ## First-time setup
 
@@ -382,6 +386,8 @@ Some menus and physical interactions remain unfinished. For reproducible issues,
 Logs are rewritten each launch. Copy them before relaunching; the previous run may also be available as `*.prev.log`. Review attachments for personal information before posting.
 
 ## Updating and uninstalling
+
+The DLSS upgrade remains in the game bin after removing the mod. To restore the original, close the game, remove or disable BannerlordVR, back up the current `nvngx_dlss.dll`, and rename `nvngx_dlss.dll.bannerlordvr-original.bak` to `nvngx_dlss.dll`. Steam file verification can also restore the game's version.
 
 **Update:** close the game, back up your personal config, and replace the mod with the complete new release. Keep its shipped defaults and DLLs together. Personal overrides remain in Documents; test without them if behavior changes unexpectedly.
 

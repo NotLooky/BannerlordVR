@@ -34,6 +34,10 @@ config\BannerlordVR.cfg         the research journal; NOT what ships (see below)
 build\                          staging output (gitignored)
 ```
 
+## Bundled DLSS runtime
+
+Public packages require the unmodified NVIDIA-signed DLSS 310.9.1.0 release binary at `native/thirdparty/dlss/nvngx_dlss.dll`. It is excluded from git. See `native/thirdparty/dlss/README.md` in the source tree for its pinned hash and update procedure. Official SDK: <https://github.com/NVIDIA/DLSS>. The runtime is separately licensed; see `module/NVIDIA-DLSS-LICENSE.txt` and `THIRD_PARTY_NOTICES.md`.
+
 ## Build
 
 ```powershell
