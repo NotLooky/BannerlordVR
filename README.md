@@ -58,7 +58,7 @@ The following headset/runtime combinations have been tested by the project. This
 | Quest 3 | Virtual Desktop / VDXR | Tested |
 | Quest 3 | SteamVR OpenXR | Tested |
 | PSVR2 | SteamVR OpenXR | Tested |
-| Quest 3 | Meta / Oculus OpenXR | **Not supported**; use VDXR or SteamVR |
+| Quest 3 | Meta / Oculus OpenXR | Tested |
 
 Other headsets may work through SteamVR, but are unverified. Controllers with fewer buttons may not provide every binding below.
 
@@ -88,7 +88,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 6. Launch Bannerlord. Enable **Bannerlord VR** in the Mods tab and place it **below Harmony**, with its required base-game modules enabled.
 7. Start a single-player mission. A small Custom Battle is a useful place to learn the controls.
 
-The OpenXR loader is linked into the native DLL; a separate `openxr_loader.dll` is not needed.
+
 
 Keep the managed DLL, native DLL, bundled DLSS DLL, NVIDIA license, and shipped default config from the **same build** together.
 
@@ -100,7 +100,7 @@ The package includes NVIDIA DLSS **310.9.1.0**. When the mod loads, it upgrades 
 2. Open the VR panel with **End**. With both hands empty, holding **both grips for 2 seconds** also toggles it with the shipped control layout.
 3. Under **Motion controls**, enable **Motion controls - full physical combat**. This combines tracked hands, physical combat, body IK, and room-scale movement.
 4. Check height, world scale, and hand alignment. Use the panel's calibration tools if weapons sit incorrectly in your hands.
-5. Draw a weapon from its holster and **keep holding the grip**. Hands can start empty even when weapons are equipped.
+
 
 The optional **Toggle battle grips** setting keeps weapons held after a grip press; bowstrings still require holding and releasing the grip. It is off by default (`grip_toggle = 0`).
 
@@ -149,7 +149,7 @@ Restart after changing it. With `0`, **swap grip and trigger throughout these in
 
 ### D-pad without a D-pad
 
-**Press and hold the left stick inward, then tilt the right stick up, down, left, or right.** The right stick sends a D-pad direction instead of turning the camera until you release the left stick.
+**Press and hold the left stick inward, then tilt the right stick up, down, left, or right.** The right stick sends a D-pad direction instead of turning the camera until you release the left stick. or for Quest3 hold left thumbrest + right stick
 
 | Direction | Battle action with standard gamepad bindings | Army-order selection |
 | --- | --- | --- |
@@ -290,9 +290,8 @@ Open the panel with **End**, or hold both grips for **2 seconds with empty hands
 | --- | --- |
 | `End` | Open / close VR settings |
 | `F10` | Recenter and re-measure body height |
-| `Home` | Open manual hand calibration |
-| `F11` | Restore saved grip alignment |
-| `Insert` | Make the current grip the saved default baseline |
+
+
 
 ## Rendering and performance
 
