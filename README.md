@@ -8,6 +8,13 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 [Downloads](https://github.com/NotLooky/BannerlordVR/releases) · [Report a bug](https://github.com/NotLooky/BannerlordVR/issues/new/choose)
 
+
+<img width="385" height="209" alt="14011-1791990479-900614996" src="https://github.com/user-attachments/assets/181151a1-4797-4197-978b-8de1a4c47185" />
+
+<img width="385" height="208" alt="14011-1791990474-1915983548" src="https://github.com/user-attachments/assets/53226c20-1bcf-4640-bd6b-77f784679401" />
+
+
+
 > **v0.2.6-alpha.2 is available:** [download the alpha](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.6-alpha.2). Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Other game versions are unverified. Expect glitches, unfinished UI, and crashes. Headset acceptance with this exact ZIP is pending.
 
 ## Contents
