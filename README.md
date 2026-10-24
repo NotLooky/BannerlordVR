@@ -320,6 +320,16 @@ Bannerlord can be CPU-limited in large battles. Start with a small battle, then 
 4. Reduce shadows, screen-space reflections, and battle size according to the bottleneck.
 5. On supported NVIDIA hardware, try **VRS** in native stereo. Eye-following VRS needs a runtime that exposes eye tracking; otherwise it uses a fixed center.
 
+**tips for performance**
+
+-(this only work with nvidia card) Install cheekyfoveateddlss(0.5.5 standalone) from their github, then paste the CheekyFoveatedDLSS folder only into the game's \bin\Win64_Shipping_Client, don't add anything else from the folder. this will enable cheekydlss , this alone should give you a good boost to performance when using dlss in game. for me it was about 12fps .
+
+-The other tip is , FOV cropping , the mod now ships with fov croping sits at 1.0 , lower it , until the edges bothers you , for quest 3 best was (H=0.83, V=0.87) this gave me about another 10fps
+
+-Enable VRS wide , this will give you maybe 2 to 4 fps with no visual loss , only at the very edges of the lens.
+
+Optimized = 25 fps increase for me ,
+
 There is no guaranteed frame rate or universal graphics preset. Compare one setting at a time on your headset and runtime.
 
 ## Configuration
