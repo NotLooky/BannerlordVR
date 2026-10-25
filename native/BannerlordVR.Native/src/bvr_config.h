@@ -30,6 +30,9 @@ const char* config_path();
 bool  config_bool(const char* key, bool fallback);
 float config_float(const char* key, float fallback);
 
+/* Case-insensitive string match of a key's value; false when the key is unset. */
+bool  config_is(const char* key, const char* value);
+
 } // namespace bvr
 
 #endif /* BVR_CONFIG_H */

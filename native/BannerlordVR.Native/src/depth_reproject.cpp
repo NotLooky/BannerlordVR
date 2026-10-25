@@ -1,7 +1,8 @@
-#include "afw_warp.h"
+#include "depth_reproject.h"
 #include "bvr_config.h"
 #include "bvr_log.h"
 #include "d3d_hooks.h"
+#include "ngx_hook.h"
 #include "vp_patch.h"
 
 #include <d3dcompiler.h>
@@ -13,7 +14,7 @@
 
 namespace bvr {
 
-constexpr uint32_t kAfwEyes = 2;
+constexpr uint32_t kDrEyes = 2;
 namespace {
 
 /* ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ float DisparityAt(float x, int y, out bool ambiguous)
        ambiguous, and the scatter declines to move it. The result is a hole down
        the side of every object, which the gather fills from another frame - a
        stale band on every edge, which is the transparent edge that appeared and
-       was never there when AFW was first working.
+       was never there when DR was first working.
 
        The half-texel offset is wrong here too: with DepthScale 1 the lerp sits at
        t = 0.5, so every pixel's depth is averaged with its LEFT neighbour's.
@@ -280,6 +281,10 @@ float DisparityAt(float x, int y, out bool ambiguous)
 
        So when the depth is full resolution, read the one texel that belongs to
        this pixel and report no ambiguity, because there is none. */
+    /* The Y axis is deliberately NOT interpolated, and TEST 201 is why. Reading
+       two depth rows and lerping them the way X already is costs two extra taps
+       per pixel and was measured to change nothing on screen: the half-resolution
+       tread in Y is real, and it is not what the far edges are doing. */
     if (DepthScale.x > 0.99 && DepthScale.y > 0.99)
     {
         int dxi = clamp((int)(x + Jitter.x), 0, (int)DepthLimit.x);
@@ -302,7 +307,7 @@ float DisparityAt(float x, int y, out bool ambiguous)
     /* Scaled, not fixed - see SpanLimit. At ten centimetres a surface legitimately
        changes by more than a fixed threshold from one depth texel to the next, and
        snapping there is what puts the staircase back exactly where it hurts most. */
-    /* Its own floor, so afw_depth_edge_px stays a separate knob, but the same
+    /* Its own floor, so dr_depth_edge_px stays a separate knob, but the same
        above-SpanFree scaling - see SpanLimit for why it is measured from there
        and not from zero. */
     float near = max(abs(da), abs(db));
@@ -460,17 +465,17 @@ R"HLSL(
    the disparity sits above it so the ordering is by depth alone. Zero means
    "nothing landed here", which is why the disparity is stored one higher than
    it is - a genuinely zero disparity (the far plane) must still beat empty. */
-#define AFW_SX_BITS 13
-#define AFW_SX_MASK ((1u << AFW_SX_BITS) - 1u)
+#define DR_SX_BITS 13
+#define DR_SX_MASK ((1u << DR_SX_BITS) - 1u)
 
 uint PackCandidate(float disp, int sx)
 {
     uint q = (uint)clamp(disp * 16.0 + 0.5, 0.0, 131000.0);
-    return ((q + 1u) << AFW_SX_BITS) | ((uint)sx & AFW_SX_MASK);
+    return ((q + 1u) << DR_SX_BITS) | ((uint)sx & DR_SX_MASK);
 }
 
-int   UnpackSx(uint v)   { return (int)(v & AFW_SX_MASK); }
-float UnpackDisp(uint v) { return (float)((v >> AFW_SX_BITS) - 1u) * (1.0 / 16.0); }
+int   UnpackSx(uint v)   { return (int)(v & DR_SX_MASK); }
+float UnpackDisp(uint v) { return (float)((v >> DR_SX_BITS) - 1u) * (1.0 / 16.0); }
 
 [numthreads(8, 8, 1)]
 void scatter(uint3 tid : SV_DispatchThreadID)
@@ -742,7 +747,7 @@ void gather(uint3 tid : SV_DispatchThreadID)
          *
            Only in this branch. The disocclusion fill below is invented content
            and holding it steady would preserve an invention rather than a
-           measurement. afw_taa = 0 turns it off. */
+           measurement. dr_taa = 0 turns it off. */
         if (Taa > 0.0 && HavePrev > 0.5)
         {
             const float2 pp = PrevPixel(dst);
@@ -808,12 +813,16 @@ void gather(uint3 tid : SV_DispatchThreadID)
         const int2 prevPx = int2(clamp(srcPx.x, 0.0, Size.x - 1.0),
                                  clamp(srcPx.y, 0.0, Size.y - 1.0));
 
+#ifdef DR_FILL_DEBUG
+        Dst[dst] = float4(0.0, 0.0, 1.0, 1.0);       // BLUE: previous real render
+        return;
+#endif
         Dst[dst] = PrevEye.Load(int3(prevPx, 0));
         return;
     }
     else
     {
-        /* No previous render yet - the first AFW frame of a mission, before any
+        /* No previous render yet - the first DR frame of a mission, before any
            real render of this eye has been recorded. Fall back to stretching the
            background: the FARTHEST filled neighbour, never the nearest. The gap
            is opened BY the near object, so filling it from the near object
@@ -946,6 +955,10 @@ R"HLSL(
            off and sends every hole down the invented path again. */
         if (BlendMax >= 1.0 && kL > 0 && kR > 0 && (kL + kR - 1) <= (int)BlendMax)
         {
+#ifdef DR_FILL_DEBUG
+            Dst[dst] = float4(0.0, 1.0, 0.0, 1.0);   // GREEN: crack, interpolated
+            return;
+#endif
             const float lf = SubPixelSource(dst.x - kL, sxL, dispL);
             const float rf = SubPixelSource(dst.x + kR, sxR, dispR);
             const float t  = (float)kL / (float)(kL + kR);
@@ -1018,8 +1031,8 @@ R"HLSL(
            moving; this is the deep end of a hole behind a near object, which is
            the one place in the image where nothing is meant to be read.
 
-           afw_fill_mirror_px above 0 restores the fold, for comparison.
-           afw_fill_mirror_reach_px 0 restores the uncompressed reflection. */
+           dr_fill_mirror_px above 0 restores the fold, for comparison.
+           dr_fill_mirror_reach_px 0 restores the uncompressed reflection. */
         int delta = bestDelta;
 
         if (MirrorMax >= 1.0)
@@ -1118,6 +1131,11 @@ R"HLSL(
         sxf = (bestDisp < 1e29)
                   ? SubPixelSource(dst.x + bestDelta, bestSx, bestDisp) + (float)delta
                   : (float)sx;
+
+#ifdef DR_FILL_DEBUG
+        Dst[dst] = float4(1.0, 0.0, 1.0, 1.0);       // MAGENTA: invented fill
+        return;
+#endif
     }
 
     Dst[dst] = FetchSource(sxf, dst.y);
@@ -1167,7 +1185,7 @@ struct Params
  *
  * This struct has been extended once per fix for several fixes now, and the one
  * that added two floats to a full row took it to 188 bytes. CreateBuffer failed,
- * AFW switched itself off for the session, and the only trace was one ERROR line
+ * DR switched itself off for the session, and the only trace was one ERROR line
  * scrolling past in a log that prints thousands. Something that can be checked
  * at compile time should never be discovered by reading a log.
  *
@@ -1177,11 +1195,11 @@ struct Params
  * other silently shifts every field after it, and the shader reads a knob's
  * value out of a different knob. Matching sizes does not prove the layouts
  * agree, but a mismatch here is proof that they do not. */
-static_assert(sizeof(AfwParams) % 16 == 0,
-              "AfwParams must be a whole number of 16-byte constant-buffer rows "
+static_assert(sizeof(DrParams) % 16 == 0,
+              "DrParams must be a whole number of 16-byte constant-buffer rows "
               "- add a pad float, and mirror it in the HLSL cbuffer above.");
 
-AfwParams        g_params = {};
+DrParams        g_params = {};
 std::atomic<bool> g_haveParams{ false };
 
 ID3D11ComputeShader*       g_shader = nullptr;      /* scatter */
@@ -1233,7 +1251,7 @@ ID3D11Texture2D* g_depthChecked = nullptr;
    teardown does, so the proof has to be earned again per mission. */
 uint32_t g_depthCheckedGen = 0;
 
-/* The shape the proof was earned against. See the gate in afw_warp_eye: the
+/* The shape the proof was earned against. See the gate in dr_warp_eye: the
    depth POINTER alternates between the two eyes' buffers, so it cannot be the
    identity, but a change of size or format is a genuinely different target. */
 uint32_t    g_depthCheckedW   = 0;
@@ -1263,7 +1281,7 @@ uint32_t g_failures = 0;
  * disparity looks like, and the arithmetic says the convention is the cause.
  * Read a reversed-Z buffer as though it were conventional and the sky - stored
  * at 0.0 - linearises to the NEAR PLANE, 0.05 m, which asks for a disparity of
- * some thousands of pixels. Everything then clamps at afw_max_disparity_px and
+ * some thousands of pixels. Everything then clamps at dr_max_disparity_px and
  * the whole image is displaced by a constant 96 px. Uniform, static, doubled:
  * exactly the report.
  *
@@ -1342,8 +1360,8 @@ uint32_t         g_probedGen = 0;
    rgl ping-pongs between two scene depths of identical size and format, so the
    pointer alternates every frame and a pointer key missed on every call: the
    log showed "guard MISSES (probes)" on each of them, cached pointer always the
-   other buffer. Every AFW frame paid a 37 MB staging allocation, a copy and a
-   CPU map - a hard pipeline sync, which is what took AFW from 90 fps to ~70.
+   other buffer. Every DR frame paid a 37 MB staging allocation, a copy and a
+   CPU map - a hard pipeline sync, which is what took DR from 90 fps to ~70.
    The acceptance check below was moved to shape + generation for exactly this
    reason; the probe was not.
  *
@@ -1538,7 +1556,7 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
         if (isNew && seenCount >= 16 && !warnedFull)
         {
             warnedFull = true;
-            BVR_INFO("AFW probe key: over 16 DISTINCT depth textures seen in %u "
+            BVR_INFO("DR probe key: over 16 DISTINCT depth textures seen in %u "
                      "call(s). The pointer is not a stable key at all.", calls);
         }
         else if ((isNew && slot >= 0) || lines < 24)
@@ -1546,7 +1564,7 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
             ++lines;
             D3D11_TEXTURE2D_DESC pd = {};
             depth->GetDesc(&pd);
-            BVR_INFO("AFW probe key: call %u, texture %p %s (slot %d, %u hit(s)), "
+            BVR_INFO("DR probe key: call %u, texture %p %s (slot %d, %u hit(s)), "
                      "cached %p, gen %u vs %u, %ux%u fmt %u -> guard %s",
                      calls, (void*)depth, isNew ? "NEW" : "repeat", slot,
                      slot >= 0 ? hits[slot] : 0u, (void*)g_probedFor,
@@ -1584,8 +1602,8 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
     ID3D11Texture2D* copy = nullptr;
     if (FAILED(device->CreateTexture2D(&staging, nullptr, &copy)) || copy == nullptr)
     {
-        BVR_WARN("AFW: could not stage the depth buffer to read it back; the depth "
-                 "convention stays at whatever afw_depth_reversed says.");
+        BVR_WARN("DR: could not stage the depth buffer to read it back; the depth "
+                 "convention stays at whatever dr_depth_reversed says.");
         return;
     }
 
@@ -1595,7 +1613,7 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
     if (FAILED(context->Map(copy, 0, D3D11_MAP_READ, 0, &mapped)))
     {
         copy->Release();
-        BVR_WARN("AFW: could not map the staged depth buffer.");
+        BVR_WARN("DR: could not map the staged depth buffer.");
         return;
     }
 
@@ -1640,7 +1658,7 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
 
     if (samples == 0)
     {
-        BVR_WARN("AFW: depth format %d could not be read back; leaving the "
+        BVR_WARN("DR: depth format %d could not be read back; leaving the "
                  "convention as configured.", static_cast<int>(desc.Format));
         return;
     }
@@ -1678,7 +1696,7 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
         if (!g_loggedEmptyProbe)
         {
             g_loggedEmptyProbe = true;
-            BVR_INFO("AFW depth probe: %d samples and every one of them reads as "
+            BVR_INFO("DR depth probe: %d samples and every one of them reads as "
                      "impossible under BOTH conventions (raw %.6f..%.6f). That is an "
                      "empty buffer, not a convention - nothing has been drawn into "
                      "it yet. Keeping the previous answer and probing again later. "
@@ -1692,7 +1710,7 @@ void probe_depth(ID3D11Device* device, ID3D11DeviceContext* context,
 
     g_probed = (plausibleReversed > plausibleNormal) ? 1 : 0;
 
-    BVR_INFO("AFW depth probe: %d samples, raw %.6f..%.6f. Plausible distances: "
+    BVR_INFO("DR depth probe: %d samples, raw %.6f..%.6f. Plausible distances: "
              "%d%% read as normal (mean %.1f m), %d%% read as REVERSED (mean %.1f m). "
              "-> %s.",
              samples, minRaw, maxRaw,
@@ -1708,7 +1726,7 @@ bool reversed_depth()
     static int configured = -2;
     if (configured == -2)
     {
-        const float v = config_float("afw_depth_reversed", -1.0f);
+        const float v = config_float("dr_depth_reversed", -1.0f);
         configured = (v < -0.5f) ? -1 : (v > 0.5f ? 1 : 0);
     }
 
@@ -1746,15 +1764,13 @@ bool reversed_depth()
  * already has it, the two sources reinforce rather than compete, and the seam
  * between them stops being visible.
  *
- * WHAT THE REFERENCE IMPLEMENTATIONS DO
+ * WHAT A MATRIX REPROJECTION DOES
  *
- * Neither has a disparity ceiling at all. PureDark's frame-warp interface
- * (dependencies/pd-afwmod/include/PDAFWPlugin.h, as driven by REFramework and
- * by the Witcher 3 mod's bridge) takes full camera matrices - srcClipToView,
- * destViewToClip and the rest - and reprojects each pixel through them. A
- * matrix reprojection has nowhere to put a ceiling: displacement falls out of
- * the geometry. The only thresholds either of them exposes are about MOTION
- * (IgnoreMotionThreshold, in pixels), never about disparity.
+ * It has no disparity ceiling at all. It takes full camera matrices -
+ * srcClipToView, destViewToClip and the rest - and reprojects each pixel
+ * through them, so there is nowhere to put a ceiling: displacement falls out
+ * of the geometry. The only thresholds worth exposing are about MOTION (in
+ * pixels), never about disparity.
  *
  * That is the right division and this file already has both halves of it. How
  * far a pixel MOVES is geometry and must not be clamped. How far apart two
@@ -1767,9 +1783,9 @@ bool reversed_depth()
  * anything a player looks at. */
 float physical_max_disparity_px()
 {
-    const float zNear = afw_z_near();
-    const float focal = afw_focal_px();
-    const float base  = afw_baseline();
+    const float zNear = dr_z_near();
+    const float focal = dr_focal_px();
+    const float base  = dr_baseline();
 
     if (!(zNear > 0.0f) || !(focal > 0.0f) || !(base > 0.0f))
         return 0.0f;
@@ -1790,7 +1806,7 @@ float max_disparity_px()
        scenes while the world-scale slider moves the baseline under the player's
        hands. A value latched on the first mission would be the wrong ceiling
        for every one after it. */
-    const float configured = config_float("afw_max_disparity_px", -1.0f);
+    const float configured = config_float("dr_max_disparity_px", -1.0f);
     if (configured > 0.0f)
         return configured;
 
@@ -2047,7 +2063,7 @@ bool measure_raw_disparity(const Staged& src, const Staged& dst,
         }
     }
 
-    BVR_INFO("AFW eye parallax, measured per block against what the depth "
+    BVR_INFO("DR eye parallax, measured per block against what the depth "
              "predicts: %d textured block(s), %d measured a shift of exactly "
              "zero, %d agreed with the prediction to within a factor of two. %s"
              "-- if every block reads zero while the predictions do not, the two "
@@ -2071,7 +2087,7 @@ bool measure_raw_disparity(const Staged& src, const Staged& dst,
    can differ between the two directions because only one of them is ever
    exercised while the source eye is pinned.
  *
-   afwSynth[E] holds the frame in which E was SYNTHESISED. One frame later the
+   drSynth[E] holds the frame in which E was SYNTHESISED. One frame later the
    eyes swap and E is RENDERED, so at that moment there is a prediction and a
    truth for the same eye, and the question "how far out was it" has a number.
  *
@@ -2177,7 +2193,7 @@ void measure_synth_residual(const Staged& pred, const Staged& real,
     if (used == 0)
         return;
 
-    BVR_INFO("AFW synthesis residual, eye %d (synthesised from eye %d): %d near "
+    BVR_INFO("DR synthesis residual, eye %d (synthesised from eye %d): %d near "
              "block(s), mean residual %+.1f px. %s-- a faithful warp leaves ~0: "
              "the predicted eye should already sit where the real one does. A "
              "residual near the 'moved' figure means the warp did not move that "
@@ -2246,9 +2262,9 @@ bool  g_calibrated = false;
 bool  g_calibrating = false;
 
 /* Set once, never cleared: the calibration decided this scene's depth cannot
-   predict the second eye. AFW then declines every frame rather than degrading
+   predict the second eye. DR then declines every frame rather than degrading
    to a copy - see the note where it is set. The caller reads it through
-   afw_stood_down() and stops asking, so the per-frame fallback counter does not
+   dr_stood_down() and stops asking, so the per-frame fallback counter does not
    fill the log with a decision that was made once. */
 bool  g_standDown = false;
 
@@ -2258,10 +2274,10 @@ bool  g_standDown = false;
 int   g_calibAttempts = 0;
 float g_calibPrevGain = 0.0f;
 constexpr int kMaxCalibAttempts = 8;
-ID3D11Texture2D* g_calibEye[kAfwEyes] = { nullptr, nullptr };
-bool g_calibHas[kAfwEyes] = { false, false };
+ID3D11Texture2D* g_calibEye[kDrEyes] = { nullptr, nullptr };
+bool g_calibHas[kDrEyes] = { false, false };
 
-/* Applies a hand-pinned afw_gain, if there is one, and reports whether it did.
+/* Applies a hand-pinned dr_gain, if there is one, and reports whether it did.
  *
  * Its own function because it has to be reachable from BOTH the point where the
  * measurement would be run and the point where evidence for it is collected -
@@ -2271,7 +2287,7 @@ bool apply_pinned_gain();
 
 void release_calibration_textures()
 {
-    for (uint32_t e = 0; e < kAfwEyes; ++e)
+    for (uint32_t e = 0; e < kDrEyes; ++e)
     {
         if (g_calibEye[e] != nullptr)
         {
@@ -2284,13 +2300,13 @@ void release_calibration_textures()
 
 bool apply_pinned_gain()
 {
-    const float pinned = static_cast<float>(config_float("afw_gain", 1.0f));
+    const float pinned = static_cast<float>(config_float("dr_gain", 1.0f));
     if (!(pinned > 0.0f))
         return false;
 
     g_calibrated = true;
     g_gain = pinned;
-    BVR_INFO("AFW calibration: skipped - afw_gain = %.3f pins it by hand.", pinned);
+    BVR_INFO("DR calibration: skipped - dr_gain = %.3f pins it by hand.", pinned);
     release_calibration_textures();
     return true;
 }
@@ -2306,9 +2322,9 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
      *
        For rectified stereo the disparity is exactly focal * baseline / z. There
        is no free scale factor in that, so a correct implementation has no gain
-       knob at all: PureDark's frame-warp interface exposes scales for MOTION
-       vectors and nothing whatever for disparity, because it reprojects through
-       camera matrices where the displacement simply falls out of the geometry.
+       knob at all: a reprojection through camera matrices needs scales for
+       MOTION vectors and nothing whatever for disparity, because there the
+       displacement simply falls out of the geometry.
 
        This search existed because the model was NOT exact while a constant
        ceiling was clamping the near field. With everything close to the camera
@@ -2326,7 +2342,7 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
        "objects near me have visible doubling, far away is fine".
 
        With the ceiling now derived from the near plane the model is exact
-       again, so the right scale is 1. Set afw_gain = 0 to run the search
+       again, so the right scale is 1. Set dr_gain = 0 to run the search
        instead, which is now a diagnostic rather than a necessity. */
     if (apply_pinned_gain())
         return;
@@ -2456,7 +2472,7 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
                replaces it; ordinary AFR runs meanwhile, which is what makes the
                next pair of REAL eyes available to measure against. */
             g_calibPrevGain = bestGain;
-            BVR_INFO("AFW calibration: sample %d reads gain %.3f (cost %.2f vs "
+            BVR_INFO("DR calibration: sample %d reads gain %.3f (cost %.2f vs "
                      "%.2f flat). Held, not applied - a single sample taken while "
                      "the head was moving looks exactly like a wider baseline, so "
                      "it takes two that agree.",
@@ -2471,7 +2487,7 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
 
         if (!usable && g_calibAttempts < kMaxCalibAttempts)
         {
-            BVR_INFO("AFW calibration: sample %d rejected (%s). Sampling again.",
+            BVR_INFO("DR calibration: sample %d rejected (%s). Sampling again.",
                      g_calibAttempts,
                      atEdge ? "the best gain sat on the end of the ladder, so the "
                               "model does not fit rather than needing correction"
@@ -2493,7 +2509,7 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
             g_gain = 0.5f * (bestGain + g_calibPrevGain);
             g_dirOverride = bestDir;
 
-            BVR_INFO("AFW calibration: two samples agree - %.3f and %.3f, using "
+            BVR_INFO("DR calibration: two samples agree - %.3f and %.3f, using "
                      "%.3f, direction %+.0f (cost %.2f against %.2f for no warp "
                      "at all). Agreement is the point: it is what says neither "
                      "sample was taken mid-movement, which is the failure that "
@@ -2511,11 +2527,11 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
             g_gain = 1.0f;
             g_dirOverride = bestDir;
 
-            BVR_WARN("AFW calibration: %d samples and no two agreed (last %.3f). "
+            BVR_WARN("DR calibration: %d samples and no two agreed (last %.3f). "
                      "Falling back to the physical model at gain 1.000, direction "
                      "%+.0f - focal length and baseline are both known, so the "
                      "model is a better estimate than a measurement that will not "
-                     "repeat. Set afw_gain to pin it if this is wrong.",
+                     "repeat. Set dr_gain to pin it if this is wrong.",
                      g_calibAttempts, bestGain, bestDir);
         }
         else
@@ -2528,7 +2544,7 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
                nothing actively wrong.
              *
                That is only true if the two images are also SUBMITTED from the
-               same viewpoint, and they are not. afw_capture tags each eye with
+               same viewpoint, and they are not. dr_capture tags each eye with
                its own pose from the locate, so the compositor was handed one
                picture twice, at two viewpoints an IPD apart. Every object in the
                scene then sits 65 mm to the side of where its own eye says it
@@ -2544,11 +2560,11 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
             g_gain = 0.0f;
             g_standDown = true;
 
-            BVR_WARN("AFW calibration: NO candidate beat copying the rendered eye "
+            BVR_WARN("DR calibration: NO candidate beat copying the rendered eye "
                      "across unchanged (best %.2f vs %.2f). The depth is not "
-                     "predicting this scene, so AFW has STOOD DOWN and the mod is "
+                     "predicting this scene, so DR has STOOD DOWN and the mod is "
                      "running ordinary AFR for the rest of the session - each eye "
-                     "a real render from its own position. AFW cannot copy an eye "
+                     "a real render from its own position. DR cannot copy an eye "
                      "across instead: both eyes are submitted with their own pose, "
                      "so a copy arrives an IPD away from where its eye expects it "
                      "and the two will not fuse. Send this log.",
@@ -2562,7 +2578,7 @@ void run_calibration(ID3D11Device* device, ID3D11DeviceContext* context,
         g_calibrated = true;
         g_gain = 1.0f;
 
-        BVR_WARN("AFW calibration: could not read the eyes back; running "
+        BVR_WARN("DR calibration: could not read the eyes back; running "
                  "uncalibrated at the physical model's gain 1.0.");
     }
 
@@ -2591,7 +2607,7 @@ bool calibrating(ID3D11Device* device, ID3D11DeviceContext* context,
        renderer alternated eyes, because the second one always turned up a frame
        later.
 
-       With afw_pin_source_eye the renderer stops alternating, so a real render
+       With dr_pin_source_eye the renderer stops alternating, so a real render
        of the second eye never arrives. g_calibHas[1] stayed false for ever,
        run_calibration was never called, g_calibrated never became true, and this
        function reported "still calibrating" on every frame of the session - so
@@ -2607,7 +2623,7 @@ bool calibrating(ID3D11Device* device, ID3D11DeviceContext* context,
         return false;
 
     const uint32_t eye = static_cast<uint32_t>(srcEye);
-    if (eye >= kAfwEyes)
+    if (eye >= kDrEyes)
         return true;
 
     if (!g_calibHas[eye])
@@ -2623,7 +2639,7 @@ bool calibrating(ID3D11Device* device, ID3D11DeviceContext* context,
 
             if (FAILED(device->CreateTexture2D(&desc, nullptr, &g_calibEye[eye])))
             {
-                BVR_WARN("AFW calibration: could not allocate a reference eye; "
+                BVR_WARN("DR calibration: could not allocate a reference eye; "
                          "running uncalibrated.");
                 g_calibrated = true;
                 release_calibration_textures();
@@ -2637,7 +2653,7 @@ bool calibrating(ID3D11Device* device, ID3D11DeviceContext* context,
         if (!g_calibrating)
         {
             g_calibrating = true;
-            BVR_INFO("AFW: measuring the disparity against both real eyes before "
+            BVR_INFO("DR: measuring the disparity against both real eyes before "
                      "switching the warp on. A frame or two of ordinary AFR.");
         }
     }
@@ -2664,20 +2680,52 @@ bool ensure_shader(ID3D11Device* device)
         { "gather",  &g_gatherShader },
     };
 
+    /* PAINT THE FILL, SO IT CAN BE POINTED AT INSTEAD OF ARGUED ABOUT.
+     *
+       Four rounds went into whether a far-edge artifact is the disocclusion fill
+       or the disparity that decides where the fill goes, and every round was a
+       theory tested by rebuilding the thing the theory blamed. This settles it by
+       looking: each of the three ways a destination pixel can be filled writes a
+       flat colour instead of its content, so one glance at a far object says which
+       one the shimmering band actually is.
+
+         MAGENTA  the invented fill - the "mirror". Reflected or run forward
+                  depending on dr_fill_invert; either way, content that is not
+                  in the source eye and had to be made up.
+         GREEN    a narrow crack interpolated from both sides (dr_fill_blend_px).
+         BLUE     read from the previous real render (dr_prev_from_synth = 1).
+
+       Everything the warp actually resolved keeps its colour, so the frame reads
+       as the normal image with the fills lit up in it.
+
+       A compile-time define rather than a cbuffer field: the switch is read once
+       at startup like the rest of the config, so there is nothing to pay per
+       pixel, and no 16-byte row to get wrong. */
+    const bool         fillDebug = config_float("dr_fill_debug", 0.0f) > 0.5;
+    const D3D_SHADER_MACRO debugDefines[] = { { "DR_FILL_DEBUG", "1" },
+                                              { nullptr, nullptr } };
+
+    if (fillDebug)
+        BVR_INFO("DR: dr_fill_debug is ON - disocclusion fills are painted flat "
+                 "(magenta invented, green interpolated crack, blue previous real "
+                 "render) instead of filled. This is a diagnostic; set it to 0 to "
+                 "play.");
+
     for (int i = 0; i < 2; ++i)
     {
         ID3DBlob* code = nullptr;
         ID3DBlob* errors = nullptr;
 
         const HRESULT hr = D3DCompile(kWarpShader, std::strlen(kWarpShader),
-                                      "afw_warp.hlsl", nullptr, nullptr,
+                                      "depth_reproject.hlsl",
+                                      fillDebug ? debugDefines : nullptr, nullptr,
                                       entries[i].name, "cs_5_0",
                                       D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                                       &code, &errors);
 
         if (FAILED(hr) || code == nullptr)
         {
-            BVR_ERR("AFW: warp shader '%s' failed to compile (0x%08X): %s",
+            BVR_ERR("DR: warp shader '%s' failed to compile (0x%08X): %s",
                     entries[i].name, hr,
                     errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer())
                                       : "no compiler output");
@@ -2697,7 +2745,7 @@ bool ensure_shader(ID3D11Device* device)
 
         if (FAILED(csHr))
         {
-            BVR_ERR("AFW: CreateComputeShader failed for '%s' (0x%08X).",
+            BVR_ERR("DR: CreateComputeShader failed for '%s' (0x%08X).",
                     entries[i].name, csHr);
             g_shaderFailed = true;
             return false;
@@ -2713,7 +2761,7 @@ bool ensure_shader(ID3D11Device* device)
 
     if (FAILED(device->CreateSamplerState(&sampDesc, &g_sampler)))
     {
-        BVR_ERR("AFW: could not create the warp's sampler.");
+        BVR_ERR("DR: could not create the warp's sampler.");
         g_shaderFailed = true;
         return false;
     }
@@ -2726,12 +2774,12 @@ bool ensure_shader(ID3D11Device* device)
 
     if (FAILED(device->CreateBuffer(&cbDesc, nullptr, &g_cb)))
     {
-        BVR_ERR("AFW: could not create the warp constant buffer.");
+        BVR_ERR("DR: could not create the warp constant buffer.");
         g_shaderFailed = true;
         return false;
     }
 
-    BVR_INFO("AFW: warp shader compiled. The second eye is now synthesised from "
+    BVR_INFO("DR: warp shader compiled. The second eye is now synthesised from "
              "the first rather than held from the previous frame.");
     return true;
 }
@@ -2766,7 +2814,7 @@ bool ensure_source_srv(ID3D11Device* device, ID3D11Texture2D* texture)
 
     if (FAILED(device->CreateShaderResourceView(texture, nullptr, &g_srcSrv)))
     {
-        BVR_ERR("AFW: could not create a view of the rendered eye.");
+        BVR_ERR("DR: could not create a view of the rendered eye.");
         return false;
     }
 
@@ -2850,14 +2898,14 @@ bool ensure_depth_srv(ID3D11Device* device, ID3D11Texture2D* texture)
 
     if (view.Format == DXGI_FORMAT_UNKNOWN)
     {
-        BVR_ERR("AFW: depth format %d is not one this can read.",
+        BVR_ERR("DR: depth format %d is not one this can read.",
                 static_cast<int>(desc.Format));
         return false;
     }
 
     if (FAILED(device->CreateShaderResourceView(texture, &view, &g_depthSrvSlot[slot])))
     {
-        BVR_ERR("AFW: could not create a view of the eye depth buffer.");
+        BVR_ERR("DR: could not create a view of the eye depth buffer.");
         return false;
     }
 
@@ -2907,7 +2955,7 @@ bool ensure_lookup(ID3D11Device* device, uint32_t width, uint32_t height)
        reads as scattered wrong-coloured pixels rather than as a limit. */
     if (width > (1u << 13))
     {
-        BVR_ERR("AFW: an eye %u pixels wide exceeds the %u the claim buffer can "
+        BVR_ERR("DR: an eye %u pixels wide exceeds the %u the claim buffer can "
                 "index, so the warp cannot address its own source. Staying on AFR.",
                 width, 1u << 13);
         return false;
@@ -2930,7 +2978,7 @@ bool ensure_lookup(ID3D11Device* device, uint32_t width, uint32_t height)
 
     if (FAILED(device->CreateTexture2D(&desc, nullptr, &g_lookup)))
     {
-        BVR_ERR("AFW: could not allocate the %ux%u claim buffer the warp "
+        BVR_ERR("DR: could not allocate the %ux%u claim buffer the warp "
                 "resolves occlusion through. Staying on AFR.", width, height);
         return false;
     }
@@ -2941,7 +2989,7 @@ bool ensure_lookup(ID3D11Device* device, uint32_t width, uint32_t height)
 
     if (FAILED(device->CreateUnorderedAccessView(g_lookup, &view, &g_lookupUav)))
     {
-        BVR_ERR("AFW: could not create the claim buffer's unordered-access view.");
+        BVR_ERR("DR: could not create the claim buffer's unordered-access view.");
         g_lookup->Release();
         g_lookup = nullptr;
         return false;
@@ -2965,7 +3013,7 @@ bool ensure_dst_uav(ID3D11Device* device, ID3D11Texture2D* texture)
 
     if ((desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
     {
-        BVR_ERR("AFW: the destination eye texture was created without "
+        BVR_ERR("DR: the destination eye texture was created without "
                 "UNORDERED_ACCESS, so the warp cannot write to it.");
         return false;
     }
@@ -2986,7 +3034,7 @@ bool ensure_dst_uav(ID3D11Device* device, ID3D11Texture2D* texture)
 
     if (view.Format == DXGI_FORMAT_UNKNOWN)
     {
-        BVR_ERR("AFW: destination format %d cannot take an unordered-access view.",
+        BVR_ERR("DR: destination format %d cannot take an unordered-access view.",
                 static_cast<int>(desc.Format));
         return false;
     }
@@ -3003,7 +3051,7 @@ bool ensure_dst_uav(ID3D11Device* device, ID3D11Texture2D* texture)
                                               &support2, sizeof(support2))) &&
         (support2.OutFormatSupport2 & D3D11_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
     {
-        BVR_ERR("AFW: this driver does not support typed UAV stores to format %d, "
+        BVR_ERR("DR: this driver does not support typed UAV stores to format %d, "
                 "so the synthesised eye cannot be written. Staying on AFR.",
                 static_cast<int>(view.Format));
         return false;
@@ -3011,7 +3059,7 @@ bool ensure_dst_uav(ID3D11Device* device, ID3D11Texture2D* texture)
 
     if (FAILED(device->CreateUnorderedAccessView(texture, &view, &g_dstUav)))
     {
-        BVR_ERR("AFW: could not create a writable view of the destination eye.");
+        BVR_ERR("DR: could not create a writable view of the destination eye.");
         return false;
     }
 
@@ -3021,7 +3069,7 @@ bool ensure_dst_uav(ID3D11Device* device, ID3D11Texture2D* texture)
 
 } // namespace
 
-void afw_set_params(const AfwParams& params)
+void dr_set_params(const DrParams& params)
 {
     if (params.focalPx <= 0.0f || params.baseline <= 0.0f ||
         params.zNear <= 0.0f || params.zFar <= params.zNear)
@@ -3031,46 +3079,46 @@ void afw_set_params(const AfwParams& params)
     g_haveParams.store(true, std::memory_order_release);
 }
 
-bool afw_have_params()
+bool dr_have_params()
 {
     return g_haveParams.load(std::memory_order_acquire);
 }
 
-float afw_focal_px()
+float dr_focal_px()
 {
-    return afw_have_params() ? g_params.focalPx : 0.0f;
+    return dr_have_params() ? g_params.focalPx : 0.0f;
 }
 
-float afw_baseline()
+float dr_baseline()
 {
-    return afw_have_params() ? g_params.baseline : 0.0f;
+    return dr_have_params() ? g_params.baseline : 0.0f;
 }
 
-float afw_z_near()
+float dr_z_near()
 {
-    return afw_have_params() ? g_params.zNear : 0.0f;
+    return dr_have_params() ? g_params.zNear : 0.0f;
 }
 
-float afw_z_far()
+float dr_z_far()
 {
-    return afw_have_params() ? g_params.zFar : 0.0f;
+    return dr_have_params() ? g_params.zFar : 0.0f;
 }
 
 /* Exposed for the depth composition layer, which has to tell the compositor
    which end of the 0..1 range is near. This is the same answer the warp uses,
    deliberately: two independent guesses at the depth direction is how one of
    them ends up inverted and only shows it as an artefact. */
-bool afw_depth_is_reversed()
+bool dr_depth_is_reversed()
 {
     return reversed_depth();
 }
 
-/* Set once per frame by the capture, just before the warp. See afw_warp.h. */
+/* Set once per frame by the capture, just before the warp. See depth_reproject.h. */
 float g_prevRot[9]  = { 1,0,0, 0,1,0, 0,0,1 };
 float g_prevTan[4]  = { 0,0,0,0 };   /* left, right, up, down */
 bool  g_prevRotValid = false;
 
-void afw_set_prev_reproject(const float rot[9], float tanLeft, float tanRight,
+void dr_set_prev_reproject(const float rot[9], float tanLeft, float tanRight,
                             float tanUp, float tanDown, bool valid)
 {
     if (rot != nullptr)
@@ -3088,7 +3136,7 @@ void afw_set_prev_reproject(const float rot[9], float tanLeft, float tanRight,
                      (tanUp - tanDown) > 1e-6f;
 }
 
-void afw_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
+void dr_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
                          ID3D11Texture2D* predicted, ID3D11Texture2D* real,
                          int eye)
 {
@@ -3096,7 +3144,7 @@ void afw_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
        arrive.
      *
        The first run took its whole allowance inside 122 ms - eight consecutive
-       frames at AFW startup, on a static scene - which measures one instant
+       frames at DR startup, on a static scene - which measures one instant
        thoroughly and the session not at all. The first sample of each eye was
        also visibly unsettled, so a burst at startup is the worst window to
        choose. Spacing them shows whether a residual is a constant or something
@@ -3120,14 +3168,14 @@ void afw_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
        spot, looking one way - and the shaking being chased happens somewhere
        else entirely.
 
-       Raise afw_residual_samples to measure for the whole mission instead. It
+       Raise dr_residual_samples to measure for the whole mission instead. It
        costs two full-frame staging copies and a CPU map per sample, so this is a
        DIAGNOSTIC setting: leave it at 12 for play. */
     static int budget = -1;
     if (budget < 0)
-        budget = static_cast<int>(config_float("afw_residual_samples", 12.0f));
+        budget = static_cast<int>(config_float("dr_residual_samples", 12.0f));
 
-    if (taken[eye] >= budget || !afw_have_params() || g_depthUnproven)
+    if (taken[eye] >= budget || !dr_have_params() || g_depthUnproven)
         return;
 
     const uint64_t now = GetTickCount64();
@@ -3181,17 +3229,17 @@ void afw_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
     unstage(context, dep);
 }
 
-bool afw_stood_down()
+bool dr_stood_down()
 {
     return g_standDown;
 }
 
-bool afw_ready()
+bool dr_ready()
 {
     /* Having a depth texture is not the same as having a USABLE one. The search
        hands one back as soon as it settles, but the warp does not run until that
        buffer has proved it contains a drawn scene - see the acceptance gate in
-       afw_warp_eye - and between a mission teardown and that proof the answer
+       dr_warp_eye - and between a mission teardown and that proof the answer
        here has to be no.
 
        It matters because the renderer PINS the source eye off this. Pinning
@@ -3205,11 +3253,11 @@ bool afw_ready()
        a real render of each eye every other frame. Proper stereo at half the
        rate beats no stereo at full rate, and the pin comes back by itself the
        moment the warp is live. */
-    return afw_have_params() && !g_shaderFailed && !g_standDown &&
+    return dr_have_params() && !g_shaderFailed && !g_standDown &&
            eye_depth_texture() != nullptr && !g_depthUnproven;
 }
 
-bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
+bool dr_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
                   ID3D11Texture2D* srcColor, int srcEye, ID3D11Texture2D* dst,
                   ID3D11Texture2D* prevReal)
 {
@@ -3221,7 +3269,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
         return false;
 
     if (device == nullptr || context == nullptr ||
-        srcColor == nullptr || dst == nullptr || !afw_have_params())
+        srcColor == nullptr || dst == nullptr || !dr_have_params())
     {
         ++g_failures;
         return false;
@@ -3381,7 +3429,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
                                                    g_params.zNear, g_params.zFar,
                                                    reversed_depth());
         const float floorM = static_cast<float>(
-            config_float("afw_depth_max_near_m", 3.0f));
+            config_float("dr_depth_max_near_m", 3.0f));
 
         if (nearest <= 0.0f)
         {
@@ -3450,7 +3498,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
         g_depthEmptyTries = 0;
         g_depthFarTries   = 0;
 
-        BVR_INFO("AFW: depth accepted - its nearest geometry is %.2f m, which is "
+        BVR_INFO("DR: depth accepted - its nearest geometry is %.2f m, which is "
                  "the player's own body where it should be. This is the buffer "
                  "the scene was drawn with, and nothing was warped before this "
                  "line.", nearest);
@@ -3479,12 +3527,12 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
     {
         /* OFF BY DEFAULT (TEST 176). It is a full-frame staging copy and a CPU
            map once a second, and the TEST 175 cost line caught it: CPU 0.15 ms
-           mean per AFW frame with a max of 11-12.6 ms, once every second - a
-           frame-sized stall on the render thread. afw_depth_liveness = 1 brings
+           mean per DR frame with a max of 11-12.6 ms, once every second - a
+           frame-sized stall on the render thread. dr_depth_liveness = 1 brings
            the diagnostic back when a dead depth buffer is suspected. */
         static int liveOn = -1;
         if (liveOn < 0)
-            liveOn = config_float("afw_depth_liveness", 0.0f) > 0.5f ? 1 : 0;
+            liveOn = config_float("dr_depth_liveness", 0.0f) > 0.5f ? 1 : 0;
 
         static uint64_t lastLive = 0;
         const uint64_t nowLive = GetTickCount64();
@@ -3498,7 +3546,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
             const float liveNear = depth_nearest_metres(device, context, depth,
                                                         g_params.zNear, g_params.zFar,
                                                         reversed_depth());
-            BVR_INFO("AFW depth liveness: nearest geometry now %.2f m. This must "
+            BVR_INFO("DR depth liveness: nearest geometry now %.2f m. This must "
                      "MOVE as the player walks; a value that stays put means the "
                      "held buffer is no longer being drawn into.", liveNear);
         }
@@ -3536,7 +3584,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        disocclusions are filled from the previous render, this path only ever
        runs on the first frame or two of a mission, before one exists. Paying
        220 iterations for that is not worth it. */
-    p.gapFill = static_cast<float>(config_float("afw_gap_fill_px", 96.0f));
+    p.gapFill = static_cast<float>(config_float("dr_gap_fill_px", 96.0f));
 
     /* Where the soft roll-off starts. Below it the disparity is EXACT, and that
        band is now nearly the whole useful range: 0.85 of a 220 px ceiling is
@@ -3550,7 +3598,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        now tracks the near plane, so this tracks it too: 0.85 of the near-plane
        disparity is a roll-off that begins a few centimetres from the eye and
        governs only geometry clipping through the near plane itself. */
-    const double kneeConfigured = config_float("afw_disparity_knee_px", -1.0f);
+    const double kneeConfigured = config_float("dr_disparity_knee_px", -1.0f);
     p.knee = kneeConfigured > 0.0
                  ? static_cast<float>(kneeConfigured)
                  : p.maxDisparity * 0.85f;
@@ -3559,7 +3607,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
 
     /* Pixel intrinsics for this eye, built here because this is where the
        destination size is known. General asymmetric form, which collapses to the
-       symmetric one on its own - AFW submits a symmetric frustum, but nothing
+       symmetric one on its own - DR submits a symmetric frustum, but nothing
        here needs to assume that. x = cx + fx * (X / -Z), y = cy - fy * (Y / -Z). */
     p.havePrevRot = 0.0f;
     if (g_prevRotValid)
@@ -3585,7 +3633,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
     /* How far one source pixel may stretch before the gap is treated as a depth
        discontinuity rather than a magnified surface. Clamped here rather than
        trusted, because it bounds a loop on the GPU. */
-    float span = static_cast<float>(config_float("afw_max_span_px", 8.0f));
+    float span = static_cast<float>(config_float("dr_max_span_px", 8.0f));
     if (span < 1.0f)  span = 1.0f;
     if (span > 32.0f) span = 32.0f;
     p.maxSpan = span;
@@ -3595,14 +3643,14 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        span uses, because they are the same judgement made twice: below it the
        neighbouring texel is the same surface and may be interpolated, above it
        it is something else and must not be. */
-    p.depthEdge = static_cast<float>(config_float("afw_depth_edge_px", span));
+    p.depthEdge = static_cast<float>(config_float("dr_depth_edge_px", span));
 
     /* The same two tests again, as a FRACTION of the disparity. Whichever of the
        two is larger wins, so the fixed value governs the mid field where the
        disparity is small and this governs the near field where it is not.
        A quarter: a real silhouette up close jumps by nearly the whole disparity,
        so a quarter separates the two cases with room to spare either way. */
-    float frac = static_cast<float>(config_float("afw_span_fraction", 0.25f));
+    float frac = static_cast<float>(config_float("dr_span_fraction", 0.25f));
     if (frac < 0.0f)  frac = 0.0f;
     if (frac > 1.0f)  frac = 1.0f;
     p.spanFrac = frac;
@@ -3610,20 +3658,20 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
     /* Below this disparity the fixed threshold stands alone. ~96 px is about
        0.68 m at this scale: everything from there outward keeps the behaviour
        that worked, and the scaling exists only nearer than that. */
-    p.spanFree = static_cast<float>(config_float("afw_span_free_px", 96.0f));
+    p.spanFree = static_cast<float>(config_float("dr_span_free_px", 96.0f));
 
     /* Below this disparity an ambiguous edge pixel is still allowed to move: the
        whole band shifts by less than a pixel there, so leaving a hole for the
        previous render to fill would cost more than the halo it prevents. Set
        very high to disable the edge holes entirely and take the halo back. */
-    p.edgeHoleMin = static_cast<float>(config_float("afw_edge_hole_min_px", 4.0f));
+    p.edgeHoleMin = static_cast<float>(config_float("dr_edge_hole_min_px", 4.0f));
 
     /* How long a mirrored run the disocclusion fill may paint before it folds
        back on itself. OFF by default: the fold reverses the texture's handedness
        every MirrorMax pixels, so a wide hole shows an inverted half against an
        upright one and the crease between them is the artifact. Set above 0 to
        put it back and compare. */
-    p.mirrorMax = static_cast<float>(config_float("afw_fill_mirror_px", 0.0f));
+    p.mirrorMax = static_cast<float>(config_float("dr_fill_mirror_px", 0.0f));
 
     /* How far into the source the fold-free reflection may reach. Under it the
        fill is an exact 1:1 reflection; past it the offset compresses smoothly
@@ -3635,20 +3683,20 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        "texture" and starts being read as "that rock again, backwards" - a hole
        narrower than this is filled exactly, and only the wide ones behind a
        near object are compressed at all. */
-    p.mirrorReach = static_cast<float>(config_float("afw_fill_mirror_reach_px", 64.0f));
+    p.mirrorReach = static_cast<float>(config_float("dr_fill_mirror_reach_px", 64.0f));
 
     /* Which way the fill runs. 0 reflects the background into the hole, 1 lays
        it across forward out of the band beside the hole, 2 continues forward
        straight past the neighbour - which is the literal inversion of the
        reflection and reaches into the occluder to do it. See the note in the
        gather; 2 is expected to double the object's edge. */
-    p.fillInvert = static_cast<float>(config_float("afw_fill_invert", 1.0f));
+    p.fillInvert = static_cast<float>(config_float("dr_fill_invert", 1.0f));
 
-    /* How long one forward run is under afw_fill_invert = 1. 0 measures the
+    /* How long one forward run is under dr_fill_invert = 1. 0 measures the
        hole and uses its width, so the run covers it exactly once and cannot
        repeat - a fixed run shorter than the hole tiles, and the tiling is
        itself read as the fill being split into pieces. Pin it only to compare. */
-    p.invertRun = static_cast<float>(config_float("afw_fill_invert_run_px", 0.0f));
+    p.invertRun = static_cast<float>(config_float("dr_fill_invert_run_px", 0.0f));
 
     /* The widest hole that is treated as a CRACK and interpolated across from
        both sides rather than invented from one. It scales with distance without
@@ -3659,7 +3707,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        4 px, which at 63 px of disparity per unit is everything past about
        fifteen metres. Higher starts interpolating real disocclusions, which
        blends the occluder into the gap - a halo. 0 turns it off. */
-    p.blendMax = static_cast<float>(config_float("afw_fill_blend_px", 4.0f));
+    p.blendMax = static_cast<float>(config_float("dr_fill_blend_px", 4.0f));
 
     /* Whether a silhouette pixel whose depth texel straddles two surfaces is
        assigned by COLOUR rather than by which texel centre is nearer. Costs
@@ -3667,7 +3715,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        nothing at all when the depth is the same size as the colour - there is
        no ambiguity to resolve then. Under an upscaler it is the difference
        between guessing at every edge in the frame and knowing. */
-    p.colourPick = static_cast<float>(config_float("afw_depth_colour_pick", 1.0f));
+    p.colourPick = static_cast<float>(config_float("dr_depth_colour_pick", 1.0f));
 
     /* THE UPSCALER'S JITTER, TAKEN BACK OUT OF THE DEPTH LOOKUP.
      *
@@ -3690,7 +3738,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
        wide gap is a pixel in mid-air. 8 px is about two metres of separation at
        the current disparity - comfortably the far field, nowhere near the band
        beside something close. 0 restores the plain vote everywhere. */
-    p.colourSoft = static_cast<float>(config_float("afw_depth_colour_soft_px", 8.0f));
+    p.colourSoft = static_cast<float>(config_float("dr_depth_colour_soft_px", 8.0f));
 
     /* How much of the previous synthesised frame a warped pixel keeps.
      *
@@ -3702,22 +3750,51 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
 
        0.5 keeps half of a value the clamp has already agreed with. Higher holds
        harder and risks trails on anything the clamp fails to catch; 0 is off. */
-    p.taa = static_cast<float>(config_float("afw_taa", 0.5f));
+    p.taa = static_cast<float>(config_float("dr_taa", 0.5f));
 
-    const double dejitter = config_float("afw_depth_dejitter", 1.0f);
+    const double dejitter = config_float("dr_depth_dejitter", 1.0f);
 
     p.jitter[0] = 0.0f;
     p.jitter[1] = 0.0f;
 
+    /* DLSS'S OWN NUMBER FIRST, THE FRUSTUM DERIVATION ONLY IF IT IS NOT THERE.
+     *
+       vp_view_jitter measures the jitter off the engine's projection inside the
+       vp_patch scan. Under `mode = engine-camera` that scan never runs - vp_patch
+       is 0 by construction - so it has returned false, and the de-jitter has been
+       OFF, ever since the late latch replaced the patch. The evidence is a run
+       with no "DR de-jitter" line in it at all while the NGX hook was logging a
+       different sub-pixel offset every frame.
+
+       That was always the better source: ngx_jitter is the value DLSS itself was
+       handed, not a value inferred from a matrix, and it is already in
+       render-resolution pixels - which is what the depth buffer is drawn at, so
+       it is a depth-texel offset with no conversion. The derivation stays as the
+       fallback for any mode that does run the patch. */
     float jx = 0.0f, jy = 0.0f;
-    if (dejitter != 0.0 && vp_view_jitter(&jx, &jy))
+    bool  fromNgx = (dejitter != 0.0) && ngx_jitter(&jx, &jy);
+
+    if (fromNgx || (dejitter != 0.0 && vp_view_jitter(&jx, &jy)))
     {
         const float sign     = dejitter < 0.0 ? -1.0f : 1.0f;
         const float depthW   = p.size[0] * p.depthScale[0];
         const float depthH   = p.size[1] * p.depthScale[1];
 
-        p.jitter[0] = sign *  jx * depthW * 0.5f;
-        p.jitter[1] = sign * -jy * depthH * 0.5f;
+        if (fromNgx)
+        {
+            /* Already texels. X only: the warp is one-dimensional and horizontal,
+               so a row read a fraction of a texel off costs far less than getting
+               the sign of that fraction wrong would, and NGX's Y convention is not
+               settled here. */
+            /* ponytail: X-only de-jitter; add Y once a run says which sign it is. */
+            p.jitter[0] = sign * jx;
+            p.jitter[1] = 0.0f;
+        }
+        else
+        {
+            p.jitter[0] = sign *  jx * depthW * 0.5f;
+            p.jitter[1] = sign * -jy * depthH * 0.5f;
+        }
 
         /* Once a second, because the number is the evidence. A real jitter is a
            fraction of a texel and a different fraction every frame; a reading
@@ -3730,11 +3807,11 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
         if (now - s_lastLog > 1000u)
         {
             s_lastLog = now;
-            BVR_INFO("AFW de-jitter: frustum centre is off by %.4f, %.4f NDC "
-                     "this frame = %.2f, %.2f depth texels, taken back out of "
-                     "every depth read. Expect a fraction of a texel, changing "
-                     "every frame; near-zero means the upscaler is off or its "
-                     "jitter is not in the matrix we see.",
+            BVR_INFO("DR de-jitter (%s): %.4f, %.4f this frame = %.2f, %.2f depth "
+                     "texels, taken back out of every depth read. Expect a fraction "
+                     "of a texel, changing every frame; near-zero means the upscaler "
+                     "is off or this is not the jitter it is using.",
+                     fromNgx ? "DLSS, render px" : "frustum centre, NDC",
                      jx, jy, p.jitter[0], p.jitter[1]);
         }
     }
@@ -3827,7 +3904,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
     if (!g_loggedFirst)
     {
         g_loggedFirst = true;
-        BVR_INFO("AFW live: eye %d rendered, eye %d synthesised from its depth. "
+        BVR_INFO("DR live: eye %d rendered, eye %d synthesised from its depth. "
                  "disparity = %.1f px at 1 unit, capped at %.0f px, depth %s, "
                  "depth buffer %.0f%% of the colour. Occlusion resolved by "
                  "SCATTER (nearest claim wins); soft knee at %.0f px so the near "
@@ -3848,7 +3925,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
     if (!g_loggedPrevFill && p.havePrev > 0.5f)
     {
         g_loggedPrevFill = true;
-        BVR_INFO("AFW: disocclusions are now filled from this eye's own previous "
+        BVR_INFO("DR: disocclusions are now filled from this eye's own previous "
                  "render - real geometry, one frame old, instead of background "
                  "stretched sideways across the hole.");
     }
@@ -3856,12 +3933,12 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
     return true;
 }
 
-void afw_log_second()
+void dr_log_second()
 {
     if (g_warps == 0 && g_failures == 0)
         return;
 
-    BVR_INFO("AFW: %u eye(s) synthesised this second, %u failed. Failures should "
+    BVR_INFO("DR: %u eye(s) synthesised this second, %u failed. Failures should "
              "be 0; anything else means the mode fell back to AFR's held image "
              "for those frames.", g_warps, g_failures);
 
@@ -3869,7 +3946,7 @@ void afw_log_second()
     g_failures = 0;
 }
 
-void afw_release()
+void dr_release()
 {
     if (g_lookupUav != nullptr){ g_lookupUav->Release();g_lookupUav = nullptr; }
     if (g_lookup != nullptr)   { g_lookup->Release();   g_lookup = nullptr; }

@@ -41,7 +41,17 @@ namespace bvr {
  * rectangle across the middle of the world, which is worse than none.
  */
 bool ui_key_apply(ID3D11Device* device, ID3D11DeviceContext* context,
-                  ID3D11Texture2D* src, ID3D11Texture2D* dst);
+                  ID3D11Texture2D* src, ID3D11Texture2D* dst,
+                  const float (*punch)[4] = nullptr, int punchCount = 0);
+
+/* TEST 377: crops up to four rectangles of `src` (source pixels, x y w h), keys
+ * them like the head panel, stacks them top-down into `dst` (a wrist texture)
+ * and multiplies alpha by `fade`. The stack is scaled to fill `dst`, at most
+ * `maxScale` times. `hand` picks a cached UAV per wrist texture. */
+bool ui_wrist_blit(ID3D11Device* device, ID3D11DeviceContext* context,
+                   ID3D11Texture2D* src, ID3D11Texture2D* dst, int hand,
+                   const float (*rects)[4], int count, float fade, float maxScale,
+                   float pixelAspect = 1.0f);
 
 /* Builds the monitor image: the eye the headset is showing, scaled to fit the
  * monitor with its aspect preserved, and the keyed interface composited on top.
@@ -65,6 +75,31 @@ bool ui_key_apply(ID3D11Device* device, ID3D11DeviceContext* context,
 bool ui_mirror_compose(ID3D11Device* device, ID3D11DeviceContext* context,
                        ID3D11Texture2D* eye, ID3D11Texture2D* ui,
                        ID3D11Texture2D* dst);
+
+/* TEST 535: the menu screen drawn into one eye image. `src` is the menu image
+ * (sampled raw), `dst` an eye-sized texture with a UAV-able format; every pixel
+ * casts its ray from the eye at the screen's rectangle in the room. All vectors
+ * are OpenXR stage space; size is filled in from `dst`. */
+struct FlatEyeParams
+{
+    float eyePos[4];
+    float axX[4], axY[4], axZ[4];
+    float tan[4];                    /* left, right, up, down */
+    float qc[4], qx[4], qy[4], qn[4];
+    float size[4];
+    float uv[4];                     /* TEST 635: src sub-rect (u0, v0, du, dv); 0 = whole */
+};
+
+bool ui_flat_to_eye(ID3D11Device* device, ID3D11DeviceContext* context,
+                    ID3D11Texture2D* src, ID3D11Texture2D* dst, int eye, FlatEyeParams p);
+
+/* TEST 635: the world labels' quad drawn OVER an eye image instead of beside
+ * it. `ui` (mipped, premultiplied alpha) is sampled through p.uv where each
+ * pixel's ray meets the quad; `base` is the eye image, `dst` receives
+ * base * (1 - a) + ui. `regenMips` rebuilds ui's mips first. */
+bool ui_labels_to_eye(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* ui,
+                      bool regenMips, ID3D11Texture2D* base, ID3D11Texture2D* dst, int eye,
+                      FlatEyeParams p);
 
 /* Frees the shader and cached views. Safe to call twice. */
 void ui_key_release();

@@ -1,4 +1,4 @@
-/* =============================================================================
+﻿/* =============================================================================
  * bvr_api.h - the ONLY surface between BannerlordVR.dll (C#/Mono) and
  *             BannerlordVR.Native.dll (C++/MSVC).
  *
@@ -132,6 +132,27 @@ BVR_API int32_t BVR_CALL bvr_prepare_frame(void);
 BVR_API int32_t BVR_CALL bvr_begin_texture_capture(int32_t eye, uint32_t width, uint32_t height);
 BVR_API int32_t BVR_CALL bvr_end_texture_capture(int32_t eye);
 
+/* The same bracket for the interface render target (TEST 299). C# allocates a
+   BVR_UI target k times the game window, points the Gauntlet views at it, and
+   native keys and submits that instead of the backbuffer - so the interface is
+   rasterised at the headset's own pixel density without resizing the window.
+
+   bvr_set_ui_source(1) each frame the views are swapped, 0 otherwise. */
+BVR_API int32_t BVR_CALL bvr_begin_ui_capture(uint32_t width, uint32_t height);
+BVR_API int32_t BVR_CALL bvr_end_ui_capture(void);
+BVR_API int32_t BVR_CALL bvr_set_ui_source(int32_t fromTarget);
+
+/* TEST 531: the campaign map bar drawn into its own render target (BVR_HAND),
+   so it never reaches the head panel and nothing there is punched for it. The
+   same capture bracket as the UI target; then bvr_set_hand_source(1) while the
+   MapBar layer's view is swapped to it. bvr_get_hand_source_state: 0 off,
+   1 checking, 2 content seen, 3 still empty after ~3 s (C# then swaps the view
+   back and the palette is cropped from the interface as before). */
+BVR_API int32_t BVR_CALL bvr_begin_hand_capture(uint32_t width, uint32_t height);
+BVR_API int32_t BVR_CALL bvr_end_hand_capture(void);
+BVR_API int32_t BVR_CALL bvr_set_hand_source(int32_t live);
+BVR_API int32_t BVR_CALL bvr_get_hand_source_state(void);
+
 /* Publishes the poses the frame was ACTUALLY rendered with, so xrEndFrame
    reprojects against those rather than against newer predictions. Submitting a
    fresher pose than the one used produces subtle swimming that is easy to
@@ -159,7 +180,7 @@ BVR_API int32_t BVR_CALL bvr_afr_eye_consumed(void);
 BVR_API int32_t BVR_CALL bvr_next_afr_eye(void);
 
 /* Hold the alternation on one eye (>= 0), or release it back to the capture path
-   (-1). Pass 0 while afw_pin_source_eye is on, -1 otherwise. */
+   (-1). Pass 0 while dr_pin_source_eye is on, -1 otherwise. */
 BVR_API int32_t BVR_CALL bvr_pin_afr_eye(int32_t eye);
 
 /* --- crash breadcrumb ------------------------------------------------------
@@ -190,6 +211,16 @@ BVR_API void BVR_CALL bvr_breadcrumb(int32_t id);
 #define BVR_CRUMB_WEAPON_HANDS    7
 #define BVR_CRUMB_BODY_HIDE       8
 #define BVR_CRUMB_ENGINE_AIM      9
+/* The mission tick, broken down. It reported only "MissionTick" for the
+   2026-09-29 mid-battle crash, which narrowed a null dereference inside
+   TaleWorlds.Native to seven subsystems and no further. These cost one
+   stored integer each, once a frame. */
+#define BVR_CRUMB_HEAD_AIM       10
+#define BVR_CRUMB_MELEE          11
+#define BVR_CRUMB_PHYS_COMBAT    12
+#define BVR_CRUMB_BOW            13
+#define BVR_CRUMB_HOLSTER        14
+#define BVR_CRUMB_ROOMSCALE      15
 
 /* The yaw, in radians, of the anchor the VR eye frames are built on - the game's
    own camera/body rotation. The OpenXR runtime knows the head pose and nothing
@@ -217,15 +248,6 @@ BVR_API int32_t BVR_CALL bvr_set_body_target(float yawRadians, float x, float y,
    negative value to disable the pairing and put every eye up as it arrives. */
 BVR_API int32_t BVR_CALL bvr_set_sim_generation(int32_t generation);
 
-/* Full AFR: one eye per GAME frame, two game frames inside one DISPLAY frame.
-   The first Present of a pair captures its eye and hands the begun XR frame
-   back rather than ending it, so the engine draws the second eye from the same
-   locate and the same frozen world and the pair goes up together. Both eyes are
-   then real renders of one simulation tick at the full display rate, with
-   nothing held and nothing warped - at the cost of asking the engine for twice
-   the frame rate. Publish it every frame alongside the eye index. */
-BVR_API int32_t BVR_CALL bvr_set_full_afr(int32_t active);
-
 /* Whether draw-duplication stereo is the running mode. The native side owns the
    duplication, so it must be told - and it must be OFF for every other mode, or
    enabling the experiment would change what AFR does. */
@@ -238,6 +260,10 @@ BVR_API int32_t BVR_CALL bvr_set_draw_stereo(int32_t active);
    merely by existing is the mistake draw duplication already made once. */
 BVR_API int32_t BVR_CALL bvr_set_native_stereo(int32_t active);
 
+/* World units per metre of the published eyes: 1 in a battle, the table's scale on
+   the campaign map. Native stereo's IPD sanity bounds are metres and scale by it. */
+BVR_API int32_t BVR_CALL bvr_set_stereo_world_scale(float unitsPerMetre);
+
 /* Whether a VR mission is rendering. 0 puts the headset on the flat screen -
    the game's own image on a quad - which is what the main menu, the campaign
    map, and every non-mission screen need. */
@@ -245,6 +271,146 @@ BVR_API int32_t BVR_CALL bvr_set_mission_active(int32_t active);
 
 /* Composite the game interface over the world instead of replacing it. */
 BVR_API int32_t BVR_CALL bvr_set_ui_overlay(int32_t active);
+
+/* ui_per_eye: this frame's interface was laid out for `eye`, projected from
+   this head pose (stage space, OpenXR axes). The next UI capture goes to that
+   eye's own quad, placed from the same pose. eye 2 = one image for both eyes
+   (TEST 401). */
+BVR_API int32_t BVR_CALL bvr_set_ui_projection(int32_t eye, float px, float py, float pz,
+                                               float qx, float qy, float qz, float qw);
+
+/* TEST 377: the wrist HUDs. Where the HUD widgets that belong on each wrist sit
+   in the interface, in WINDOW pixels (x, y, w, h) of a screenWidth x
+   screenHeight window. Native crops them out of the captured interface onto a
+   quad on that hand's inner wrist and punches them out of the head panel.
+   count 0 for a hand turns its wrist off. 0 = left, 1 = right. 144 bytes. */
+#define BVR_WRIST_MAX_REGIONS 4
+typedef struct BvrWristRegions {
+    float   screenWidth;
+    float   screenHeight;
+    int32_t count[2];
+    float   rects[2][BVR_WRIST_MAX_REGIONS][4];
+} BvrWristRegions;
+
+BVR_API int32_t BVR_CALL bvr_set_wrist_regions(const BvrWristRegions* regions);
+
+/* TEST 590: the interface image shared out instead of cut. In WINDOW pixels of a
+   screenWidth x screenHeight window: the WORLD page (world-anchored widgets) at
+   0,0 is worldW x worldH, shown on its own quad sized by bvr_set_ui_geometry and
+   hung where it was laid out; the HUD page at hudX,0 is hudW x hudH, shown
+   head-locked at the freshest pose, hudWidthM wide at the same distance. The
+   rest of the image holds the hands' widgets and is shown on no head quad.
+   active 0 = one full-window image, as before. 36 bytes. */
+typedef struct BvrUiSplit {
+    int32_t active;
+    float   screenWidth, screenHeight;
+    float   worldW, worldH;
+    float   hudX, hudW, hudH;
+    float   hudWidthM;
+} BvrUiSplit;
+
+BVR_API int32_t BVR_CALL bvr_set_ui_split(const BvrUiSplit* split);
+
+/* TEST 591: draw the game's interface at `factor` x the window (1 < factor <= 4)
+   by binding a dense target wherever the engine binds the backbuffer; 0 off.
+   Managed scales the shaders' pixel clip rects by the same factor. The state is
+   0 off, 1 drawing into the dense target, 2 armed but the interface never
+   reached the backbuffer (managed stands down), 3 standing aside while a 3D
+   scene layer draws into the window with depth. */
+BVR_API int32_t BVR_CALL bvr_set_ui_supersample(float factor);
+BVR_API int32_t BVR_CALL bvr_get_ui_supersample(void);
+
+/* TEST 377d: where `hand`'s wrist panel hangs, worked out from the DRAWN arm, in
+   stage space (OpenXR axes, metres). The quad is then placed there in stage
+   space instead of at the fixed grip-space offset. valid 0 returns the hand to
+   the grip-space offset. TEST 523: valid 2 floats the panel above the
+   controller, facing the head (the pose is ignored); valid 3 the same, sized by
+   the campaign palette's width (TEST 527); valid 4 sits it on top of the other
+   hand's panel at that panel's scale - the palette's tooltip (TEST 532). */
+BVR_API int32_t BVR_CALL bvr_set_wrist_pose(int32_t hand, int32_t valid,
+                                            float px, float py, float pz,
+                                            float qx, float qy, float qz, float qw);
+
+/* TEST 378: the laser pointer. Native casts the ray from `hand`'s aim pose
+   against whatever can be pointed at this frame - the VR panel first, then the
+   game's interface (the flat screen or the interface quad) - and draws the beam
+   and a dot where it lands. enabled 0 leaves only the VR panel pointable.
+   beamToUi 0 hit-tests without drawing (the campaign map draws its own beam to
+   the terrain). click is the active hand's trigger as managed reads it, used
+   for the VR panel; the game's own clicks go through the pad. During deployment,
+   groundDistance bypasses the head UI quad and extends the beam to terrain:
+   positive for a terrain hit, negative for a ray with no hit, zero otherwise. */
+typedef struct BvrLaser {
+    int32_t valid;      /* the ray landed on something pointable */
+    int32_t hand;       /* 0 = left, 1 = right */
+    int32_t target;     /* 0 none, 1 the game's interface, 2 the VR panel, 3 a hand
+                           panel (TEST 532; u/v are window coordinates, like 1) */
+    float   u, v;       /* where, as image coordinates: 0,0 top-left */
+    float   distance;   /* metres along the ray */
+} BvrLaser;             /* 24 bytes */
+
+BVR_API int32_t BVR_CALL bvr_set_laser(int32_t enabled, int32_t hand, int32_t beamToUi,
+                                       int32_t click, float groundDistance);
+BVR_API int32_t BVR_CALL bvr_get_laser(BvrLaser* out);
+
+/* TEST 651: the laser ray as last drawn for `hand` - stage space, the direction
+   smoothed (laser_smooth_hz / _beta). BVR_SESSION_NOT_READY when that hand has
+   not been drawn in the last 100 ms. */
+BVR_API int32_t BVR_CALL bvr_get_laser_ray(int32_t hand, BvrVec3* origin, BvrVec3* dir);
+
+/* TEST 378: 1 pins the interface quad where it hangs now, level, at eye height
+   (the flat screen's rule), and shows one image to both eyes while pinned - a
+   menu that stays put in the room to be pointed at. 0 returns it to the head. */
+BVR_API int32_t BVR_CALL bvr_set_ui_pin(int32_t pinned);
+
+/* TEST 379: ui_eye_lag at runtime. 1 pairs each interface image with the
+   PREVIOUS projection published; the campaign map and missions can differ. */
+BVR_API int32_t BVR_CALL bvr_set_ui_eye_lag(int32_t lag);
+
+/* TEST 633: display refreshes each app frame stays on screen, smoothed (~1 at
+   the display rate, ~2.5 at 47 fps on a 120 Hz headset). */
+BVR_API float BVR_CALL bvr_get_periods_per_frame(void);
+
+/* --- changing the render scale without restarting the game ----------------
+ *
+ * A HANDSHAKE, not a call, because the two halves own different pieces: the eye
+ * TEXTURES belong to the engine and only managed can release and re-ask for
+ * them, while the SWAPCHAINS belong to OpenXR and only the frame-loop thread
+ * may touch them. Neither side can do this alone and neither may block the
+ * other, so each watches a stage instead.
+ *
+ * The sequence managed follows:
+ *
+ *   1  bvr_request_rescale(scale)          -> stage 1, draining frames in flight
+ *   2  poll bvr_rescale_stage() until 2    -> the old eye textures have been let
+ *                                             go and the new size is chosen. THE
+ *                                             SWAPCHAINS ARE STILL THE OLD SIZE.
+ *   3  release its own targets, create them at the new size, wait for rgl
+ *   4a got them   -> bvr_rescale_swap()    -> stage 3; the swapchains are rebuilt
+ *                                             to match, then stage returns to 0
+ *   4b could not  -> bvr_rescale_abort(previousScale) -> back to stage 2 at the
+ *                                             OLD size, where the untouched
+ *                                             swapchains still fit, and try again
+ *   5  re-point the scene view, bvr_rescale_finish()
+ *
+ * THE ORDER IS THE SAFETY. Destroying working swapchains before the new textures
+ * exist is what turned "rgl would not give us textures" into a headset with no
+ * image and no way back. Now the only irreversible step happens after the
+ * reversible one has succeeded, and 4b is a real way home.
+ *
+ * Frames carry no layers from step 1 to step 5, so the headset is black for that
+ * window - a moment of black being the honest thing to show when there is no
+ * image, rather than a held pair locked to the head.
+ *
+ * scale is the ABSOLUTE render scale, 0.25 to 1.0, the same number the config
+ * key holds. Passed explicitly rather than re-read from the file because the
+ * config write and this call otherwise race, and losing that race rebuilds at
+ * the old size - which looks exactly like the button doing nothing. */
+BVR_API int32_t BVR_CALL bvr_request_rescale(float scale);
+BVR_API int32_t BVR_CALL bvr_rescale_swap(void);
+BVR_API int32_t BVR_CALL bvr_rescale_abort(float previousScale);
+BVR_API int32_t BVR_CALL bvr_rescale_stage(void);
+BVR_API int32_t BVR_CALL bvr_rescale_finish(void);
 
 /* Whether a mission exists at all. Drives the window mirror. */
 BVR_API int32_t BVR_CALL bvr_set_in_mission(int32_t active);
@@ -261,14 +427,18 @@ BVR_API int32_t BVR_CALL bvr_set_screen_geometry(float width, float distance);
    that ended up somewhere awkward can be fixed without restarting. */
 BVR_API int32_t BVR_CALL bvr_repin_flat_screen(void);
 
+/* TEST 710: re-pins only if the head is turned more than `degrees` left or right
+   of the screen. Used when a new screen opens. */
+BVR_API int32_t BVR_CALL bvr_repin_flat_screen_if_turned(float degrees);
+
 /* Which of the three single-render stereo modes is running, and the geometry
    they all need.
 
      mode 0  AFR. The eye that was not rendered is HELD from its own last real
              render and submitted with the pose it was drawn at.
-     mode 1  AFW. That eye is SYNTHESISED from the rendered one by reprojecting
+     mode 1  DR. That eye is SYNTHESISED from the rendered one by reprojecting
              it through the depth buffer, so both eyes come from one instant.
-     mode 2  AFW+AFR hybrid. Held while the head is still - where a real render
+     mode 2  DR+AFR hybrid. Held while the head is still - where a real render
              is exact and no warp can improve on it - and warped once it moves,
              where a held eye would be displaced by the movement.
 
@@ -276,7 +446,7 @@ BVR_API int32_t BVR_CALL bvr_repin_flat_screen(void);
    from the same focal length and baseline and is drawn under AFR too.
    focalPx = (eye width / 2) / tan(hfov / 2); baseline and the planes are in game
    world units. */
-BVR_API int32_t BVR_CALL bvr_set_afw(int32_t mode, float focalPx, float baseline,
+BVR_API int32_t BVR_CALL bvr_set_depth_reproject(int32_t mode, float focalPx, float baseline,
                                      float zNear, float zFar);
 
 /* 1 once the warp can actually synthesise an eye - shader built, parameters set,
@@ -287,7 +457,7 @@ BVR_API int32_t BVR_CALL bvr_set_afw(int32_t mode, float focalPx, float baseline
    with no other source of content, so while this is 0 that eye would be filled
    with a copy of the other one and the view would go flat. Alternating until it
    turns 1 gives ordinary AFR instead, which is real stereo at half the rate. */
-BVR_API int32_t BVR_CALL bvr_afw_ready(void);
+BVR_API int32_t BVR_CALL bvr_depth_reproject_ready(void);
 
 /* --- view-projection patching -------------------------------------------
  * Every managed route into the engine's camera was tried and measured; the
@@ -375,7 +545,7 @@ typedef struct BvrOverlayState
     float worldScale;
     float renderScale;
 
-    /* 0 = alternate-frame, 1 = native stereo, 2 = alternate-frame warping. */
+    /* 0 = alternate-frame, 1 = native stereo, 2 = depth reprojection. */
     int32_t stereoMode;
 
     /* Push-only. A mode has been asked for but the scene has not restarted yet,
@@ -473,7 +643,276 @@ typedef struct BvrOverlayState
        Two-way, 0..1. CAS on the finished eye images at submit, in every render
        mode; 0 is off. Appended LAST so every field above keeps its offset. */
     float   sharpen;
+
+    /* --- the menu pointer -------------------------------------------------
+       How fast the thumbstick drags the cursor across menus, in screen widths
+       per second at full deflection. Two-way, and applied live: it is judged by
+       moving the stick and watching, not by reading the number.
+
+       Purely a managed setting - nothing native reads it - but it belongs on
+       this struct because the panel is the only place it can be changed from
+       inside a headset, which is the only place it is ever wrong.
+
+       Appended LAST, after sharpen, so every field above keeps its offset. */
+    float   stickMouseSpeed;
+
+    /* --- applying a resolution change without a restart -------------------
+       resolutionApply is poll-only and cleared as it is read, exactly like
+       tableauProbe: clicking Apply is an EVENT. It exists because the slider is
+       only half live on its own - lowering it is immediate, since the scene is
+       simply shaded at a smaller fraction of the eye target, while RAISING it
+       above what the targets were allocated for has nothing to raise. Apply
+       rebuilds the pair at the new size.
+
+       resolutionState is push-only, so the button can say what is happening
+       rather than the player wondering whether it took:
+         0 idle   1 rebuilding   2 live at the new size   3 failed
+
+       Appended LAST, after stickMouseSpeed, so every field above keeps its
+       offset. */
+    int32_t resolutionApply;
+    int32_t resolutionState;
+
+    /* --- physical collision combat (TEST 244) -----------------------------
+       Two-way, like hideBody and motionHands: pushed so the checkbox shows the
+       truth after a config load, read back so clicking it means something. It
+       switches the mod's own physics off - the player's swings no longer hit,
+       a raised shield no longer blocks, arrows stop on nothing - while leaving
+       motion-control hands, weapons and the game's own trigger attacks alone.
+
+       Appended LAST, after resolutionState, so every field above keeps its
+       offset. */
+    int32_t physicalCombat;
+
+    /* --- the full body (TEST 258) -----------------------------------------
+       Two-way, like the toggles above. OFF reverts to the normal animated body:
+       no pelvis or torso follow, no leg solve, no held pose, and the camera
+       anchors to the engine's own head again. ON is the full-body IK, whose
+       animation diet is the body_anim key (legs or full).
+
+       Appended LAST, after physicalCombat, so every field above keeps its
+       offset. */
+    int32_t bodyIk;
+
+    /* --- motion-control combat (TEST 245-252) ------------------------------
+       Two-way, like the toggles above. One switch for the whole gesture melee:
+       a swing writes the game's own attack direction, a raised hand is the
+       guard, the blade lands the damage itself and the body holds still through
+       engine attacks. OFF is the game's own combat - the trigger and the
+       movement stick attack and block, and every animation plays.
+
+       Appended LAST, after bodyIk, so every field above keeps its offset. */
+    int32_t motionMelee;
+
+    /* --- friendly fire (TEST 261) -----------------------------------------
+       Two-way, like the toggles above. ON lets a physical swing land on
+       friends and neutrals; OFF (the default) is the vanilla single-player
+       rule, enemies only. Missions that forbid friendly fire refuse it either
+       way - the managed side checks ForceNoFriendlyFire.
+
+       Appended LAST, after motionMelee, so every field above keeps its
+       offset. */
+    int32_t friendlyFire;
+
+    /* --- which controller the grip is saved for ----------------------------
+       Two-way. The dropdown index on the Calibration section; managed turns it
+       into the config suffix (grip_rotation_main_psvr2 and so on) and reloads
+       that controller's grips. 0 is the unsuffixed generic keys.
+
+       Appended LAST, after friendlyFire, so every field above keeps its
+       offset. */
+    int32_t gripController;
+
+    /* --- body holsters (TEST 271) ------------------------------------------
+       Two-way. ON: the trigger in a body zone draws or sheathes a weapon and
+       the trigger's vanilla attack is off in a fight. OFF gives the trigger
+       back. Appended LAST, after gripController, so every field above keeps
+       its offset. */
+    int32_t holster;
+
+    /* --- the campaign map in VR (map_stereo) ----------------------------
+       Two-way. Takes effect once no map is bound to the eye texture - the
+       binding cannot be undone. Appended LAST, after holster. */
+    int32_t mapVr;
+
+    /* --- the VR tab (TEST 293) --------------------------------------------
+       Two-way. The head camera's offset from the body, in metres along the
+       body's heading (up, forward), and how far the head turns before the body
+       follows (TEST 291), in degrees. recenter is a one-shot: the PANEL's to
+       raise and managed's to consume, like resolutionApply. Appended LAST,
+       after mapVr. */
+    float headUp;
+    float headForward;
+    float bodyTurnDeg;
+    int32_t recenter;
+
+    /* --- hands only ---------------------------------------------------------
+       Two-way, like hideBody - and only has an effect while hideBody is on: it
+       is a variant of the full hide, keeping the hand meshes (matched by name,
+       like hide_body_hand_meshes) drawn alongside the weapon instead of hiding
+       everything but the weapon. Appended LAST, after recenter. */
+    int32_t handsOnly;
+
+    /* --- your height (TEST 356) -----------------------------------------------
+       playerHeight is two-way: the player's standing height in metres, which
+       the character is scaled to match (0 = the game's own size). heightMeasure
+       is a one-shot like recenter: the PANEL's to raise, managed's to consume -
+       measure the headset's height now. bodyScale is push-only: the scale that
+       gave. Appended LAST, after handsOnly. */
+    float playerHeight;
+    int32_t heightMeasure;
+    float bodyScale;
+
+    /* --- the wrist HUD's size (TEST 377e) --------------------------------------
+       Two-way: the wrist panel's width in metres. The panel applies it the moment
+       the slider moves; managed keeps the mirror and saves it. Appended LAST. */
+    float wristHudWidth;
+
+    /* --- foveated rendering, NVIDIA VRS (TEST 427) ------------------------------
+       Two-way: 0 off, 1 wide, 2 balanced, 3 narrow. The panel applies it the
+       moment the dropdown moves; managed keeps the mirror and saves `vrs`.
+       Appended LAST. */
+    int32_t vrs;
+
+    /* --- eye-tracked foveation (TEST 428) ---------------------------------------
+       Two-way: 1 = the VRS centre follows the gaze when the runtime gives one.
+       The panel applies it; managed saves `vrs_eye`. Appended LAST. */
+    int32_t vrsEye;
+
+    /* --- the head camera's height in the saddle (TEST 442) -----------------------
+       Two-way, metres: used INSTEAD of headUp while the player rides. Managed
+       saves `head_offset_mounted_up_m`. Appended LAST. */
+    float headUpMounted;
+
+    /* --- your body (TEST 450 / 447) -----------------------------------------------
+       Two-way. armScale: the arms' length against the character's own, 0.80-1.30
+       (managed saves `arm_length_scale`). bodyWeight: seconds the chest takes to
+       follow the head's turn, 0 = instant (managed saves `body_weight_s`).
+       Appended LAST. */
+    float armScale;
+    float bodyWeight;
+
+    /* --- battle HUD extras (TEST 462) ----------------------------------------------
+       Two-way, 0/1. hudHitMarker: the crosshair's hit marker without the reticle
+       (managed saves `hud_hit_marker`). hudPrompts: the pickup prompt - the item's
+       name and its button (managed saves `hud_prompts`). Appended LAST. */
+    int32_t hudHitMarker;
+    int32_t hudPrompts;
+
+    /* --- five-finger hands (TEST 485) ------------------------------------------------
+       Two-way, 0/1: the player's own gloves bend per finger (managed saves
+       `finger_mesh`); 0 = the game's hands. Appended LAST. */
+    int32_t handFingers;
+
+    /* --- the campaign map's hand palette size (TEST 527) ---------------------------
+       Two-way: the map bar panel's width in metres, separate from wristHudWidth
+       (the battle wrists). The panel applies it; managed saves `hand_ui_width_m`.
+       Appended LAST. */
+    float mapHandUiWidth;
+
+    /* --- D-pad chord on the left thumbrest -----------------------------------------
+       Two-way, 0/1: a thumb resting on the LEFT thumbrest (Quest Touch) is also the
+       D-pad modifier for the right stick, beside the left stick held in. Managed
+       saves `dpad_thumbrest`. Appended LAST. */
+    int32_t dpadThumbrest;
+
+    /* --- TEST 620: world-anchored UI size under the split (TEST 590) -------------
+       Two-way: how big the battle markers (formations, objectives) and the campaign
+       map labels draw, x the game's own UI scale. Managed applies them per layer and
+       saves `ui_world_scale_battle` / `ui_world_scale_map`. Appended LAST. */
+    float uiWorldScaleBattle;
+    float uiWorldScaleMap;
+
+    /* --- TEST 645: your weapon is solid against your own shield (TEST 642) --------
+       Two-way, 0/1. Managed saves `collide_own_shield`. Appended LAST. */
+    int32_t ownShieldBash;
+
+    /* --- TEST 648: the pre-battle formation markers' size ---------------------------
+       Two-way: x the game's UI scale, capped by what still fits the cards on the
+       palette (they share one layer). Managed saves `ui_world_scale_deploy_markers`.
+       Appended LAST. */
+    float uiWorldScaleDeploy;
+
+    /* --- TEST 711: re-centre a new screen, and only past this turn-away angle ----
+       Two-way. Managed saves `ui_recenter_new_screen` and `ui_recenter_angle`.
+       Appended LAST. */
+    int32_t uiRecenterNewScreen;
+    float uiRecenterAngle;
+
+    /* --- fov_true_vertical: symmetric across, the runtime's own up/down ------
+       Two-way. Managed saves `fov_true_vertical`. Appended LAST. */
+    int32_t fovTrueVertical;
+
+    /* --- TEST 750: the Calibration tool tab ---------------------------------
+       toolMode (0 weapon, 1 hand grip) and toolHand (0 main, 1 off) are the
+       panel's, echoed back. toolLive is push-only: 1 holding it now, 0 dropped
+       (the sliders grey, the saves stay), -1 nothing to edit. toolValue is
+       x, y, z metres then yaw, pitch, roll degrees, two-way. toolCommand is a
+       poll-only event (BVR_TOOL_CMD_*). The two texts are push-only, ANSI.
+       Appended LAST. */
+    int32_t toolMode;
+    int32_t toolHand;
+    int32_t toolLive;
+    int32_t toolCommand;
+    float toolValue[6];
+    char toolLabel[128];
+    char toolStatus[128];
+
+    /* --- TEST 751: pose profiles and equipping from the tool -----------------
+       toolProfile: 0 Original, 1 Profile 1, 2 Profile 2. Two-way, managed saves
+       `skin_profile`. toolWielded: push-only, the main hand's slot 0..3 or -1.
+       toolSlot: push-only names of the four weapon slots, "" when empty.
+       Appended LAST. */
+    int32_t toolProfile;
+    int32_t toolWielded;
+    char toolSlot[4][48];
+
+    /* --- TEST 770: fov crop, VD-style tangent multipliers (0.5-1.0) ----------
+       Two-way. Managed saves `fov_crop_h` / `fov_crop_v`; the eye targets
+       follow through resolutionApply. Appended LAST. */
+    float fovCropH;
+    float fovCropV;
+
+    /* --- TEST 785: detailed fov crop, one multiplier per edge ---------------
+       Two-way. fovCropDetailed 1 = the four edges below apply instead of
+       fovCropH/V. Managed saves fov_crop_detailed / _left / _right / _up /
+       _down. Appended LAST. */
+    int32_t fovCropDetailed;
+    float fovCropLeft;
+    float fovCropRight;
+    float fovCropUp;
+    float fovCropDown;
+
+    /* --- TEST 790: sharpener, 0 CAS / 1 RCAS --------------------------------
+       Two-way. Managed saves `sharpen_mode`. Appended LAST. */
+    int32_t sharpenMode;
+
+    /* --- TEST 797: DLSS preset ----------------------------------------------
+       Two-way. The cfg value: 0 auto (driver profile, else K), 10 J, 11 K,
+       12 L, 13 M, -1 DLSS's own. Managed saves `dlss_preset`. Appended LAST. */
+    int32_t dlssPreset;
+    int32_t gripToggle;
+
 } BvrOverlayState;
+
+/* TEST 750: toolCommand values. SAME VALUES as BvrToolCommand in NativeBridge.cs. */
+enum
+{
+    BVR_TOOL_CMD_NONE = 0,
+    BVR_TOOL_CMD_ADJUST = 1,
+    BVR_TOOL_CMD_SAVE_ITEM = 2,
+    BVR_TOOL_CMD_SAVE_CLASS = 3,
+    BVR_TOOL_CMD_ZERO = 4,
+    BVR_TOOL_CMD_REVERT = 5,
+    BVR_TOOL_CMD_SAVE_HAND = 6,
+    BVR_TOOL_CMD_EQUIP_0 = 7,      /* 7..10: wield weapon slot 0..3 (TEST 751) */
+    BVR_TOOL_CMD_SHEATHE = 11
+};
+
+/* Mouse-wheel notches for the panel, from the game thread (the render thread
+   has no message pump to read the wheel from). Accumulated until the panel's
+   next frame. */
+BVR_API int32_t BVR_CALL bvr_overlay_scroll(float notches);
 
 BVR_API int32_t BVR_CALL bvr_overlay_toggle(void);
 BVR_API int32_t BVR_CALL bvr_overlay_visible(void);
@@ -487,6 +926,28 @@ BVR_API int32_t BVR_CALL bvr_overlay_poll(BvrOverlayState* outState);
 
 /* --- input (Phase 6) ---------------------------------------------------- */
 BVR_API int32_t BVR_CALL bvr_get_input_state(BvrInputState* outState);
+
+/* TEST 452: once per game frame, before anything reads input - locate both hands
+ * on the game thread for this moment plus leadFrames display periods. Every
+ * bvr_get_input_state after it (for up to 100 ms) returns that sample. */
+BVR_API int32_t BVR_CALL bvr_latch_input(float leadFrames);
+
+/* TEST 482: the controllers' touch sensors, for the finger hands - the left
+ * hand in bits 0-7 and the right in 8-15, each a BVR_TOUCH_* set. A sensor the
+ * runtime did not bind (a profile without it, or the profile declined with it)
+ * reports neither its _BOUND bit nor touched; 0 before input is up. */
+#define BVR_TOUCH_TRIGGER        0x1u   /* a finger rests on the trigger */
+#define BVR_TOUCH_THUMB          0x2u   /* the thumb rests on the stick, a face button or the thumbrest */
+#define BVR_TOUCH_TRIGGER_BOUND  0x4u
+#define BVR_TOUCH_THUMB_BOUND    0x8u
+#define BVR_TOUCH_THUMBREST      0x10u  /* the thumb rests on the thumbrest itself (Touch only) */
+BVR_API uint32_t BVR_CALL bvr_get_finger_touch(void);
+
+/* A pulse on one controller: 0 = left, 1 = right, amplitude 0..1, duration in
+   seconds. Returns BVR_OK when the runtime took it and BVR_SESSION_NOT_READY
+   when there is no session, no vibration action or no binding - a caller may
+   call it on every block without guarding anything itself. Thread-safe from the
+   game thread; the session handle is guarded against shutdown. */
 BVR_API int32_t BVR_CALL bvr_trigger_haptic(int32_t hand, float amplitude, float durationSeconds);
 
 /* --- teardown ----------------------------------------------------------- */

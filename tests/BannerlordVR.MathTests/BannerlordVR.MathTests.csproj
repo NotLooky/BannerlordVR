@@ -45,6 +45,28 @@
     <Reference Include="TaleWorlds.DotNet">
       <HintPath>$(GameBinDir)\TaleWorlds.DotNet.dll</HintPath>
     </Reference>
+
+    <!-- TEST 245: VrMelee's gesture table lives on Agent.UsageDirection and
+         Agent.MovementControlFlag, so loading the type at all needs the game's
+         own assembly present. -->
+    <Reference Include="TaleWorlds.MountAndBlade">
+      <HintPath>$(GameBinDir)\TaleWorlds.MountAndBlade.dll</HintPath>
+    </Reference>
+
+    <!-- TEST 271: VrHolster's rule table is keyed on ItemObject.ItemTypeEnum. -->
+    <Reference Include="TaleWorlds.Core">
+      <HintPath>$(GameBinDir)\TaleWorlds.Core.dll</HintPath>
+    </Reference>
+    <!-- TEST 590: the interface split's patches and packer live on Gauntlet types. -->
+    <Reference Include="TaleWorlds.GauntletUI">
+      <HintPath>$(GameBinDir)\TaleWorlds.GauntletUI.dll</HintPath>
+    </Reference>
+    <Reference Include="TaleWorlds.Engine.GauntletUI">
+      <HintPath>$(GameBinDir)\TaleWorlds.Engine.GauntletUI.dll</HintPath>
+    </Reference>
+    <Reference Include="TaleWorlds.TwoDimension">
+      <HintPath>$(GameBinDir)\TaleWorlds.TwoDimension.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
   <!-- No Properties= on this reference, deliberately. Passing global properties

@@ -28,6 +28,9 @@ namespace BannerlordVR.VR
 
         public static string Path { get; private set; }
 
+        /// <summary>The mod's own BannerlordVR.default.cfg (see Load).</summary>
+        private static string _shipped;
+
         public static void Load()
         {
             if (_loaded)
@@ -36,6 +39,17 @@ namespace BannerlordVR.VR
 
             try
             {
+                // The release's tested settings, in the module root two folders
+                // above this DLL. The player's file goes on top, so it holds only
+                // what they changed and Save never touches this one. The native
+                // config_load layers the same two files the same way.
+                string shipped = System.IO.Path.Combine(
+                    System.IO.Path.GetDirectoryName(typeof(VrConfig).Assembly.Location),
+                    "..", "..", "BannerlordVR.default.cfg");
+                _shipped = shipped;
+                if (File.Exists(shipped))
+                    VrLog.Info($"Loaded {ReadInto(shipped)} shipped default(s) from {shipped}.");
+
                 Path = System.IO.Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                     "Mount and Blade II Bannerlord", "Configs", "BannerlordVR.cfg");
@@ -46,20 +60,7 @@ namespace BannerlordVR.VR
                     return;
                 }
 
-                foreach (string raw in File.ReadAllLines(Path))
-                {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line[0] == '#' || line[0] == ';')
-                        continue;
-
-                    int eq = line.IndexOf('=');
-                    if (eq <= 0)
-                        continue;
-
-                    Values[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
-                }
-
-                VrLog.Info($"Loaded {Values.Count} setting(s) from {Path}.");
+                VrLog.Info($"Loaded {ReadInto(Path)} setting(s) from {Path}.");
 
                 if (Values.TryGetValue("mode", out string mode))
                 {
@@ -72,6 +73,25 @@ namespace BannerlordVR.VR
             {
                 VrLog.Error("Could not read the config; using defaults.", ex);
             }
+        }
+
+        private static int ReadInto(string file)
+        {
+            int count = 0;
+            foreach (string raw in File.ReadAllLines(file))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0 || line[0] == '#' || line[0] == ';')
+                    continue;
+
+                int eq = line.IndexOf('=');
+                if (eq <= 0)
+                    continue;
+
+                Values[line.Substring(0, eq).Trim()] = line.Substring(eq + 1).Trim();
+                count++;
+            }
+            return count;
         }
 
         // --- modes ------------------------------------------------------------
@@ -188,14 +208,30 @@ namespace BannerlordVR.VR
         {
             Load();
             Values[key] = value;
+            return WriteKey(Path, key, value);
+        }
 
-            if (string.IsNullOrEmpty(Path))
+        /// <summary>
+        /// TEST 553: Save, and the same line into the mod's own default cfg, so an
+        /// equipment pose belongs to the mod rather than to one player's file - a
+        /// deleted live config keeps it, and the build carries it into the tracked
+        /// module\BannerlordVR.default.cfg (tools\write-default-cfg.ps1).
+        /// </summary>
+        public static bool SaveToMod(string key, string value)
+        {
+            bool saved = Save(key, value);
+            return WriteKey(_shipped, key, value) && saved;
+        }
+
+        private static bool WriteKey(string file, string key, string value)
+        {
+            if (string.IsNullOrEmpty(file))
                 return false;
 
             try
             {
-                var lines = File.Exists(Path)
-                    ? new List<string>(File.ReadAllLines(Path))
+                var lines = File.Exists(file)
+                    ? new List<string>(File.ReadAllLines(file))
                     : new List<string>();
 
                 bool replaced = false;
@@ -225,12 +261,12 @@ namespace BannerlordVR.VR
                     lines.Add(key + " = " + value);
                 }
 
-                File.WriteAllLines(Path, lines);
+                File.WriteAllLines(file, lines);
                 return true;
             }
             catch (Exception ex)
             {
-                VrLog.Error("Could not write " + key + " back to the config.", ex);
+                VrLog.Error("Could not write " + key + " to " + file + ".", ex);
                 return false;
             }
         }
@@ -263,6 +299,27 @@ namespace BannerlordVR.VR
                    int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
                 ? parsed
                 : fallback;
+        }
+
+        /// <summary>A comma-separated list of exactly fallback.Length numbers, or
+        /// the fallback.</summary>
+        public static float[] Floats(string key, float[] fallback)
+        {
+            if (!Lookup(key, out string value))
+                return fallback;
+
+            string[] parts = value.Split(',');
+            if (parts.Length != fallback.Length)
+                return fallback;
+
+            var parsed = new float[parts.Length];
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (!float.TryParse(parts[i].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out parsed[i]))
+                    return fallback;
+            }
+
+            return parsed;
         }
     }
 }

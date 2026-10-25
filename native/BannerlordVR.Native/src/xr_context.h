@@ -41,9 +41,63 @@ int32_t xr_set_mission_active(int32_t active);
 /* What xr_set_mission_active last set. Any thread. */
 bool xr_mission_active();
 
+/* --- the live resolution rescale ------------------------------------------
+ *
+ * Rebuilds the eye swapchains at a new render scale without restarting the
+ * game. A handshake rather than a call, because the eye TEXTURES belong to the
+ * engine and only the managed half can release and re-ask for them; see the
+ * long note above rescale_step in xr_context.cpp.
+ *
+ * Stages: 0 idle, 1 draining the frames in flight, 2 let go of the old pair and
+ * re-sized - managed is re-capturing, 3 rebuilding the swapchains, 4 failed.
+ *
+ * THE SWAPCHAINS SURVIVE STAGE 2, which is what makes failure survivable. They
+ * are still sized for the pair managed just released, so a managed half that
+ * cannot get new textures calls abort(previousScale) and re-allocates at the old
+ * size, landing back on something that works. Only when managed reports success
+ * does swap() destroy anything that currently functions. */
+int32_t xr_request_rescale(float scale);
+int32_t xr_rescale_swap();
+int32_t xr_rescale_abort(float previousScale);
+int32_t xr_rescale_stage();
+int32_t xr_rescale_finish();
+
 /* Whether a menu should be composited OVER the world rather than replacing it.
    The tactics wheel and anything else meant to be used mid-fight. */
 int32_t xr_set_ui_overlay(int32_t active);
+int32_t xr_set_ui_projection(int32_t eye, float px, float py, float pz,
+                             float qx, float qy, float qz, float qw);
+
+/* TEST 377e: the wrist panels' width in metres, live, from the VR panel. */
+void wrist_hud_set_width(float metres);
+
+/* TEST 527: the campaign map palette's width (placement mode 3), live. */
+void map_hand_ui_set_width(float metres);
+
+/* TEST 531: the map bar's own render target is live (see bvr_set_hand_source),
+   and what the content check has seen of it. */
+int32_t xr_set_hand_source(int32_t live);
+int32_t xr_hand_source_state();
+
+/* TEST 377: where the wrist HUDs' widgets are in the interface. */
+int32_t xr_set_wrist_regions(const BvrWristRegions* regions);
+int32_t xr_set_ui_split(const BvrUiSplit* split);
+
+/* TEST 620: vp_publish, game thread - a camera publication follows the newest
+   interface layout in the same frame (the OnFrameTick postfix, after the views
+   ticked) and names it to the late latch. */
+void xr_note_vp_published(const float eyeCameraPos[3]);
+int32_t xr_set_wrist_pose(int32_t hand, int32_t valid, float px, float py, float pz,
+                          float qx, float qy, float qz, float qw);
+
+/* TEST 378: the laser pointer and the pinned menu. TEST 379: runtime eye lag. */
+int32_t xr_set_laser(int32_t enabled, int32_t hand, int32_t beamToUi, int32_t click,
+                     float groundDistance);
+int32_t xr_get_laser(BvrLaser* out);
+int32_t xr_get_laser_ray(int32_t hand, BvrVec3* origin, BvrVec3* dir);
+int32_t xr_set_ui_pin(int32_t pinned);
+int32_t xr_set_ui_eye_lag(int32_t lag);
+float xr_get_periods_per_frame();
 
 /* Whether a mission exists, as distinct from whether the stereo path is live.
    Drives the window mirror and the backbuffer clear. */
@@ -52,6 +106,11 @@ int32_t xr_set_in_mission(int32_t active);
 /* Size and distance of the keyed interface layer, in metres. */
 int32_t xr_set_ui_geometry(float width, float distance);
 
+/* TEST 299: whether the interface is coming from our own dense render target
+   (1) or from the game's backbuffer (0). Raised by C# only while the Gauntlet
+   views are swapped onto it. */
+int32_t xr_set_ui_source(int32_t fromTarget);
+
 /* Size and distance of the flat screen, in metres. */
 int32_t xr_set_screen_geometry(float width, float distance);
 
@@ -59,7 +118,21 @@ int32_t xr_set_screen_geometry(float width, float distance);
    places it in front of the head again. Wired to recentre. */
 int32_t xr_repin_flat_screen();
 
+/* TEST 710: the same, but only if the head is turned more than `degrees` away. */
+int32_t xr_repin_flat_screen_if_turned(float degrees);
+
+/* fov_true_vertical, live from the VR panel. */
+void xr_set_fov_true_vertical(bool on);
+
+/* TEST 770: fov crop tangent multipliers (0.5-1.0), live from the VR panel.
+   The eye targets follow at the next rescale. */
+void xr_set_fov_crop(float left, float right, float up, float down, bool outerOnly);   /* TEST 785: per edge */
+
 bool    xr_recommended_size(uint32_t* width, uint32_t* height);
+
+/* The per-eye size a render scale and fov crop would build, by the rebuild's
+   own rule - for the VR panel's readout. False before the first enumeration. */
+bool    xr_eye_size_at(float scale, float left, float right, float up, float down, uint32_t* width, uint32_t* height);
 int32_t xr_session_state();
 bool    xr_instance_ready();
 
@@ -76,7 +149,7 @@ int32_t xr_afr_eye_consumed();
 int32_t xr_next_afr_eye();
 
 /* Hold the sequence on one eye (>= 0) or release it back to the capture path
-   (-1). Used by afw_pin_source_eye. */
+   (-1). Used by dr_pin_source_eye. */
 int32_t xr_pin_afr_eye(int32_t eye);
 
 /* Which eye the engine is drawing right now, or -1. Read by the NGX hook to
@@ -107,17 +180,9 @@ int32_t xr_set_used_views(const BvrEyeView* views, int64_t displayTime);
    disables the pairing entirely. See afr_capture. */
 int32_t xr_set_sim_generation(int32_t generation);
 
-/* Full AFR: one eye per GAME frame, two game frames per DISPLAY frame. The
-   first Present of a pair captures its eye and hands the begun XR frame back
-   instead of ending it, so the second eye is rendered from the same locate and
-   the same world state and the pair is submitted together - both eyes real, at
-   the full display rate. See XrState::fullAfr and the defer branch in
-   render_frame. */
-int32_t xr_set_full_afr(int32_t active);
-
-/* Selects AFW and hands it the stereo geometry the warp needs. Lengths are in
-   game world units. See afw_warp.h. */
-int32_t xr_set_afw(int32_t mode, float focalPx, float baseline,
+/* Selects DR and hands it the stereo geometry the warp needs. Lengths are in
+   game world units. See depth_reproject.h. */
+int32_t xr_set_depth_reproject(int32_t mode, float focalPx, float baseline,
                    float zNear, float zFar);
 
 /* Managed thread. Latest poses published by the render thread. */

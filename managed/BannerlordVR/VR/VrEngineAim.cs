@@ -247,6 +247,10 @@ namespace BannerlordVR.VR
         /// note.</summary>
         public static float BodyYaw { get; private set; }
 
+        /// <summary>TEST 518: the body heading turned counter-clockwise from above (as
+        /// RotateAboutUp turns) - VrSiege carrying the player round a machine.</summary>
+        internal static void TurnBody(float ccw) => BodyYaw = WrapPi(BodyYaw - ccw);
+
         /// <summary>True once the head is genuinely contributing to the game's
         /// look, which is the only condition under which the anchor must stop
         /// reading the agent's look direction directly.</summary>
@@ -434,6 +438,20 @@ namespace BannerlordVR.VR
                     _prevMouseYaw = mouseYaw;
                     _prevMousePitch = mousePitch;
                     BodyYaw = lookYaw;
+
+                    // TEST 611: in the saddle, the HORSE's facing. After pre-battle
+                    // the agent's look is still the deployment camera's bearing, so
+                    // the body started sideways on the horse ("not centred on my
+                    // horse after Ready"; chest yaw at its 90 deg cap on the first
+                    // frame). Without deployment both agree.
+                    Vec2 horse = agent.MountAgent?.GetMovementDirection() ?? Vec2.Zero;
+                    if (horse.LengthSquared > 1e-6f)
+                    {
+                        BodyYaw = (float)Math.Atan2(horse.x, horse.y);
+                        VrLog.Info(string.Format(
+                            "TEST 611: mounted spawn - body heading seeded from the horse ({0:F1} deg), "
+                            + "not the look ({1:F1} deg).", BodyYaw * 57.2957795f, lookYaw * 57.2957795f));
+                    }
 
                     if (AbsoluteAim && SkipCalibration && _phase == Phase.Calibrating)
                     {

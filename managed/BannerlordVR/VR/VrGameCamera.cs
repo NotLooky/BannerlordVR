@@ -84,6 +84,7 @@ namespace BannerlordVR.VR
 
         private static bool _have;
         private static Vec3 _origin;
+        private static Agent _capturedAgent;
 
         private static bool _haveRaw;
         private static MatrixFrame _rawFrame;
@@ -198,9 +199,23 @@ namespace BannerlordVR.VR
                 Vec3 origin = frame.origin;
 
                 // See MaxDistance: this is what says the first-person branch is
-                // the one that ran.
+                // the one that ran. NOT on a modded mount (anything but the vanilla
+                // horse, camel and mule), or a dismount from one: big mounts seat
+                // the rider far from the mount's ground position - Realm of
+                // Thrones' dragon 5.8 m, 10.3 m hovering; its elephant ~4 m, more
+                // as the rider pitches on a hard stop - and every rejection fell
+                // to the formula point straight above the mount's centre,
+                // flickering in and out of it. A vanilla rider never nears 3.5 m.
+                //
+                // The dragon rider floating off the back in slow, wing-beating
+                // flight is RoT's own (flat too, 2026-10-17); the view follows the
+                // rider. Steering it onto the seat bone (TEST 701) put it inside
+                // the dragon and off the body - do not retry that.
                 float distance = (origin - agent.Position).Length;
-                if (distance > MaxDistance)
+                string mountId = agent.MountAgent?.Monster?.StringId;
+                bool vanillaMount = mountId == "horse" || mountId == "camel" || mountId == "mule";
+                float limit = VrHeadBody.Saddled(agent) && !vanillaMount ? float.MaxValue : MaxDistance;
+                if (distance > limit)
                 {
                     if (!_loggedReject)
                     {
@@ -210,13 +225,14 @@ namespace BannerlordVR.VR
                             + "limit, so the engine built a third-person or spectator camera this "
                             + "frame. The anchor falls back to the computed eye point while that "
                             + "lasts. Raise game_first_person_max_m if this is wrong.",
-                            distance, MaxDistance));
+                            distance, limit));
                     }
 
                     return;
                 }
 
                 _origin = origin;
+                _capturedAgent = agent;
                 _have = true;
 
                 if (!_loggedCapture)
@@ -242,6 +258,9 @@ namespace BannerlordVR.VR
         public static bool TryGetEyeOrigin(out Vec3 origin)
         {
             origin = _origin;
+            Agent agent = Mission.Current?.MainAgent;
+            if (_have && !ReferenceEquals(agent, _capturedAgent))
+                return false;
 
             if (Enabled && !_have && !_loggedNoCapture)
             {
@@ -280,12 +299,12 @@ namespace BannerlordVR.VR
             return _haveRaw;
         }
 
-        /// <summary>Forgets the captured camera. Called when the mission changes,
-        /// so a new scene cannot be anchored to the old one's camera.</summary>
+        /// <summary>Forget the captured camera when its mission ends.</summary>
         public static void Reset()
         {
             _have = false;
             _haveRaw = false;
+            _capturedAgent = null;
         }
 
         private static bool IsUsable(Vec3 v)

@@ -42,6 +42,13 @@ void    stereo_perf_map_end(int64_t t0, ID3D11Resource* r);
    stereo. */
 void stereo_perf_ngx_stamp(ID3D11DeviceContext* ctx, int point);
 void stereo_perf_ngx_cpu(int64_t ticks);
+
+/* Every engine draw and dispatch in native stereo (stereo_begin), with the first
+   surface it writes and how many it writes: kind 0 a draw's first render target,
+   1 a depth-only draw's depth target, 2 a dispatch's first UAV. On a sampled frame
+   a different surface opens a new GPU-timed pass (TEST 196). One compare and a
+   return on every other frame. */
+void stereo_perf_pass(ID3D11DeviceContext* ctx, ID3D11Resource* out, int kind, int count);
 /* Every ~5 s from stereo_frame_boundary, with the stereo code's own numbers. */
 void stereo_perf_report(double decideMsPerFrame, double issueMsPerFrame, uint64_t frames,
                         uint64_t twinBytes);

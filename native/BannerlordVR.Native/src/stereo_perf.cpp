@@ -3,13 +3,17 @@
 #include <windows.h>
 #include <dxgi1_4.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 
 #include "bvr_config.h"
 #include "bvr_log.h"
 #include "d3d_hooks.h"
 #include "stereo_dup.h"
+#include "water_spec_aa.h"
 
 #include <atomic>
+#include <vector>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
@@ -157,7 +161,7 @@ std::atomic<uint64_t> g_mapCount{ 0 };
 /* GPU timestamps. A slot measures one frame: t0 when our tick ENDS (the engine's
    frame starts), t1 when the next tick BEGINS (the engine's frame is submitted),
    t2 when that tick ends. The disjoint query brackets all three. Collected a few
-   frames later without ever waiting - the same ring AFW's cost line uses. */
+   frames later without ever waiting - the same ring DR's cost line uses. */
 struct GpuSlot
 {
     ID3D11Query* dj = nullptr;
@@ -169,6 +173,7 @@ struct GpuSlot
     ID3D11Query* n[3] = { nullptr, nullptr, nullptr };
     bool         nHave[3] = { false, false, false };
     int          stage = 0;       /* 0 free, 1 opened, 2 t1 stamped, 3 pending */
+    int          probe = -1;      /* TEST 548: the water probe phase this frame ran in */
 };
 
 constexpr int kGpuSlots = 8;
@@ -248,6 +253,7 @@ void gpu_collect(ID3D11DeviceContext* ctx)
         }
 
         const double engine = static_cast<double>(b - a) * 1000.0 / static_cast<double>(dj.Frequency);
+        water_probe_sample(s.probe, engine);
         const double tick = static_cast<double>(c - b) * 1000.0 / static_cast<double>(dj.Frequency);
         g_sumGpuEngine += engine;
         g_sumGpuTick += tick;
@@ -290,6 +296,7 @@ void gpu_open(ID3D11DeviceContext* ctx)
         ctx->Begin(s.dj);
         ctx->End(s.t0);
         s.nHave[0] = s.nHave[1] = s.nHave[2] = false;
+        s.probe = water_probe_open();
         s.stage = 1;
         g_gpuOpen = i;
         return;
@@ -307,6 +314,292 @@ void gpu_close_open(ID3D11DeviceContext* ctx)
         ctx->End(s.dj);
     s.stage = 0;
     g_gpuOpen = -1;
+}
+
+// ---------------------------------------------------------------------------
+// GPU time by pass (TEST 196)
+//
+// DLSS Performance, Balanced and Quality ran within a few fps of each other
+// (18:16 run: ~66, ~66, ~55), GPU-bound, with the render thread waiting ~8 ms of
+// every frame for it. So most of the GPU's frame does not depend on the render
+// size, and the two numbers above (engine frame, our tick) cannot say which part.
+// On one frame in kPassEvery, every change of the surface the engine writes to
+// ends a timestamp: the time until the next one is that pass - with its second
+// eye, which is issued straight after each operation. Summed by what the pass
+// writes (size, format, how many targets), so the same pass lines up across
+// frames. Work that runs on another queue (DLSS's own) lands in whichever pass
+// the GPU was in when it ran, not in the DLSS call's own interval.
+// ---------------------------------------------------------------------------
+
+constexpr int kPassStamps = 256;
+constexpr int kPassSlots = 4;
+constexpr int kPassRows = 48;
+constexpr int kPassLabel = 64;
+constexpr uint64_t kPassEvery = 23;     /* not a multiple of anything periodic */
+
+struct PassSlot
+{
+    ID3D11Query* dj = nullptr;
+    ID3D11Query* ts[kPassStamps + 1] = {};
+    char         label[kPassStamps][kPassLabel];
+    int          n = 0;          /* passes opened; ts[n] closes the last */
+    int          stage = 0;      /* 0 free, 1 recording, 2 waiting on the GPU */
+};
+
+PassSlot*       g_pass = nullptr;            /* kPassSlots, made on first use */
+int             g_passRec = -1;
+ID3D11Resource* g_passKey = nullptr;
+int             g_passKeyKind = -1;
+int             g_passKeyCount = -1;
+bool            g_passFailed = false;
+uint64_t        g_passFrameNo = 0;
+
+struct PassRow { char label[kPassLabel]; double ms; };
+PassRow  g_passRows[kPassRows];
+int      g_passRowCount = 0;
+uint64_t g_passFrames = 0;
+double   g_passTotalMs = 0.0;
+int      g_passMost = 0;
+
+/* Appends to a fixed buffer; a truncated write fills it and later ones stop. */
+void append_to(char* buf, size_t cap, size_t& used, const char* fmt, ...)
+{
+    if (used + 1 >= cap)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    const int wrote = _vsnprintf_s(buf + used, cap - used, _TRUNCATE, fmt, args);
+    va_end(args);
+    used = wrote < 0 ? cap - 1 : used + static_cast<size_t>(wrote);
+}
+
+void pass_describe(ID3D11Resource* r, int kind, int count, char* out, size_t n)
+{
+    switch (kind)
+    {
+    case 3: strcpy_s(out, n, "DLSS call, eye 0"); return;
+    case 4: strcpy_s(out, n, "DLSS call, eye 1 (with its setup)"); return;
+    case 5: strcpy_s(out, n, "after DLSS, before the next pass"); return;
+    default: break;
+    }
+    const char* verb = kind == 2 ? "compute into" : kind == 1 ? "depth-only draw into" : "draw into";
+    if (r == nullptr)
+    {
+        _snprintf_s(out, n, _TRUNCATE, "%s nothing", verb);
+        return;
+    }
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    r->GetType(&dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        D3D11_TEXTURE2D_DESC d = {};
+        static_cast<ID3D11Texture2D*>(r)->GetDesc(&d);
+        char arr[16] = "";
+        if (d.ArraySize > 1)
+            _snprintf_s(arr, _TRUNCATE, " [%u]", d.ArraySize);
+        if (count > 1)
+            _snprintf_s(out, n, _TRUNCATE, "%s %d targets %ux%u%s fmt %u", verb, count, d.Width,
+                        d.Height, arr, static_cast<unsigned>(d.Format));
+        else
+            _snprintf_s(out, n, _TRUNCATE, "%s %ux%u%s fmt %u", verb, d.Width, d.Height, arr,
+                        static_cast<unsigned>(d.Format));
+    }
+    else if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+    {
+        D3D11_TEXTURE3D_DESC d = {};
+        static_cast<ID3D11Texture3D*>(r)->GetDesc(&d);
+        _snprintf_s(out, n, _TRUNCATE, "%s 3D %ux%ux%u fmt %u", verb, d.Width, d.Height, d.Depth,
+                    static_cast<unsigned>(d.Format));
+    }
+    else if (dim == D3D11_RESOURCE_DIMENSION_BUFFER)
+    {
+        D3D11_BUFFER_DESC d = {};
+        static_cast<ID3D11Buffer*>(r)->GetDesc(&d);
+        _snprintf_s(out, n, _TRUNCATE, "%s a %u KB buffer", verb, (d.ByteWidth + 1023) / 1024);
+    }
+    else
+    {
+        _snprintf_s(out, n, _TRUNCATE, "%s a surface of dimension %d", verb, static_cast<int>(dim));
+    }
+}
+
+void pass_add(const char* label, double ms)
+{
+    for (int i = 0; i < g_passRowCount; ++i)
+        if (strcmp(g_passRows[i].label, label) == 0)
+        {
+            g_passRows[i].ms += ms;
+            return;
+        }
+    if (g_passRowCount < kPassRows - 1)
+    {
+        PassRow& row = g_passRows[g_passRowCount++];
+        strcpy_s(row.label, label);
+        row.ms = ms;
+        return;
+    }
+    /* the last row takes whatever did not get one of its own */
+    PassRow& rest = g_passRows[kPassRows - 1];
+    if (g_passRowCount == kPassRows - 1)
+    {
+        strcpy_s(rest.label, "every other pass");
+        rest.ms = 0.0;
+        g_passRowCount = kPassRows;
+    }
+    rest.ms += ms;
+}
+
+void pass_release_all()
+{
+    if (g_pass == nullptr)
+        return;
+    for (int k = 0; k < kPassSlots; ++k)
+    {
+        PassSlot& s = g_pass[k];
+        if (s.dj) { s.dj->Release(); s.dj = nullptr; }
+        for (ID3D11Query*& q : s.ts)
+            if (q) { q->Release(); q = nullptr; }
+    }
+}
+
+/* At the end of our tick: the engine's next frame starts here. */
+void pass_open(ID3D11DeviceContext* ctx)
+{
+    g_passRec = -1;
+    if (g_passFailed || (++g_passFrameNo % kPassEvery) != 0)
+        return;
+
+    if (g_pass == nullptr)
+    {
+        ID3D11Device* dev = engine_device();
+        if (dev == nullptr)
+            return;
+        g_pass = new PassSlot[kPassSlots];
+        const D3D11_QUERY_DESC dj = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+        const D3D11_QUERY_DESC ts = { D3D11_QUERY_TIMESTAMP, 0 };
+        bool ok = true;
+        for (int k = 0; k < kPassSlots && ok; ++k)
+        {
+            PassSlot& s = g_pass[k];
+            ok = SUCCEEDED(dev->CreateQuery(&dj, &s.dj));
+            for (int i = 0; i <= kPassStamps && ok; ++i)
+                ok = SUCCEEDED(dev->CreateQuery(&ts, &s.ts[i]));
+        }
+        if (!ok)
+        {
+            pass_release_all();
+            g_passFailed = true;
+            BVR_WARN("GPU by pass: could not create timestamp queries; no breakdown.");
+            return;
+        }
+    }
+
+    for (int k = 0; k < kPassSlots; ++k)
+    {
+        PassSlot& s = g_pass[k];
+        if (s.stage != 0)
+            continue;
+        ctx->Begin(s.dj);
+        ctx->End(s.ts[0]);
+        strcpy_s(s.label[0], "frame start, before the engine's first pass");
+        s.n = 1;
+        s.stage = 1;
+        g_passRec = k;
+        g_passKey = nullptr;
+        g_passKeyKind = -1;
+        g_passKeyCount = -1;
+        return;
+    }
+    /* every slot still waiting on the GPU: skip this sample */
+}
+
+/* At the start of our tick: the engine's frame has been issued. */
+void pass_close(ID3D11DeviceContext* ctx, bool keep)
+{
+    if (g_passRec < 0)
+        return;
+    PassSlot& s = g_pass[g_passRec];
+    g_passRec = -1;
+    ctx->End(s.ts[s.n]);
+    ctx->End(s.dj);
+    s.stage = keep ? 2 : 0;
+}
+
+void pass_collect(ID3D11DeviceContext* ctx)
+{
+    if (g_pass == nullptr)
+        return;
+    for (int k = 0; k < kPassSlots; ++k)
+    {
+        PassSlot& s = g_pass[k];
+        if (s.stage != 2)
+            continue;
+
+        UINT64 stamps[kPassStamps + 1] = {};
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+        if (ctx->GetData(s.ts[s.n], &stamps[s.n], sizeof(UINT64), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
+            ctx->GetData(s.dj, &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        bool ready = true;
+        for (int i = 0; i < s.n && ready; ++i)
+            ready = ctx->GetData(s.ts[i], &stamps[i], sizeof(UINT64),
+                                 D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        if (!ready)
+            continue;
+
+        s.stage = 0;
+        if (dj.Disjoint || dj.Frequency == 0)
+            continue;
+        bool ordered = true;
+        for (int i = 0; i < s.n && ordered; ++i)
+            ordered = stamps[i + 1] >= stamps[i];
+        if (!ordered)
+            continue;
+
+        const double toMs = 1000.0 / static_cast<double>(dj.Frequency);
+        for (int i = 0; i < s.n; ++i)
+            pass_add(s.label[i], static_cast<double>(stamps[i + 1] - stamps[i]) * toMs);
+        g_passTotalMs += static_cast<double>(stamps[s.n] - stamps[0]) * toMs;
+        if (s.n > g_passMost)
+            g_passMost = s.n;
+        ++g_passFrames;
+    }
+}
+
+void pass_report()
+{
+    if (g_passFrames == 0)
+        return;
+
+    const double frames = static_cast<double>(g_passFrames);
+    const double total = g_passTotalMs / frames;
+    char line[3072] = {};
+    size_t used = 0;
+    append_to(line, sizeof(line), used,
+              "GPU by pass (%llu sampled frame(s), both eyes, up to %d passes a frame): %.2f ms a "
+              "frame from the engine's frame start to our tick. Largest:",
+              static_cast<unsigned long long>(g_passFrames), g_passMost, total);
+
+    bool taken[kPassRows] = {};
+    for (int rank = 0; rank < 16 && rank < g_passRowCount; ++rank)
+    {
+        int best = -1;
+        for (int i = 0; i < g_passRowCount; ++i)
+            if (!taken[i] && (best < 0 || g_passRows[i].ms > g_passRows[best].ms))
+                best = i;
+        if (best < 0)
+            break;
+        taken[best] = true;
+        const double ms = g_passRows[best].ms / frames;
+        append_to(line, sizeof(line), used, "%s %s %.2f ms (%.0f%%)", rank ? " |" : "",
+                  g_passRows[best].label, ms, total > 0.0 ? 100.0 * ms / total : 0.0);
+    }
+    BVR_INFO("%s", line);
+
+    g_passRowCount = 0;
+    g_passFrames = 0;
+    g_passTotalMs = 0.0;
+    g_passMost = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +818,343 @@ DWORD WINAPI sampler_main(LPVOID)
     }
 }
 
+/* ===========================================================================
+   WHERE THE RENDER THREAD'S TIME GOES (TEST 188).
+
+   "Native stereo ~35 fps with or without DLSS, GPU at 50%." The perf line had
+   the render thread at 94-99% of a core with the stereo code's own decide and
+   issue under 2 ms of a 29 ms frame - CPU-bound, and not in anything the
+   counters name. Thread CPU says THAT it is busy; only a profile says WHERE.
+
+   So a sampling profiler on that one thread: about a thousand times a second
+   it is suspended, its instruction pointer and a page of its stack are read,
+   and it is resumed. Nothing between Suspend and Resume takes a user-mode lock
+   (GetThreadContext and ReadProcessMemory are system calls), so it cannot
+   deadlock on a lock the render thread holds. Module lookups happen after the
+   resume, against a module list refreshed between reports.
+
+   Reported every ~5 s: time by module at the instruction pointer; how often
+   our DLL is anywhere on the stack (a scan for return addresses, so an
+   over-estimate); and the hottest addresses, plus the nearest caller inside
+   TaleWorlds.Native and inside BannerlordVR.Native. stereo_profile = 0 off.
+   =========================================================================== */
+struct ModRange
+{
+    uintptr_t base;
+    uintptr_t end;
+    char      name[48];
+};
+
+constexpr int kMods = 256;
+ModRange g_mods[kMods];
+int      g_modCount = 0;
+int      g_modEngine = -1;
+int      g_modOurs = -1;
+
+void refresh_modules()
+{
+    HMODULE list[kMods];
+    DWORD needed = 0;
+    g_modCount = 0;
+    g_modEngine = -1;
+    g_modOurs = -1;
+    if (!K32EnumProcessModules(GetCurrentProcess(), list, sizeof(list), &needed))
+        return;
+    const int n = static_cast<int>(needed / sizeof(HMODULE)) < kMods
+                      ? static_cast<int>(needed / sizeof(HMODULE)) : kMods;
+    for (int i = 0; i < n; ++i)
+    {
+        MODULEINFO mi = {};
+        if (!K32GetModuleInformation(GetCurrentProcess(), list[i], &mi, sizeof(mi)))
+            continue;
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(list[i], path, MAX_PATH);
+        const char* name = strrchr(path, '\\');
+        name = name ? name + 1 : path;
+        ModRange& m = g_mods[g_modCount];
+        m.base = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+        m.end = m.base + mi.SizeOfImage;
+        strncpy_s(m.name, name, _TRUNCATE);
+        if (_stricmp(m.name, "TaleWorlds.Native.dll") == 0) g_modEngine = g_modCount;
+        if (_stricmp(m.name, "BannerlordVR.Native.dll") == 0) g_modOurs = g_modCount;
+        ++g_modCount;
+    }
+}
+
+int module_of(uintptr_t a)
+{
+    for (int i = 0; i < g_modCount; ++i)
+        if (a >= g_mods[i].base && a < g_mods[i].end)
+            return i;
+    return -1;
+}
+
+struct Hit
+{
+    uintptr_t key;
+    uint32_t  n;
+};
+
+constexpr int kHitSlots = 4096;
+
+void hit_add(Hit* table, uintptr_t key)
+{
+    size_t h = (key * 0x9E3779B97F4A7C15ull) >> 52;       /* 12 bits */
+    for (int probe = 0; probe < kHitSlots; ++probe)
+    {
+        Hit& e = table[(h + probe) & (kHitSlots - 1)];
+        if (e.key == key) { ++e.n; return; }
+        if (e.key == 0) { e.key = key; e.n = 1; return; }
+    }
+}
+
+void hit_top(const Hit* table, Hit* out, int k)
+{
+    for (int i = 0; i < k; ++i) out[i] = Hit{ 0, 0 };
+    for (int s = 0; s < kHitSlots; ++s)
+    {
+        if (table[s].key == 0) continue;
+        for (int i = 0; i < k; ++i)
+        {
+            if (table[s].n > out[i].n)
+            {
+                for (int m = k - 1; m > i; --m) out[m] = out[m - 1];
+                out[i] = table[s];
+                break;
+            }
+        }
+    }
+}
+
+void describe_addr(uintptr_t a, char* out, size_t n)
+{
+    const int m = module_of(a);
+    if (m < 0)
+        _snprintf_s(out, n, _TRUNCATE, "%p", reinterpret_cast<void*>(a));
+    else
+        _snprintf_s(out, n, _TRUNCATE, "%s+0x%llX", g_mods[m].name,
+                    static_cast<unsigned long long>(a - g_mods[m].base));
+}
+
+Hit g_hitRip[kHitSlots];
+Hit g_hitEngine[kHitSlots];
+Hit g_hitOurs[kHitSlots];
+
+void report_list(const char* title, const Hit* table, uint64_t samples, bool round)
+{
+    Hit top[10];
+    hit_top(table, top, 10);
+    char line[1400] = {};
+    size_t used = 0;
+    for (int i = 0; i < 10 && top[i].n > 0; ++i)
+    {
+        char a[96];
+        describe_addr(top[i].key, a, sizeof(a));
+        const int w = _snprintf_s(line + used, sizeof(line) - used, _TRUNCATE, "%s%s%s %.1f%%",
+                                  i ? ", " : "", a, round ? "(~)" : "",
+                                  100.0 * top[i].n / static_cast<double>(samples));
+        if (w < 0) break;
+        used += static_cast<size_t>(w);
+    }
+    BVR_INFO("Render thread profile: %s: %s", title, line[0] ? line : "(none)");
+}
+
+/* Fraction of each 5 s report period spent sampling. Re-read at every report,
+   so it can be changed without restarting the game. */
+double duty_now()
+{
+    double d = static_cast<double>(config_float("stereo_profile_duty", 0.1f));
+    if (d < 0.01) d = 0.01;
+    if (d > 1.0)  d = 1.0;
+    return d;
+}
+
+/* THE PROFILER SAMPLES IN WINDOWS, NOT CONTINUOUSLY.
+ *
+ * One sample is SuspendThread / GetThreadContext / ReadProcessMemory of 8 KB of
+ * stack / ResumeThread, on the PRESENT thread. At the 1 ms cadence below that is
+ * several hundred suspensions a second, for as long as native stereo runs, and
+ * SuspendThread is asynchronous - it can land inside a D3D call. The 2026-09-17
+ * run carried it the whole time (3186 samples per 5 s report). That is a lot of
+ * jitter to pay in normal play for an instrument that is only read when
+ * something is being diagnosed.
+ *
+ * A histogram does not need anything like that many samples. The 5 s report
+ * cadence and every line of the report are unchanged; sampling now runs for
+ * stereo_profile_duty of each period (0.1 = the first ~500 ms, ~600 samples)
+ * and idles for the rest. The window always extends until the existing
+ * 50-sample floor is cleared, so a report is never starved.
+ *
+ * stereo_profile_duty = 1.0 restores the old continuous behaviour for a
+ * measurement session. stereo_profile = 0 is still the off switch. */
+DWORD WINAPI profiler_main(LPVOID)
+{
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                          CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    DWORD tid = 0;
+    HANDLE th = nullptr;
+    uint64_t samples = 0, ours = 0, engineOnStack = 0;
+    uint64_t byMod[kMods + 1] = {};
+    int64_t lastReport = qpc();
+    std::vector<uint8_t> stack(8192);
+
+    double duty = duty_now();
+
+    refresh_modules();
+
+    /* One suspend-and-read of the Present thread. False means it could not be
+       taken this time, which is not worth reporting - the next one will be. */
+    auto take_sample = [&]() -> bool
+    {
+        const DWORD want = present_thread_id();
+        if (want == 0)
+            return false;
+        if (want != tid)
+        {
+            if (th) CloseHandle(th);
+            th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                            FALSE, want);
+            tid = th ? want : 0;
+            if (!th)
+                return false;
+        }
+
+        CONTEXT c = {};
+        c.ContextFlags = CONTEXT_CONTROL;
+        SIZE_T got = 0;
+        bool ok = false;
+        if (SuspendThread(th) != static_cast<DWORD>(-1))
+        {
+            if (GetThreadContext(th, &c))
+            {
+                ok = true;
+                ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(c.Rsp),
+                                  stack.data(), stack.size(), &got);
+            }
+            ResumeThread(th);
+        }
+        if (!ok)
+            return false;
+
+        ++samples;
+        const uintptr_t rip = static_cast<uintptr_t>(c.Rip);
+        const int m = module_of(rip);
+        ++byMod[m < 0 ? kMods : m];
+        hit_add(g_hitRip, rip & ~static_cast<uintptr_t>(0x3F));
+
+        bool sawOurs = (m == g_modOurs && m >= 0);
+        bool sawEngine = (m == g_modEngine && m >= 0);
+        uintptr_t firstEngine = sawEngine ? rip : 0;
+        uintptr_t firstOurs = sawOurs ? rip : 0;
+        const size_t words = got / sizeof(uintptr_t);
+        const uintptr_t* q = reinterpret_cast<const uintptr_t*>(stack.data());
+        for (size_t i = 0; i < words && (!firstEngine || !firstOurs); ++i)
+        {
+            const uintptr_t v = q[i];
+            if (g_modOurs >= 0 && !firstOurs && v >= g_mods[g_modOurs].base &&
+                v < g_mods[g_modOurs].end)
+            {
+                firstOurs = v;
+                sawOurs = true;
+            }
+            if (g_modEngine >= 0 && !firstEngine && v >= g_mods[g_modEngine].base &&
+                v < g_mods[g_modEngine].end)
+            {
+                firstEngine = v;
+                sawEngine = true;
+            }
+        }
+        if (sawOurs) ++ours;
+        if (sawEngine) ++engineOnStack;
+        if (firstEngine) hit_add(g_hitEngine, firstEngine);
+        if (firstOurs) hit_add(g_hitOurs, firstOurs);
+        return true;
+    };
+
+    for (;;)
+    {
+        /* Sampling for the first duty-fraction of the period, and beyond it if
+           the 50-sample floor has not been cleared yet. */
+        const bool inWindow = qpc_to_ms(qpc() - lastReport) < 5000.0 * duty ||
+                              samples < 50;
+
+        if (!inWindow)
+        {
+            /* Idling out the rest of the period. Nothing is being suspended. */
+            Sleep(10);
+        }
+        else if (timer != nullptr)
+        {
+            LARGE_INTEGER due = {};
+            due.QuadPart = -10000;                      /* 1 ms */
+            SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(timer, 50);
+        }
+        else
+        {
+            Sleep(1);
+        }
+
+        if (!perf_live() || !config_bool("stereo_profile", true))
+        {
+            if (th) { CloseHandle(th); th = nullptr; tid = 0; }
+            samples = ours = engineOnStack = 0;
+            memset(byMod, 0, sizeof(byMod));
+            memset(g_hitRip, 0, sizeof(g_hitRip));
+            memset(g_hitEngine, 0, sizeof(g_hitEngine));
+            memset(g_hitOurs, 0, sizeof(g_hitOurs));
+            Sleep(200);
+            lastReport = qpc();
+            continue;
+        }
+
+        if (inWindow)
+            take_sample();
+
+        const int64_t now = qpc();
+        if (qpc_to_ms(now - lastReport) < 5000.0 || samples < 50)
+            continue;
+        lastReport = now;
+        duty = duty_now();
+
+        char mods[900] = {};
+        size_t used = 0;
+        for (int pass = 0; pass < 8; ++pass)
+        {
+            int best = -2;
+            uint64_t bestN = 0;
+            for (int i = 0; i <= kMods; ++i)
+                if (byMod[i] > bestN) { bestN = byMod[i]; best = i; }
+            if (best == -2)
+                break;
+            const int w = _snprintf_s(mods + used, sizeof(mods) - used, _TRUNCATE, "%s%s %.1f%%",
+                                      pass ? ", " : "",
+                                      best == kMods ? "(no module)" : g_mods[best].name,
+                                      100.0 * bestN / static_cast<double>(samples));
+            byMod[best] = 0;
+            if (w < 0) break;
+            used += static_cast<size_t>(w);
+        }
+        BVR_INFO("Render thread profile over %llu sample(s): by module at the instruction "
+                 "pointer: %s | BannerlordVR.Native anywhere on the stack in %.1f%%, "
+                 "TaleWorlds.Native in %.1f%%.",
+                 static_cast<unsigned long long>(samples), mods,
+                 100.0 * ours / static_cast<double>(samples),
+                 100.0 * engineOnStack / static_cast<double>(samples));
+        report_list("hottest instruction pointers (64-byte buckets)", g_hitRip, samples, true);
+        report_list("nearest TaleWorlds.Native caller", g_hitEngine, samples, false);
+        report_list("nearest BannerlordVR.Native caller", g_hitOurs, samples, false);
+
+        samples = ours = engineOnStack = 0;
+        memset(byMod, 0, sizeof(byMod));
+        memset(g_hitRip, 0, sizeof(g_hitRip));
+        memset(g_hitEngine, 0, sizeof(g_hitEngine));
+        memset(g_hitOurs, 0, sizeof(g_hitOurs));
+        refresh_modules();
+    }
+}
+
 } // namespace
 
 void stereo_perf_tick_begin(ID3D11DeviceContext* ctx)
@@ -538,6 +1168,7 @@ void stereo_perf_tick_begin(ID3D11DeviceContext* ctx)
             {
                 ContextLock lock;
                 gpu_close_open(ctx);
+                pass_close(ctx, false);
             }
             reset_window();
         }
@@ -559,6 +1190,9 @@ void stereo_perf_tick_begin(ID3D11DeviceContext* ctx)
             HANDLE th = CreateThread(nullptr, 0, &sampler_main, nullptr, 0, nullptr);
             if (th != nullptr)
                 CloseHandle(th);
+            HANDLE pr = CreateThread(nullptr, 0, &profiler_main, nullptr, 0, nullptr);
+            if (pr != nullptr)
+                CloseHandle(pr);
         }
         return;
     }
@@ -570,6 +1204,7 @@ void stereo_perf_tick_begin(ID3D11DeviceContext* ctx)
     ++g_nPeriod;
     g_lastTickBegin = now;
     g_tickBegin = now;
+    water_probe_frame();
 
     if (ctx != nullptr)
     {
@@ -579,7 +1214,9 @@ void stereo_perf_tick_begin(ID3D11DeviceContext* ctx)
             ctx->End(g_gpu[g_gpuOpen].t1);
             g_gpu[g_gpuOpen].stage = 2;
         }
+        pass_close(ctx, true);
         gpu_collect(ctx);
+        pass_collect(ctx);
     }
 }
 
@@ -609,6 +1246,7 @@ void stereo_perf_tick_end(ID3D11DeviceContext* ctx)
             gpu_close_open(ctx);
         }
         gpu_open(ctx);
+        pass_open(ctx);
     }
 }
 
@@ -627,6 +1265,7 @@ void stereo_perf_ngx_stamp(ID3D11DeviceContext* ctx, int point)
 {
     if (!g_wasLive || !perf_live() || ctx == nullptr || point < 0 || point > 2)
         return;
+    stereo_perf_pass(ctx, nullptr, 3 + point, 0);
     if (g_gpuOpen < 0 || g_gpu[g_gpuOpen].stage != 1)
         return;
     GpuSlot& s = g_gpu[g_gpuOpen];
@@ -635,6 +1274,24 @@ void stereo_perf_ngx_stamp(ID3D11DeviceContext* ctx, int point)
         return;
     ctx->End(s.n[point]);
     s.nHave[point] = true;
+}
+
+void stereo_perf_pass(ID3D11DeviceContext* ctx, ID3D11Resource* out, int kind, int count)
+{
+    if (g_passRec < 0 || ctx == nullptr)
+        return;
+    if (out == g_passKey && kind == g_passKeyKind && count == g_passKeyCount)
+        return;
+    g_passKey = out;
+    g_passKeyKind = kind;
+    g_passKeyCount = count;
+
+    PassSlot& s = g_pass[g_passRec];
+    if (s.n >= kPassStamps)
+        return;            /* the rest of the frame stays in the last pass */
+    pass_describe(out, kind, count, s.label[s.n], kPassLabel);
+    ctx->End(s.ts[s.n]);
+    ++s.n;
 }
 
 void stereo_perf_ngx_cpu(int64_t ticks)
@@ -776,6 +1433,7 @@ void stereo_perf_report(double decideMsPerFrame, double issueMsPerFrame, uint64_
     }
 
     report_map_sites(n);
+    pass_report();
 
     if (usedGb > 0.0 && budgetGb > 0.0 && usedGb > budgetGb)
         BVR_WARN("Stereo perf: VRAM in use (%.2f GB) is OVER the budget Windows gives this "

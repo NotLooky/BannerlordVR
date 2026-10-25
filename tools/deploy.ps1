@@ -35,7 +35,8 @@ $allowed = @(
     'BannerlordVR.pdb',
     'BannerlordVR.Native.dll',
     'BannerlordVR.Native.pdb',
-    'openxr_loader.dll'
+    'openxr_loader.dll',
+    'nvngx_dlss.dll'      # bundled DLSS; managed startup upgrades an older game runtime
 )
 
 if (-not (Test-Path $BannerlordDir)) {
@@ -47,7 +48,8 @@ New-Item -ItemType Directory -Force -Path $moduleBin | Out-Null
 # --- 1. copy our artifacts ------------------------------------------------
 $sources = @(
     (Join-Path $repoRoot 'build\managed'),
-    (Join-Path $repoRoot 'build\native')
+    (Join-Path $repoRoot 'build\native'),
+    (Join-Path $repoRoot 'native\thirdparty\dlss')
 )
 
 foreach ($src in $sources) {
@@ -66,6 +68,12 @@ Get-ChildItem (Join-Path $repoRoot 'module') -File -Recurse | ForEach-Object {
     if (-not $DryRun) {
         Copy-Item $_.FullName -Destination $moduleDir -Force
     }
+}
+
+# --- 2b. the tested defaults, so a deleted live config still renders (TEST 540)
+if (-not $DryRun) {
+    & (Join-Path $PSScriptRoot 'write-default-cfg.ps1') `
+        -OutFile (Join-Path $moduleDir 'BannerlordVR.default.cfg')
 }
 
 # --- 3. purge anything not on the allow-list ------------------------------

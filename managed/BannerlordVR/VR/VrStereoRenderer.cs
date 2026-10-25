@@ -737,14 +737,30 @@ namespace BannerlordVR.VR
             }
         }
 
-        /// <summary>Releases the eye targets. Only on shutdown: the native side
-        /// holds an AddRef on each texture, so churning them mid-session would
-        /// leave it pointing at resources nothing else references.</summary>
+        /// <summary>
+        /// Releases the eye targets and goes back to Idle, so the next Tick
+        /// allocates a fresh pair at whatever size VrSystem now reports.
+        ///
+        /// ON SHUTDOWN, AND ON A LIVE RESCALE - BUT NEVER ON A WHIM.
+        ///
+        /// The constraint that used to make this shutdown-only is real and has
+        /// not gone away: the native side holds an AddRef on each texture, so
+        /// releasing here while it still does would leave it pointing at
+        /// resources nothing else references. What changed is that there is now
+        /// a sequence which drops that reference FIRST. VrResolution does not
+        /// call this until native reports stage 2, which is its way of saying
+        /// release_eye_textures() has run and the engine's view has been unbound
+        /// for long enough that no frame in flight still uses the old pair.
+        ///
+        /// Calling it at any other moment mid-session is still the bug the old
+        /// comment warned about.
+        /// </summary>
         public static void Release()
         {
             ReleaseInternal();
             _stage = Stage.Idle;
         }
+
 
         private static void ReleaseInternal()
         {
@@ -762,6 +778,54 @@ namespace BannerlordVR.VR
             }
         }
 
+        /// <summary>
+        /// Releases the pair AND makes rgl actually give the memory back.
+        ///
+        /// THE BUG THIS EXISTS FOR, because it is not obvious from anything here.
+        ///
+        /// Texture.Release() marks the target released and invalidates it; it
+        /// does not mean rgl hands the GPU memory back. rgl KEEPS the buffer and
+        /// reuses it for the next render target of the same description - which
+        /// is good engine behaviour and fatal to the way this mod finds its eye
+        /// textures. The capture hook watches ID3D11Device::CreateTexture2D, so
+        /// it only ever sees a target rgl ALLOCATES. A recycled one arrives
+        /// without a single D3D call, the capture waits for a creation that never
+        /// comes, and the rescale times out.
+        ///
+        /// Measured, not deduced: rescaling to a size used earlier in the session
+        /// failed every time, and to a size never used before succeeded every
+        /// time. The native log shows it exactly - on the failures the only
+        /// eye-sized CreateTexture2D calls after arming are the two DEPTH targets
+        /// (bind 0x48), because the two COLOUR targets came from the pool.
+        ///
+        /// The fix is ReleaseImmediately, which is the per-texture call:
+        ///
+        ///     Release()            IsReleased = true; ManualInvalidate()
+        ///     ReleaseImmediately() IsReleased = true; ITexture.Release(ptr)
+        ///
+        /// The first defers and leaves rgl holding the buffer; the second tells
+        /// the engine to let go of THAT texture now.
+        ///
+        /// AND NOT Texture.ReleaseGpuMemories(), WHICH WAS TRIED AND WITHDRAWN.
+        ///
+        /// It looked like the obvious answer - rgl's own "release the pooled GPU
+        /// memory" call - and it did fix the capture. It also washed the colours
+        /// out of the whole image from the first rescale onwards, on the monitor
+        /// as well as in the headset. It takes no argument: it is an engine-wide
+        /// flush, not a flush of our two textures, so it also drops whatever
+        /// cached GPU resources the post chain is holding - a colour grade, a
+        /// tonemap, an environment map. Losing one of those is exactly what
+        /// "washed out" looks like.
+        ///
+        /// A global hammer to solve a two-texture problem was the wrong tool, and
+        /// the narrow call is the right one.
+        /// </summary>
+        public static void ReleaseForRescale()
+        {
+            ReleaseInternal();
+            _stage = Stage.Idle;
+        }
+
         private static void TryRelease(ref Texture texture, string what, int eye)
         {
             if (texture == null)
@@ -770,7 +834,12 @@ namespace BannerlordVR.VR
             try
             {
                 if (!texture.IsReleased)
-                    texture.Release();
+                {
+                    // ReleaseImmediately, not Release: the ordinary one defers,
+                    // and the whole point here is that the buffer is gone before
+                    // the next allocation asks for one the same shape.
+                    texture.ReleaseImmediately();
+                }
             }
             catch (Exception ex)
             {

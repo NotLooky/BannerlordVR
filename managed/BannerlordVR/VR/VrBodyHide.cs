@@ -42,15 +42,19 @@ namespace BannerlordVR.VR
     /// the armour, the hair - and a child entity's meshes are not among them, so
     /// the weapon carries on rendering because nothing ever asked it not to.
     ///
-    /// NOTHING IS RESTORED, AND THAT IS DELIBERATE
+    /// NOTHING IS STASHED, ONLY A KNOWN-GOOD VALUE PUT BACK
     ///
     /// VrAgentVisibility has the scar for this one: the previous attempt at
     /// meddling with agent rendering held engine pointers across the agent's
     /// lifetime and handed one back after the engine had freed it. A MetaMesh
-    /// belongs to an agent that can die between the hide and the restore, so the
-    /// masks are not stashed and put back. The meshes are re-hidden whenever the
-    /// entity changes instead, and switching the feature off takes effect on the
-    /// next mission. Nothing of ours can outlive what it points at.
+    /// belongs to an agent that can die between the hide and the restore, so a
+    /// mesh's ORIGINAL mask is never cached for later - a re-show sets every
+    /// kept mesh to VisibilityMaskFlags.DefaultDynamic instead, the value every
+    /// skinned character mesh here already carries before anything hides it, so
+    /// there is nothing agent-specific to outlive. That is also what makes a
+    /// live toggle - hide_body off, or hands_only on, mid-mission rather than at
+    /// the next one - take effect on the very next Tick instead of only on a
+    /// fresh entity.
     /// </summary>
     public static class VrBodyHide
     {
@@ -79,6 +83,89 @@ namespace BannerlordVR.VR
         }
 
         public static bool Enabled => Hiding;
+
+        /// <summary>
+        /// Whether the hand meshes stay drawn alongside the weapon while the
+        /// rest of the body is hidden. Only has an effect while <see
+        /// cref="Hiding"/> is on - this is a variant of the full hide, not the
+        /// shown-body mode, so toggling it off HideBody does nothing.
+        ///
+        /// Matched by name against the same mesh table hide_body_log prints,
+        /// exactly like <see cref="HeadNames"/> does for the shown-body branch:
+        /// "hands_male_a" is what the log shows for the bare-handed player, and
+        /// a glove or gauntlet equipped over it is its own mesh with its own
+        /// name, hence the wider default list.
+        /// </summary>
+        public static bool HandsOnly { get; private set; } = VrConfig.Bool("hands_only", false);
+
+        /// <summary>Set from the VR panel. Takes effect on the next visibility
+        /// pass, like <see cref="SetHiding"/>.</summary>
+        public static void SetHandsOnly(bool handsOnly)
+        {
+            if (HandsOnly == handsOnly)
+                return;
+
+            HandsOnly = handsOnly;
+            Reset();
+        }
+
+        private static readonly string[] HandNames = Names(VrConfig.String(
+            "hide_body_hand_meshes", "hands_,glove,gauntlet"));
+
+        /// <summary>A hand or glove mesh by name (hide_body_hand_meshes). TEST 480's
+        /// finger copies are named "bvr_fingers_..." and never count.</summary>
+        internal static bool IsHandName(string name)
+        {
+            string lower = (name ?? string.Empty).ToLowerInvariant();
+            if (lower.Length == 0 || lower.StartsWith("bvr_fingers_"))
+                return false;
+
+            foreach (string hand in HandNames)
+            {
+                if (lower.Contains(hand))
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Whether to hide just the head and neck meshes while the body IS shown.
+        ///
+        /// WHY THE HEAD HAS TO GO. The eye camera sits inside the skull. At the
+        /// near plane - five centimetres, deliberately close so your own hands do
+        /// not clip - the inside of a head mesh is either a black screen or a ring
+        /// of inverted faces, depending on which way its normals point. Nothing
+        /// else about a drawn body is in the way.
+        ///
+        /// The names are matched as substrings against the mesh table this class
+        /// prints (hide_body_log), and the list is editable because what a body
+        /// mesh is called is game data rather than a fact: if the head turns out
+        /// to be part of one big body mesh, this list will match nothing and the
+        /// log will say so - at which point hide_body = 1 is the honest fallback.
+        /// </summary>
+        private static readonly bool HideHead = VrConfig.Bool("hide_head", true);
+
+        private static readonly string[] HeadNames = Names(VrConfig.String(
+            "hide_head_meshes", "head,hair,beard,moustache,brow,teeth,tongue,helmet,hood,hat"));
+
+        private static string[] Names(string list)
+        {
+            if (string.IsNullOrEmpty(list))
+                return new string[0];
+
+            string[] parts = list.Split(',');
+            var cleaned = new System.Collections.Generic.List<string>(parts.Length);
+
+            foreach (string part in parts)
+            {
+                string name = part.Trim().ToLowerInvariant();
+                if (name.Length > 0)
+                    cleaned.Add(name);
+            }
+
+            return cleaned.ToArray();
+        }
 
         /// <summary>Print the mesh table once, the way the bone table is printed.
         /// It is what makes the next question about this answerable from a log
@@ -116,7 +203,7 @@ namespace BannerlordVR.VR
         public static void Tick(Agent agent, MBAgentVisuals visuals, GameEntity entity,
                                 Skeleton skeleton)
         {
-            if (!Enabled || _broken || agent == null || entity == null)
+            if ((!Hiding && !HideHead) || _broken || agent == null || entity == null)
                 return;
 
             try
@@ -132,7 +219,11 @@ namespace BannerlordVR.VR
 
                 DescribeOnce(agent, entity, skeleton, count);
 
-                if (!WeaponsAreSeparate(agent, entity))
+                // The full hide only when the weapons are on their own entities:
+                // hiding the body's meshes would take a weapon that shares the
+                // entity with it. The head list is matched by name and never
+                // touches a "wpn_" mesh, so it needs no such check.
+                if (Hiding && !WeaponsAreSeparate(agent, entity))
                     return;
 
                 Hide(entity, skeleton, count);
@@ -222,38 +313,51 @@ namespace BannerlordVR.VR
             for (int i = 0; i < count; i++)
             {
                 MetaMesh mesh = entity.GetMetaMesh(i);
-                if (mesh == null)
+                if (mesh == null || VrHandMesh.Owns(mesh.GetName()))
                     continue;
 
-                if (Skip(mesh.GetName()))
+                if (Hides(mesh.GetName()))
                 {
-                    kept++;
-                    continue;
+                    // Nought rather than "clear the Final bit": the shadow bits
+                    // would otherwise leave the body casting a shadow it no longer
+                    // has, and a headless shadow at first-person range is more
+                    // startling than the body was.
+                    mesh.SetVisibilityMask(0);
+                    hidden++;
                 }
-
-                // Nought rather than "clear the Final bit": the shadow bits would
-                // otherwise leave the body casting a shadow it no longer has, and
-                // a headless shadow at first-person range is more startling than
-                // the body was.
-                mesh.SetVisibilityMask(0);
-                hidden++;
+                else
+                {
+                    // Restored rather than left alone: hands_only and hide_head
+                    // can flip a mesh from hidden to kept on the SAME entity - the
+                    // panel toggling mid-mission, not a fresh one - and a mesh this
+                    // pass zeroed earlier stays zero forever without this. Every
+                    // skinned character mesh this class hides is dynamic, so this
+                    // is also what a never-hidden mesh already carries - setting it
+                    // again is a no-op for those.
+                    mesh.SetVisibilityMask(VisibilityMaskFlags.DefaultDynamic);
+                    kept++;
+                }
             }
 
             if (skeleton != null)
             {
                 foreach (Mesh mesh in skeleton.GetAllMeshes())
                 {
-                    if (mesh == null)
+                    // TEST 481: our finger copies, and the game's hands while
+                    // they are drawn, are VrHandMesh's to show and hide.
+                    if (mesh == null || VrHandMesh.Owns(mesh.Name))
                         continue;
 
-                    if (Skip(mesh.Name))
+                    if (Hides(mesh.Name))
                     {
-                        kept++;
-                        continue;
+                        mesh.SetVisibilityMask(0);
+                        hidden++;
                     }
-
-                    mesh.SetVisibilityMask(0);
-                    hidden++;
+                    else
+                    {
+                        mesh.SetVisibilityMask(VisibilityMaskFlags.DefaultDynamic);
+                        kept++;
+                    }
                 }
             }
 
@@ -261,19 +365,78 @@ namespace BannerlordVR.VR
                 return;
 
             _loggedResult = true;
-            VrLog.Info("Body hidden: " + hidden + " mesh(es) taken out of the render, "
-                       + kept + " kept. The weapon and shield are separate entities with their "
-                       + "own meshes, so they carry on drawing. Set hide_body = 0 to get the "
-                       + "body back.");
+
+            if (Hiding)
+            {
+                VrLog.Info("Body hidden: " + hidden + " mesh(es) taken out of the render, "
+                           + kept + " kept. The weapon and shield are separate entities with "
+                           + "their own meshes, so they carry on drawing"
+                           + (HandsOnly
+                                ? "; hands_only kept the hand mesh too ('"
+                                  + string.Join(",", HandNames) + "' - correct it from the "
+                                  + "mesh table above if the hand didn't match)."
+                                : ".")
+                           + " Set hide_body = 0 to get the body back (hide_head then decides "
+                           + "whether the head stays).");
+            }
+            else if (hidden == 0)
+            {
+                VrLog.Warn("Body shown, but NO mesh matched the head list ('"
+                           + string.Join(",", HeadNames) + "') - nothing was hidden. The mesh "
+                           + "table above names every one of them. Either add the head's own "
+                           + "name to hide_head_meshes, or the head is part of one body mesh "
+                           + "and hide_body = 1 is the honest answer.");
+            }
+            else
+            {
+                VrLog.Info("Body shown, head hidden: " + hidden + " mesh(es) matching '"
+                           + string.Join(",", HeadNames) + "' taken out of the render, " + kept
+                           + " kept. If the head is still in the way, the mesh table above "
+                           + "names it - add it to hide_head_meshes, or set hide_head = 0 and "
+                           + "hide_body = 1 to go back to a hidden body.");
+            }
+        }
+
+        /// <summary>Whether this mesh comes out of the render this pass: everything
+        /// but the weapon meshes when the body is hidden, and only the head-named
+        /// ones when it is not.</summary>
+        private static bool Hides(string name)
+        {
+            if (Hiding)
+                return !Skip(name);
+
+            string lower = (name ?? string.Empty).ToLowerInvariant();
+            if (lower.Length == 0)
+                return false;
+
+            for (int i = 0; i < HeadNames.Length; i++)
+            {
+                if (lower.Contains(HeadNames[i]))
+                    return true;
+            }
+
+            return false;
         }
 
         private static bool Skip(string name)
         {
-            if (Keep.Length == 0)
+            string lower = (name ?? string.Empty).ToLowerInvariant();
+            if (lower.Length == 0)
                 return false;
 
-            string lower = (name ?? string.Empty).ToLowerInvariant();
-            return lower.Length > 0 && lower.Contains(Keep);
+            if (Keep.Length > 0 && lower.Contains(Keep))
+                return true;
+
+            if (HandsOnly)
+            {
+                for (int i = 0; i < HandNames.Length; i++)
+                {
+                    if (lower.Contains(HandNames[i]))
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -323,7 +486,7 @@ namespace BannerlordVR.VR
                     line.Append("  skeleton [").Append(n++).Append("] ").Append(name);
 
                     if (Skip(name))
-                        line.Append("   (kept - matches hide_body_keep)");
+                        line.Append("   (kept - matches hide_body_keep or hide_body_hand_meshes)");
 
                     VrLog.Info(line.ToString());
                 }

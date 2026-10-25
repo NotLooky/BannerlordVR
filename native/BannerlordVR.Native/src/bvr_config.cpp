@@ -46,8 +46,12 @@ std::string lower(std::string s)
  * managed-only and lives in VrConfig. */
 bool mode_default(const std::string& key, std::string* out)
 {
+    /* No `mode` at all is engine-camera, as VrConfig.Mode says. Requiring the key
+       here was TEST 540's broken render with no config: managed drew the
+       symmetric frustum while this side submitted the runtime's asymmetric one. */
     auto mode = g_values.find("mode");
-    if (mode == g_values.end() || lower(trim(mode->second)) != "engine-camera")
+    if (mode != g_values.end() && !trim(mode->second).empty() &&
+        lower(trim(mode->second)) != "engine-camera")
         return false;
 
     if (key == "vp_patch")
@@ -89,32 +93,19 @@ bool lookup(const char* key, std::string* out)
     return mode_default(k, out);
 }
 
-} // namespace
-
-void config_load()
+std::string narrow(const wchar_t* wide)
 {
-    if (g_loaded)
-        return;
-    g_loaded = true;
+    char out[MAX_PATH] = {};
+    WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, sizeof(out), nullptr, nullptr);
+    return out;
+}
 
-    wchar_t docs[MAX_PATH] = {};
-    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_MYDOCUMENTS, nullptr, 0, docs)))
-        return;
-
-    wchar_t wide[MAX_PATH] = {};
-    _snwprintf_s(wide, _TRUNCATE,
-                 L"%s\\Mount and Blade II Bannerlord\\Configs\\BannerlordVR.cfg", docs);
-
-    char narrow[MAX_PATH] = {};
-    WideCharToMultiByte(CP_UTF8, 0, wide, -1, narrow, sizeof(narrow), nullptr, nullptr);
-    g_path = narrow;
-
+/* Later files override earlier ones key by key; -1 means the file is absent. */
+int parse_file(const wchar_t* wide)
+{
     FILE* file = nullptr;
     if (_wfopen_s(&file, wide, L"r") != 0 || file == nullptr)
-    {
-        BVR_INFO("No config at %s; using defaults.", g_path.c_str());
-        return;
-    }
+        return -1;
 
     char line[512] = {};
     int count = 0;
@@ -138,7 +129,56 @@ void config_load()
     }
 
     std::fclose(file);
-    BVR_INFO("Loaded %d setting(s) from %s.", count, g_path.c_str());
+    return count;
+}
+
+} // namespace
+
+void config_load()
+{
+    if (g_loaded)
+        return;
+    g_loaded = true;
+
+    /* The release ships its tested settings as BannerlordVR.default.cfg in the
+       module root, two folders above this DLL. The player's own file goes on
+       top, so it only has to hold what they changed, and a new release's
+       defaults still reach a player who already has one. VrConfig layers the
+       same two files the same way. */
+    HMODULE self = nullptr;
+    wchar_t shipped[MAX_PATH] = {};
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&config_load), &self) &&
+        GetModuleFileNameW(self, shipped, MAX_PATH) > 0)
+    {
+        for (int up = 0; up < 3; ++up)   /* file name, Win64_Shipping_Client, bin */
+        {
+            wchar_t* slash = wcsrchr(shipped, L'\\');
+            if (slash != nullptr)
+                *slash = L'\0';
+        }
+        wcscat_s(shipped, L"\\BannerlordVR.default.cfg");
+
+        const int n = parse_file(shipped);
+        if (n >= 0)
+            BVR_INFO("Loaded %d shipped default(s) from %s.", n, narrow(shipped).c_str());
+    }
+
+    wchar_t docs[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_MYDOCUMENTS, nullptr, 0, docs)))
+        return;
+
+    wchar_t wide[MAX_PATH] = {};
+    _snwprintf_s(wide, _TRUNCATE,
+                 L"%s\\Mount and Blade II Bannerlord\\Configs\\BannerlordVR.cfg", docs);
+    g_path = narrow(wide);
+
+    const int count = parse_file(wide);
+    if (count < 0)
+        BVR_INFO("No config at %s; using defaults.", g_path.c_str());
+    else
+        BVR_INFO("Loaded %d setting(s) from %s.", count, g_path.c_str());
 
     auto mode = g_values.find("mode");
     if (mode != g_values.end())
@@ -160,6 +200,14 @@ bool config_bool(const char* key, bool fallback)
 
     const std::string v = lower(value);
     return !(v == "0" || v == "false" || v == "off" || v == "no");
+}
+
+bool config_is(const char* key, const char* value)
+{
+    config_load();
+
+    std::string v;
+    return lookup(key, &v) && lower(v) == lower(value);
 }
 
 float config_float(const char* key, float fallback)

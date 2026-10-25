@@ -193,7 +193,7 @@ bool ensure_uav(ID3D11Device* device, ID3D11Texture2D* texture)
     if ((desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
     {
         BVR_WARN("Reticle: the held eye texture is not writable (no UNORDERED_ACCESS), "
-                 "so no reticle can be drawn. Set afw = 1 - the hold textures are "
+                 "so no reticle can be drawn. Set depth_reproject = 1 - the hold textures are "
                  "allocated writable only when it is.");
         g_failed = true;
         return false;

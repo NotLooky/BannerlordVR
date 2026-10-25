@@ -78,6 +78,11 @@ namespace BannerlordVR.VR
         private static readonly string ToggleKeyName =
             VrConfig.String("grip_calibrate_key", "Home");
 
+        /// <summary>Key that makes the current grip the baseline a reset returns
+        /// to. Blank disables it.</summary>
+        private static readonly string DefaultKeyName =
+            VrConfig.String("grip_default_key", "Insert");
+
         private static readonly float MoveRate = VrConfig.Float("grip_move_rate", 0.20f);
         private static readonly float TurnRate = VrConfig.Float("grip_turn_rate", 60f);
 
@@ -102,6 +107,26 @@ namespace BannerlordVR.VR
 
         private const int Roles = 2;
 
+        /// <summary>
+        /// Which controller the grip keys are saved under, as the config suffix.
+        /// Index 0 is the unsuffixed keys every older config already has. Chosen
+        /// by the player from the panel rather than detected, because PSVR2 and
+        /// Quest both report oculus/touch_controller through SteamVR. SAME ORDER
+        /// as kControllers in vr_overlay.cpp.
+        /// </summary>
+        private static readonly string[] ControllerSuffix =
+        {
+            "", "psvr2", "quest3",
+        };
+
+        private static int _controller;
+
+        /// <summary>The panel's dropdown index.</summary>
+        public static int Controller => _controller;
+
+        public static string ControllerName =>
+            _controller == 0 ? "generic" : ControllerSuffix[_controller];
+
         // THE GRIP IS TWO THINGS, STORED SEPARATELY
         //
         // _captured is what the automatic pass measured: the rotation between the
@@ -122,6 +147,11 @@ namespace BannerlordVR.VR
         private static readonly Vec3[] _offset = new Vec3[Roles];
         private static readonly Vec3[] _euler = new Vec3[Roles];   // yaw, pitch, roll (deg)
         private static readonly bool[] _have = new bool[Roles];
+
+        // The baseline a reset returns to. Loaded from grip_default_*, written only
+        // when asked, and never touched by the automatic pass.
+        private static readonly Mat3[] _default = new Mat3[Roles];
+        private static readonly bool[] _haveDefault = new bool[Roles];
 
         /// <summary>Whether this role's grip came from the config or from a save,
         /// rather than from an automatic pass nobody asked for. An unrequested
@@ -258,6 +288,19 @@ namespace BannerlordVR.VR
             _have[i] = true;
         }
 
+        /// <summary>TEST 750: the adjustment back to what this controller saved
+        /// (zero if it never saved one). The rotation is untouched.</summary>
+        public static void RevertAdjustment(HandRole role)
+        {
+            int i = (int)role;
+            string adj = ReadAdj(role);
+            if (string.IsNullOrEmpty(adj) || !TryParseAdjust(adj, out _offset[i], out _euler[i]))
+            {
+                _offset[i] = Vec3.Zero;
+                _euler[i] = Vec3.Zero;
+            }
+        }
+
         /// <summary>
         /// The controller-space frame a hand is posed with, composed from the
         /// captured rotation and the adjustment. False means nothing is known yet,
@@ -298,20 +341,97 @@ namespace BannerlordVR.VR
 
         public static void Load()
         {
+            _controller = Array.IndexOf(ControllerSuffix,
+                VrConfig.String("grip_controller", string.Empty).Trim().ToLowerInvariant());
+            if (_controller < 0)
+                _controller = 0;
+
             LoadOne(HandRole.Main);
             LoadOne(HandRole.Off);
             Migrate();
+        }
+
+        /// <summary>
+        /// Switches to another controller's saved grip. The one being left is
+        /// already on disk - every save writes straight through - so nothing is
+        /// lost; the new one loads its own keys, or the generic ones if it has
+        /// never been saved, or an automatic pass if there are neither.
+        /// </summary>
+        public static void SetController(int index)
+        {
+            if (index < 0 || index >= ControllerSuffix.Length || index == _controller)
+                return;
+
+            // A manual edit in progress belongs to the controller it started on.
+            Cancel();
+            CancelAuto(quiet: true);
+
+            _controller = index;
+            VrConfig.Save("grip_controller", ControllerSuffix[index]);
+
+            for (int i = 0; i < Roles; i++)
+            {
+                _have[i] = false;
+                _haveDefault[i] = false;
+                _persisted[i] = false;
+                _captured[i] = Mat3.Identity;
+                _offset[i] = Vec3.Zero;
+                _euler[i] = Vec3.Zero;
+            }
+
+            LoadOne(HandRole.Main);
+            LoadOne(HandRole.Off);
+            _wantAuto = !_have[0] || !_have[1];
+
+            VrLog.Info("Grip: controller set to " + ControllerName + ", saved. Grips now load "
+                       + "from and save to its own keys.");
+        }
+
+        /// <summary>This controller's own value for a grip key, else the
+        /// generic one, so a new controller starts from the pose you already
+        /// have rather than from nothing.</summary>
+        private static string Read(string key)
+        {
+            string own = _controller == 0
+                ? string.Empty
+                : VrConfig.String(key + "_" + ControllerSuffix[_controller], string.Empty);
+
+            return !string.IsNullOrEmpty(own) ? own : VrConfig.String(key, string.Empty);
+        }
+
+        /// <summary>Where a grip key is written for this controller.</summary>
+        private static string Own(string key)
+        {
+            return _controller == 0 ? key : key + "_" + ControllerSuffix[_controller];
         }
 
         private static bool LoadOne(HandRole role)
         {
             int i = (int)role;
 
+            // The baseline first, so it is available whether or not a live
+            // calibration follows.
+            string def = Read(DefaultKey(role));
+            if (!string.IsNullOrEmpty(def))
+            {
+                if (TryParseRotation(def, out Mat3 baseline))
+                {
+                    _default[i] = baseline;
+                    _haveDefault[i] = true;
+                }
+                else
+                {
+                    VrLog.Warn("Grip default '" + DefaultKey(role) + "' could not be read "
+                               + "(expected 9 numbers). A reset will fall back to the "
+                               + "controller's own frame for this hand.");
+                }
+            }
+
             // The adjustment loads independently of the rotation. They are written
             // together, but a player who hand-edits one line should not lose the
             // other to a typo - and an adjustment on its own is perfectly usable,
             // because the automatic pass will fill in the rotation.
-            string adj = VrConfig.String(AdjKey(role), string.Empty);
+            string adj = ReadAdj(role);
             if (!string.IsNullOrEmpty(adj))
             {
                 if (TryParseAdjust(adj, out Vec3 offset, out Vec3 euler))
@@ -327,9 +447,22 @@ namespace BannerlordVR.VR
                 }
             }
 
-            string raw = VrConfig.String(RotKey(role), string.Empty);
+            string raw = Read(RotKey(role));
             if (string.IsNullOrEmpty(raw))
+            {
+                // No live calibration, but a baseline is a perfectly good one to
+                // start from - and starting there beats starting on the animation
+                // and making the player redo a pass they already got right once.
+                if (_haveDefault[i])
+                {
+                    Set(role, _default[i], persisted: false);
+                    VrLog.Info("No saved grip for the " + role + " hand, so it starts from your "
+                               + "default pose.");
+                    return true;
+                }
+
                 return false;
+            }
 
             if (!TryParseRotation(raw, out Mat3 rotation))
             {
@@ -652,10 +785,94 @@ namespace BannerlordVR.VR
             int i = (int)_editing;
             _offset[i] = Vec3.Zero;
             _euler[i] = Vec3.Zero;
+
+            // Back to the saved baseline when there is one. The controller's own
+            // frame is a starting point, not a pose - it is the right answer only
+            // when nobody has ever found a better one.
+            if (_haveDefault[i])
+            {
+                Set(_editing, _default[i], persisted: false);
+                VrLog.Info("Grip for the " + _editing + " hand reset to your saved default "
+                           + "pose, sliders back to nought.");
+                return;
+            }
+
             Set(_editing, Mat3.Identity, persisted: false);
 
-            VrLog.Info("Grip for the " + _editing + " hand reset to the controller's own frame. "
-                       + "Run the automatic pass if that was not what you wanted.");
+            VrLog.Info("Grip for the " + _editing + " hand reset to the controller's own frame - "
+                       + "there is no saved default for this hand. Get the grip how you want it "
+                       + "and save it as the default so a reset comes back here instead.");
+        }
+
+        /// <summary>
+        /// Puts BOTH hands back on the saved default pose, and makes that the live
+        /// calibration again so it survives a restart.
+        ///
+        /// This is what the align key does now. Re-taking the grip from the
+        /// animation is still available from the panel and from manual mode, but it
+        /// is no longer the thing a single keypress does - a mistaken press of it
+        /// destroys a pose that took real effort to get right, and did.
+        /// </summary>
+        public static void RestoreDefaults()
+        {
+            int restored = 0;
+
+            for (int i = 0; i < Roles; i++)
+            {
+                if (!_haveDefault[i])
+                    continue;
+
+                HandRole role = (HandRole)i;
+
+                // The sliders go back to nought too. "Back to the good pose" means
+                // the whole grip, not the rotation with yesterday's nudges still on
+                // top of it.
+                _offset[i] = Vec3.Zero;
+                _euler[i] = Vec3.Zero;
+
+                Set(role, _default[i], persisted: true);
+
+                VrConfig.Save(Own(RotKey(role)), Serialise(_default[i]));
+                VrConfig.Save(Own(AdjKey(role)), SerialiseAdjust(_offset[i], _euler[i]));
+
+                restored++;
+            }
+
+            if (restored == 0)
+            {
+                VrLog.Warn("No default grip pose is saved, so there is nothing to restore. Get "
+                           + "the grip how you want it and press " + DefaultKeyName + " to make "
+                           + "it the default.");
+                return;
+            }
+
+            _sampling[0] = false;
+            _sampling[1] = false;
+
+            VrLog.Info("Both hands restored to the saved default grip pose, sliders back to "
+                       + "nought, and written to the config so it survives a restart.");
+        }
+
+        /// <summary>
+        /// Makes the current grip the baseline a reset returns to, for both hands.
+        ///
+        /// Deliberately a separate action from saving the calibration: the point of
+        /// a default is that the automatic pass cannot move it.
+        /// </summary>
+        public static void SaveAsDefault()
+        {
+            for (int i = 0; i < Roles; i++)
+            {
+                if (!_have[i])
+                    continue;
+
+                _default[i] = _captured[i];
+                _haveDefault[i] = true;
+                VrConfig.Save(Own(DefaultKey((HandRole)i)), Serialise(_captured[i]));
+            }
+
+            VrLog.Info("Saved the current grip for both hands as the default. A reset now comes "
+                       + "back to this pose, and it survives the automatic pass.");
         }
 
         private static void Set(HandRole role, Mat3 rotation, bool persisted)
@@ -674,9 +891,52 @@ namespace BannerlordVR.VR
             return role == HandRole.Main ? "grip_rotation_main" : "grip_rotation_off";
         }
 
+        /// <summary>Where this hand's adjustment is SAVED: TEST 752, under the
+        /// calibration tool's pose profile (p1_ / p2_), Original unprefixed.</summary>
         private static string AdjKey(HandRole role)
         {
-            return role == HandRole.Main ? "grip_adjust_main" : "grip_adjust_off";
+            return (_profile == 0 ? string.Empty : "p" + _profile + "_")
+                   + (role == HandRole.Main ? "grip_adjust_main" : "grip_adjust_off");
+        }
+
+        /// <summary>TEST 752: the profile's own adjustment, else Original's - a
+        /// profile starts as a copy and never writes Original.</summary>
+        private static string ReadAdj(HandRole role)
+        {
+            string own = Read(AdjKey(role));
+            return !string.IsNullOrEmpty(own) || _profile == 0
+                ? own
+                : Read(role == HandRole.Main ? "grip_adjust_main" : "grip_adjust_off");
+        }
+
+        private static int _profile = Math.Max(0, Math.Min(2, VrConfig.Int("skin_profile", 0)));
+
+        /// <summary>TEST 752: both hands' adjustments follow the pose profile;
+        /// unsaved slider edits are dropped, like the weapons'. The measured
+        /// rotation is not profiled.</summary>
+        public static void SetProfile(int profile)
+        {
+            if (profile == _profile)
+                return;
+
+            _profile = profile;
+            RevertAdjustment(HandRole.Main);
+            RevertAdjustment(HandRole.Off);
+        }
+
+        /// <summary>
+        /// The BASELINE a reset returns to: a grip you decided was right and want
+        /// to be able to get back to.
+        ///
+        /// Separate from grip_rotation_* on purpose. That one is the live value and
+        /// the automatic pass overwrites it, so a mistaken F11 loses the good pose
+        /// with nothing to fall back on - which is exactly how one got lost. This
+        /// one is only ever written when you ask for it, so it survives any number
+        /// of recalibrations.
+        /// </summary>
+        private static string DefaultKey(HandRole role)
+        {
+            return role == HandRole.Main ? "grip_default_main" : "grip_default_off";
         }
 
         /// <summary>
@@ -687,14 +947,14 @@ namespace BannerlordVR.VR
         /// installs. Splitting them keeps the second legible, and it means an
         /// automatic pass rewrites only the line it actually measured.
         /// </summary>
-        private static void SaveOne(HandRole role)
+        public static void SaveOne(HandRole role)
         {
             int i = (int)role;
             if (!_have[i])
                 return;
 
-            VrConfig.Save(RotKey(role), Serialise(_captured[i]));
-            VrConfig.Save(AdjKey(role), SerialiseAdjust(_offset[i], _euler[i]));
+            VrConfig.Save(Own(RotKey(role)), Serialise(_captured[i]));
+            VrConfig.Save(Own(AdjKey(role)), SerialiseAdjust(_offset[i], _euler[i]));
             _persisted[i] = true;
         }
 
@@ -716,6 +976,13 @@ namespace BannerlordVR.VR
                            + "it sits in your hand. " + ToggleKeyName + " opens the panel there "
                            + "and starts the manual mode.");
             }
+
+            // Make the grip you are holding right now the one a reset comes back to.
+            // Its own key rather than a panel button because the moment you want it
+            // is the moment the hands finally look right, and that is not a moment
+            // to go hunting through menus.
+            if (!string.IsNullOrEmpty(DefaultKeyName) && VrKeys.Pressed(DefaultKeyName))
+                SaveAsDefault();
 
             if (VrKeys.Pressed(ToggleKeyName))
             {

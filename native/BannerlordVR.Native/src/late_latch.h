@@ -53,10 +53,15 @@ void late_latch_frame_boundary();
    frame being drawn came from. TEST 178. */
 void late_latch_note_upload(const void* data, unsigned int bytes);
 
-/* Render thread, at an AFW capture: the latched stage orientation (x, y, z, w)
+/* Render thread, at an DR capture: the latched stage orientation (x, y, z, w)
    of the build this frame was drawn from, if one was matched since the last
    call for this eye. False means the caller falls back to the slot. */
 bool late_latch_drawn_orientation(unsigned int eye, float outXyzw[4]);
+
+/* Present thread, TEST 620: the eye camera position of the publication the frame
+   now being presented was built from - exactly as published, so it names the
+   managed tick. Once per matched frame; false = no frame matched since the last call. */
+bool late_latch_drawn_camera(float outPos[3]);
 
 } // namespace bvr
 

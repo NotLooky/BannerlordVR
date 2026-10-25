@@ -36,6 +36,12 @@ const char* crumb_name(int id)
     case 7:  return "VrWeaponHands";
     case 8:  return "VrBodyHide";
     case 9:  return "VrEngineAim";
+    case 10: return "VrHeadAim.Apply";
+    case 11: return "VrMelee.Tick";
+    case 12: return "VrPhysicalCombat.Tick";
+    case 13: return "VrBow.Tick";
+    case 14: return "VrHolster.Tick";
+    case 15: return "VrRoomscale.Tick";
     default: return "unknown";
     }
 }
@@ -182,6 +188,19 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info)
             kind == 0 ? "read" : (kind == 1 ? "write" : "execute"),
             static_cast<unsigned long long>(addr));
 
+    /* THE OPERANDS. The offset names the instruction; only the registers say
+       which half of its address was bad. The arena crash (2026-09-25) faulted
+       in a table read, movsxd rdx,[rax+rcx*4], and a stale table and a garbage
+       index land on that same instruction - with no dump, nothing could tell
+       them apart. */
+    if (const CONTEXT* c = info->ContextRecord)
+    {
+        BVR_ERR("  rax %llX rbx %llX rcx %llX rdx %llX rsi %llX rdi %llX rbp %llX rsp %llX",
+                c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+        BVR_ERR("  r8 %llX r9 %llX r10 %llX r11 %llX r12 %llX r13 %llX r14 %llX r15 %llX",
+                c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
+    }
+
     /* WHERE THE FAULTING THREAD WAS, WHICH IS THE PART THAT WAS MISSING.
      *
      * A fault offset inside rgl has now been chased twice on nothing but the
@@ -257,6 +276,12 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info)
      * thread's history at all? If it never does, our code is not in the call
      * chain and the fault is the engine's own, reached some other way. */
     scan_stack(info);
+
+    /* The log is buffered now (see logf), and this report is the one that must
+       never be lost. Every line above went out through BVR_ERR, which flushes
+       on its own, but flush once more here so nothing written by anything else
+       is still sitting in the buffer when the process goes down. */
+    log_flush();
 
     /* Let the engine's own crash handler proceed as usual. */
     return EXCEPTION_CONTINUE_SEARCH;

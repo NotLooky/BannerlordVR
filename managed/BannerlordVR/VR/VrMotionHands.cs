@@ -1,4 +1,5 @@
-using BannerlordVR.VR;
+using System;
+using TaleWorlds.MountAndBlade;
 
 namespace BannerlordVR.VR
 {
@@ -39,9 +40,16 @@ namespace BannerlordVR.VR
 
         private static bool _logged;
 
-        /// <summary>Set from the VR panel. Takes effect on the next frame - the
-        /// hands simply stop being posed, and the game's own animation is already
-        /// running underneath and takes back over with nothing to restore.</summary>
+        /// <summary>
+        /// Set from the VR panel. Takes effect on the next frame.
+        ///
+        /// Turning it OFF is not just "stop calling Tick". That was the old belief
+        /// - the game's own animation is running underneath and takes back over
+        /// with nothing to restore - and it was true of the bone writes and false
+        /// of everything else we had asked the engine to do. weapon_hold pauses the
+        /// skeleton outright, and a paused skeleton stays paused however many of
+        /// our own flags get cleared. See ReleaseSkeleton.
+        /// </summary>
         public static void SetEnabled(bool enabled)
         {
             if (Enabled == enabled)
@@ -51,10 +59,68 @@ namespace BannerlordVR.VR
 
             if (!enabled)
             {
+                // FIRST, and before the resets, because this is the only half that
+                // touches the ENGINE rather than our own flags.
+                //
+                // weapon_hold pauses the player's skeleton animation, and that is
+                // state on the engine's entity - clearing our booleans does not
+                // undo it. Switching the experiment off used to stop us posing the
+                // hands and leave the animation paused: one static posture, legs
+                // not walking, for the rest of the mission, with no way back short
+                // of restarting it. Turning a feature off has to actually turn it
+                // off.
+                //
+                // The entity is resolved HERE, from the live mission, rather than
+                // remembered by VrWeaponAttach. The accessors behind GameEntity are
+                // unbounded native calls and a dead one faults rather than
+                // throwing, so the only pointer worth handing to the release is one
+                // that has just been read out of Mission.Current.
+                ReleaseSkeleton();
+
                 // Let go of anything currently held so the character is not left
                 // mid-pose with a weapon parked where a controller used to be.
+                // TEST 228: items drawn on our own entities are handed back to the
+                // engine first, from the live mission, while it is still there.
+                VrSkinnedWeapon.Release(Mission.Current?.MainAgent);
                 VrWeaponHands.Reset();
                 VrWeaponEntity.Reset();
+                VrWeaponAttach.Reset();
+
+                VrLog.Info("Motion-control hands off: head aiming and the gamepad are "
+                           + "untouched and the character animates itself again. Nothing "
+                           + "writes bones from here, so the game's own animation is the "
+                           + "only thing posing the body.");
+            }
+        }
+
+        /// <summary>
+        /// Hands the player's skeleton back to the game's animation, if there is
+        /// one to hand back.
+        ///
+        /// Every step is null-checked on the way down rather than wrapped in a
+        /// single try: no mission, no agent, an agent between visuals - these are
+        /// ordinary states, not failures, and there is simply nothing to release
+        /// in any of them.
+        /// </summary>
+        private static void ReleaseSkeleton()
+        {
+            try
+            {
+                Agent agent = Mission.Current?.MainAgent;
+                if (agent == null || !agent.IsActive())
+                    return;
+
+                MBAgentVisuals visuals = agent.AgentVisuals;
+                if (visuals == null)
+                    return;
+
+                VrWeaponAttach.Release(visuals.GetEntity(), visuals.GetSkeleton());
+            }
+            catch (Exception ex)
+            {
+                VrLog.Error("Could not reach the player's skeleton to release the animation "
+                            + "hold. If the character is stuck in one posture, the mission "
+                            + "restart clears it.", ex);
             }
         }
 
@@ -81,6 +147,11 @@ namespace BannerlordVR.VR
 
                     return false;
                 }
+
+                // TEST 570: pre-battle the camera flies free of the body, so
+                // posed hands and weapons would float in front of it.
+                if (VrMissionPhase.Deploying)
+                    return false;
 
                 return true;
             }

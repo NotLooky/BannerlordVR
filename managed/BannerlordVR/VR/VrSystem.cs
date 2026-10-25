@@ -23,6 +23,46 @@ namespace BannerlordVR.VR
         public static uint RecommendedEyeWidth { get; private set; }
         public static uint RecommendedEyeHeight { get; private set; }
 
+        /// <summary>
+        /// Re-reads the per-eye size from the native side.
+        ///
+        /// Needed because the size is no longer settled once at startup. A live
+        /// rescale re-asks the runtime for its recommendation and applies the new
+        /// render scale to it, so the number this side caches is stale from that
+        /// moment until this is called - and allocating the new eye targets from a
+        /// stale number would build them at the OLD size, which CopyResource then
+        /// refuses against the new swapchain. A refused copy is a black headset,
+        /// so this is not a tidiness call.
+        ///
+        /// Returns false and leaves the old numbers alone if native cannot answer,
+        /// which is the right failure: the caller aborts the rescale rather than
+        /// allocating from a zero.
+        /// </summary>
+        public static bool RefreshRecommendedSize()
+        {
+            try
+            {
+                if (NativeMethods.bvr_get_recommended_size(out uint w, out uint h)
+                        != (int)BvrStatus.Ok || w == 0 || h == 0)
+                    return false;
+
+                if (w == RecommendedEyeWidth && h == RecommendedEyeHeight)
+                    return true;
+
+                VrLog.Info($"Per-eye size is now {w}x{h} (was {RecommendedEyeWidth}x"
+                           + $"{RecommendedEyeHeight}).");
+
+                RecommendedEyeWidth = w;
+                RecommendedEyeHeight = h;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                VrLog.Error("Could not re-read the per-eye size from the native layer.", ex);
+                return false;
+            }
+        }
+
         public static void Initialize()
         {
             try

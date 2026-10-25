@@ -28,7 +28,7 @@
  * FINISHED IMAGE by D on the way to the compositor. Sky, shadows, effects and
  * geometry all move together, because by then they are the same pixels.
  *
- * WHY THIS IS CHEAP RATHER THAN A SECOND AFW
+ * WHY THIS IS CHEAP RATHER THAN A SECOND DR
  *
  * D's translation is measured at 0.0 mm over 450 of 450 publishes: D is a PURE
  * ROTATION. A rotation about the eye is a homography - every point on a ray
@@ -91,7 +91,7 @@ bool image_latch_applied(uint32_t eye);
    from the same place as the other per-second reports. */
 void image_latch_report();
 
-/* Drops every device object. Called on session teardown, like the AFW keeps. */
+/* Drops every device object. Called on session teardown, like the DR keeps. */
 void image_latch_release();
 
 /* =============================================================================

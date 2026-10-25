@@ -1,5 +1,6 @@
 /* =============================================================================
- * AFW - Alternate Frame Warping.
+ * DR - Depth Reprojection. The second eye is synthesised from the depth buffer
+ * of the eye that WAS rendered, rather than being rendered itself.
  *
  * WHAT IT IS
  *
@@ -18,7 +19,7 @@
  * the camera still across a pair (TEST 49) - three rounds of making two moments
  * agree with each other.
  *
- * AFW removes the second moment. Both eyes come from ONE render of ONE frame:
+ * DR removes the second moment. Both eyes come from ONE render of ONE frame:
  * one is the render, the other is a reprojection of it. They cannot disagree
  * about where the soldiers are, where the camera is pointing, or how far apart
  * the eyes are, because there is only one of each.
@@ -43,8 +44,8 @@
  * cheap 1D search rather than a general 3D scatter, and it is another reason
  * symmetric_fov earns its keep.
  * ========================================================================== */
-#ifndef BVR_AFW_WARP_H
-#define BVR_AFW_WARP_H
+#ifndef BVR_DEPTH_REPROJECT_H
+#define BVR_DEPTH_REPROJECT_H
 
 #include <d3d11.h>
 #include <stdint.h>
@@ -54,7 +55,7 @@ namespace bvr {
 /* The geometry the warp needs, published from the managed side because that is
    where all of it is already known. Lengths are in game world units, which is
    the space the depth buffer linearises into. */
-struct AfwParams
+struct DrParams
 {
     float focalPx;    /* (width / 2) / tan(hfov / 2) */
     float baseline;   /* distance between the eyes */
@@ -62,28 +63,28 @@ struct AfwParams
     float zFar;
 };
 
-void afw_set_params(const AfwParams& params);
-bool afw_have_params();
+void dr_set_params(const DrParams& params);
+bool dr_have_params();
 
 /* The stereo geometry, for anything that needs it - the reticle needs it in
    AFR too, where the warp itself never runs. Zero until it has been published. */
-float afw_focal_px();
-float afw_baseline();
+float dr_focal_px();
+float dr_baseline();
 
 /* The near and far planes the depth buffer was rendered with, and which end of
    the stored 0..1 range is the near one. The depth composition layer needs all
    three to tell the compositor what the values it is about to read MEAN; see
    submit_depth() in xr_context.cpp. Zero until parameters are published. */
-float afw_z_near();
-float afw_z_far();
-bool  afw_depth_is_reversed();
+float dr_z_near();
+float dr_z_far();
+bool  dr_depth_is_reversed();
 
 /* True when everything the warp needs exists: parameters, a depth buffer that
    can be sampled, and a compiled shader. */
-bool afw_ready();
+bool dr_ready();
 
 /* True once the calibration has concluded that this scene's depth cannot
-   predict the second eye, and AFW has taken itself out of the frame path for
+   predict the second eye, and DR has taken itself out of the frame path for
    good.
  *
  * The caller must check this BEFORE asking for a warp, so the per-frame
@@ -92,7 +93,7 @@ bool afw_ready();
  * answer - a real render of the other eye, one frame old, beats a copy of THIS
  * eye submitted from the other eye's position, which is what a zero-gain warp
  * used to produce and which no pair of eyes can fuse. */
-bool afw_stood_down();
+bool dr_stood_down();
 
 /* Synthesises the eye OPPOSITE srcEye from the image just rendered.
  *
@@ -105,7 +106,7 @@ bool afw_stood_down();
    disocclusions are filled from: the source eye physically cannot contain the
    geometry a disocclusion reveals, but the other eye's own render can, and does.
    One frame stale, which is the same trade AFR makes for whole eyes. */
-bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
+bool dr_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
                   ID3D11Texture2D* srcColor, int srcEye, ID3D11Texture2D* dst,
                   ID3D11Texture2D* prevReal);
 
@@ -129,7 +130,7 @@ bool afw_warp_eye(ID3D11Device* device, ID3D11DeviceContext* context,
    Translation is deliberately not corrected. It needs the depth of the revealed
    background, which is by definition absent from the depth we have, and its
    magnitude over one frame is a fraction of the rotation term. */
-void afw_set_prev_reproject(const float rot[9], float tanLeft, float tanRight,
+void dr_set_prev_reproject(const float rot[9], float tanLeft, float tanRight,
                             float tanUp, float tanDown, bool valid);
 
 /* Measures how far out the warp actually landed, separately for each direction.
@@ -147,15 +148,15 @@ void afw_set_prev_reproject(const float rot[9], float tanLeft, float tanRight,
 
    Costs two full-frame staging copies and a search, so it is budgeted to a few
    samples per eye and then stops. */
-void afw_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
+void dr_check_synthesis(ID3D11Device* device, ID3D11DeviceContext* context,
                          ID3D11Texture2D* predicted, ID3D11Texture2D* real,
                          int eye);
 
 /* Once per second, so a run can be read without a headset. */
-void afw_log_second();
+void dr_log_second();
 
-void afw_release();
+void dr_release();
 
 } // namespace bvr
 
-#endif /* BVR_AFW_WARP_H */
+#endif /* BVR_DEPTH_REPROJECT_H */

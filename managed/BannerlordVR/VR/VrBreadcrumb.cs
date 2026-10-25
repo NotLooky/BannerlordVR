@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using BannerlordVR.Interop;
 
 namespace BannerlordVR.VR
@@ -43,6 +43,16 @@ namespace BannerlordVR.VR
         public const int WeaponHands   = 7;
         public const int BodyHide      = 8;
         public const int EngineAim     = 9;
+
+        // The mission tick, broken down. The 2026-09-29 mid-battle crash - a
+        // null dereference inside TaleWorlds.Native, reached from our tick -
+        // reported only "MissionTick", which named seven subsystems at once.
+        public const int HeadAim       = 10;
+        public const int Melee         = 11;
+        public const int PhysCombat    = 12;
+        public const int Bow           = 13;
+        public const int Holster       = 14;
+        public const int Roomscale     = 15;
 
         private static bool _broken;
 

@@ -129,9 +129,34 @@ bool eye_textures_ready();
 
 void release_eye_textures();
 
-/* --- the eye's depth buffer (AFW) ----------------------------------------
+/* --- the interface's own render target (TEST 299) ------------------------
+ * Same bracket, its own slot. C# allocates a BVR_UI render target k times the
+ * game window and points the Gauntlet views at it, so the interface is
+ * RASTERISED at the headset's pixel density while its layout stays in window
+ * pixels. Native then keys and submits that instead of the backbuffer.
+ */
+bool arm_ui_capture(uint32_t width, uint32_t height);
+
+/* BVR_OK once the texture has been seen; BVR_SESSION_NOT_READY means "not
+ * yet", exactly as for the eyes - rgl creates it on its own thread. */
+int32_t finish_ui_capture();
+
+/* The captured interface target, or null when C# never asked for one. */
+ID3D11Texture2D* ui_texture();
+
+void release_ui_texture();
+
+/* --- the map bar's own render target (TEST 531) --------------------------
+ * A second slot of the same kind: C# points the MapBar layer's view at a
+ * BVR_HAND target, so the campaign map bar never reaches the head panel and the
+ * hand palette is cropped from it instead. */
+bool arm_hand_capture(uint32_t width, uint32_t height);
+int32_t finish_hand_capture();
+ID3D11Texture2D* hand_texture();
+
+/* --- the eye's depth buffer (DR) ----------------------------------------
  *
- * AFW synthesises the second eye by reprojecting the first one, and that needs
+ * DR synthesises the second eye by reprojecting the first one, and that needs
  * the depth the first was drawn with. We cannot ask for it: AFR retargets the
  * ENGINE'S OWN scene view and lets rgl auto-create the depth target, so the
  * texture is never named on our side of the boundary.

@@ -35,6 +35,11 @@ namespace BannerlordVR.VR
         /// weapon lives on its own GameEntity, and this is how it is fetched -
         /// see VrWeaponEntity.</summary>
         public EquipmentIndex Equipment;
+
+        /// <summary>Whose bones the item in this slot is drawn on. Its own hand,
+        /// except a bow, which is carried in the OFF hand while the arms keep
+        /// following their own controllers. See VrHandSlots.</summary>
+        public HandRole Carrier;
     }
 
     /// <summary>
@@ -93,10 +98,29 @@ namespace BannerlordVR.VR
         /// a sword is more startling than one with nothing in it.</summary>
         private static readonly bool FollowBoth = VrConfig.Bool("hand_follow_both", true);
 
-        /// <summary>Whether a bow trades the controllers over. Config rather than
-        /// a constant because it is a claim about how the player wants to hold a
-        /// bow, and that is not ours to be certain about.</summary>
-        private static readonly bool SwapForBows = VrConfig.Bool("hand_swap_for_bows", true);
+        /// <summary>
+        /// Which hand carries a bow: "off" (the left, where an archer holds it) or
+        /// "main". Config rather than a constant because it is a claim about how
+        /// the player wants to hold a bow, and that is not ours to be certain about.
+        ///
+        /// This replaced hand_swap_for_bows, which traded the two CONTROLLERS over:
+        /// the right arm chain then reached to the left controller and the left arm
+        /// to the right one, and the forearms crossed in an X (seen on screen with a
+        /// bow, and in the log as "main holds a bow (driven by the left controller)").
+        /// Arms now always follow their own controllers, and since the weapon is drawn
+        /// on an entity of our own it can ride whichever wrist we say. That key is
+        /// no longer read.
+        /// </summary>
+        internal static readonly bool BowInOffHand =
+            !string.Equals(VrConfig.String("bow_hand", "off"), "main",
+                           StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>A bow or a crossbow, under bow_hand = off: a main-hand item
+        /// drawn on the off wrist.</summary>
+        internal static bool RidesOffWrist(WeaponComponentData usage)
+        {
+            return BowInOffHand && usage != null && (usage.IsBow || usage.IsCrossBow);
+        }
 
         /// <summary>What a hand bone is called, for the fallback search. Only used
         /// when the monster definition names no hand bones of its own.</summary>
@@ -105,6 +129,16 @@ namespace BannerlordVR.VR
 
         private static bool _loggedBones;
         private static string _loggedHeld;
+
+        /// <summary>
+        /// The controller behind the weapon hand and the shield hand as of the last
+        /// Resolve. Published for VrMelee, which needs to know which controller
+        /// swings and which one guards without owning a skeleton. Right and left
+        /// until the first Resolve, which is Bannerlord's own convention.
+        /// </summary>
+        public static VrHand MainController { get; private set; } = VrHand.Right;
+
+        public static VrHand OffController { get; private set; } = VrHand.Left;
 
         /// <summary>
         /// Fills in the two slots for this frame. Returns false if neither hand
@@ -133,14 +167,23 @@ namespace BannerlordVR.VR
             // into a bone needs to know which way round the character is.
             bool mainIsRight = SideOf(skeleton, mainBone, expectRight: true);
 
-            // Whether what is being held trades the controllers over.
-            bool swap = SwapForBows && held != null && (held.IsBow || held.IsCrossBow);
-
             VrHand mainSide = mainIsRight ? VrHand.Right : VrHand.Left;
             VrHand offSide = mainIsRight ? VrHand.Left : VrHand.Right;
 
-            main = Slot(skeleton, HandRole.Main, mainBone, swap ? offSide : mainSide);
-            off = Slot(skeleton, HandRole.Off, offBone, swap ? mainSide : offSide);
+            MainController = mainSide;
+            OffController = offSide;
+
+            // Each arm follows its own controller, always. A bow is still a main-hand
+            // ITEM, but it is drawn on the off hand's wrist.
+            main = Slot(skeleton, HandRole.Main, mainBone, mainSide);
+            off = Slot(skeleton, HandRole.Off, offBone, offSide);
+
+            // TEST 373c: a crossbow rides the off (left) hand too - it holds the
+            // front, and the main hand comes to the stock to shoot (VrCrossbow).
+            main.Carrier = off.Valid && RidesOffWrist(held)
+                ? HandRole.Off
+                : HandRole.Main;
+            off.Carrier = HandRole.Off;
 
             // The wielded slots, so the weapon entity can be fetched. WieldedItem
             // rather than a fixed index: which of the four weapon slots is in hand
@@ -325,15 +368,17 @@ namespace BannerlordVR.VR
             // Keyed on the controllers too, not just the items. Swapping for a bow
             // changes which hand drives which bone without changing what is held,
             // and that is precisely the line worth seeing in the log.
-            string state = mainText + "/" + offText + "/" + Side(main) + "/" + Side(off);
+            string carried = main.Carrier == HandRole.Off ? "carried in the off hand" : "carried in the main hand";
+            string state = mainText + "/" + offText + "/" + Side(main) + "/" + Side(off) + "/" + carried;
 
             if (state == _loggedHeld)
                 return;
 
             _loggedHeld = state;
+            VrWeaponAttach.NoteHeldChanged();
 
-            VrLog.Info("Hands: main holds " + mainText + " (driven by the " + Side(main)
-                       + " controller), off holds " + offText + " (driven by the "
+            VrLog.Info("Hands: main holds " + mainText + " (" + carried + "; the main arm follows the "
+                       + Side(main) + " controller), off holds " + offText + " (the off arm follows the "
                        + Side(off) + " controller).");
         }
 

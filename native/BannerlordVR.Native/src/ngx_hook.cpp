@@ -11,8 +11,19 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <MinHook.h>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <windows.h>
+#include <mutex>
+#include <cstdio>
+#include <vector>
+
+/* NVIDIA's header, not held to /W4. */
+#pragma warning(push, 0)
+#include "nvapi.h"
+#pragma warning(pop)
+
 
 using bvr::config_bool;
 using bvr::vp_prev_latch_homography;
@@ -74,6 +85,14 @@ typedef NVSDK_NGX_Result(__cdecl* PFN_EvaluateFeature)(
 PFN_EvaluateFeature g_realEvaluate = nullptr;
 std::atomic<bool>   g_installed{ false };
 std::atomic<uint64_t> g_evalCount{ 0 };
+
+/* For ngx_mode_name. */
+std::atomic<int>      g_lastQuality{ -1 };
+std::atomic<uint64_t> g_lastEvalMs{ 0 };
+
+/* For ngx_jitter. Render-resolution pixels, as DLSS was handed them. */
+std::atomic<float>    g_jitterX{ 0.0f };
+std::atomic<float>    g_jitterY{ 0.0f };
 
 bool hook_enabled()
 {
@@ -153,6 +172,18 @@ bool apply_mv_fix(ID3D11DeviceContext* ctx, NVSDK_NGX_Parameter* p,
 /* Defined below. Chooses which of the two DLSS features this evaluation belongs
    to, so each eye accumulates only its own history. */
 const NVSDK_NGX_Handle* pick_feature(const NVSDK_NGX_Handle* incoming);
+/* TEST 794-799: the DLSS preset (defined beside CreateFeature_hook). */
+unsigned preset_now();
+unsigned live_preset();   /* TEST 812 */
+void set_preset_hints(NVSDK_NGX_Parameter* p, unsigned preset);
+extern unsigned g_gamePreset;
+/* TEST 800, defined at the end. */
+void dlss_dump_output(ID3D11DeviceContext* ctx, const NVSDK_NGX_Parameter* params, const void* feature);
+
+/* Defined below (TEST 594). Our feature when the game's was made for other sizes;
+   nullptr = the game's fits. */
+const NVSDK_NGX_Handle* fit_feature(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature,
+                                    const NVSDK_NGX_Parameter* params);
 
 /* And the two feature calls, all defined below beside pick_feature. Declared
    here because ngx_hook_install sits above them and has to name them. */
@@ -173,6 +204,296 @@ NVSDK_NGX_Result __cdecl ReleaseFeature_hook(NVSDK_NGX_Handle* handle);
 void stereo_second_eye(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature,
                        const NVSDK_NGX_Parameter* params, void* callback,
                        NVSDK_NGX_Result first);
+
+/* Defined below (TEST 430). Resolves one eye as a DLAA periphery plus a DLSS
+   window instead of the game's full-size upscale; false = not done, so the
+   caller evaluates as it always did. */
+bool tex2d_size(ID3D11Resource* r, unsigned* w, unsigned* h);   /* defined below */
+bool fovea_enabled();
+bool fovea_eval(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* game,
+                NVSDK_NGX_Parameter* p, void* callback, int eye, ID3D11Resource* out);
+bool g_fovGameStale = false;   /* the game's eye-0 feature idled while foveated */
+
+/* TEST 777: THE GAME'S DLSS SETTINGS QUERY AND OUR EVALUATIONS TAKE TURNS.
+ *
+   TEST 776 caught it: the game thread runs its "optimal settings" query on the
+   very block the render thread evaluates with - Width/Height = display from
+   TaleWorlds.Native+0x2F243A, then NVIDIA's callback writes OutWidth/OutHeight =
+   render size - several times a frame, 4796 of ~42000 writes DURING a DLSS call.
+   Cheeky then reads torn sizes and rejects (code 6), and our size fix landing
+   mid-query feeds the game a wrong optimal size. The query (TaleWorlds.Native
+   +0x2F2390 in this build: Get the callback, Set Width/Height/PerfQualityValue/
+   RTXValue, call it, Get the results - no waits) is found by its bytes and run
+   under one lock, which every Cheeky evaluation and eye-1 create also hold. A
+   build whose bytes differ is left unhooked and says so. ngx_query_lock = 0 off.
+   CONFIRMED 2026-10-18: no rejections, no stutter. */
+std::recursive_mutex g_ngxBlockLock;
+typedef uintptr_t(__fastcall* PFN_Query)(void*, void*, void*, uintptr_t);
+PFN_Query g_realQuery = nullptr;
+
+/* TEST 793: DOES THE RENDERED JITTER MATCH THE ONE DLSS IS TOLD?
+   DLSS gets Jitter.Offset in render pixels; the projection moved the image by
+   ndc = 2 * px / width. So 2 * px / ndc is the width the engine converted with -
+   it must be the colour's own width (2005 in Quality). Medians over ~5 s, with
+   the frames the jitter takes to repeat. Log only; ngx_jitter_probe = 0 is off. */
+void jitter_probe(NVSDK_NGX_Parameter* p, float jx, float jy, int quality)
+{
+    static const bool on = bvr::config_bool("ngx_jitter_probe", false);
+    if (!on) return;
+    constexpr int kN = 256;
+    static float    s_w[kN], s_h[kN], s_ring[kN];
+    static int      s_nw = 0, s_nh = 0, s_ringN = 0;
+    static uint64_t s_last = 0;
+    float nx = 0.0f, ny = 0.0f;
+    if (bvr::stereo_render_jitter(&nx, &ny))
+    {
+        if (fabsf(nx) > 1e-7f && fabsf(jx) > 0.02f && s_nw < kN) s_w[s_nw++] = 2.0f * jx / nx;
+        if (fabsf(ny) > 1e-7f && fabsf(jy) > 0.02f && s_nh < kN) s_h[s_nh++] = 2.0f * jy / ny;
+    }
+    s_ring[s_ringN++ % kN] = jx;
+
+    const uint64_t now = GetTickCount64();
+    if (now - s_last < 5000) return;
+    s_last = now;
+    ID3D11Resource* color = nullptr;
+    p->Get("Color", &color);
+    unsigned cw = 0, ch = 0;
+    tex2d_size(color, &cw, &ch);
+    auto median = [](float* v, int n) { std::sort(v, v + n); return n ? v[n / 2] : 0.0f; };
+    /* The smallest p for which the last 64 jitters repeat every p frames. */
+    int period = 0;
+    if (s_ringN >= 128)
+        for (int q = 1; q <= 64 && period == 0; ++q)
+        {
+            bool same = true;
+            for (int i = 0; i < 64 && same; ++i)
+                same = s_ring[(s_ringN - 1 - i) % kN] == s_ring[(s_ringN - 1 - i - q) % kN];
+            if (same) period = q;
+        }
+    BVR_INFO("Jitter probe (TEST 793, PerfQualityValue %d, colour %ux%u): the engine converted "
+             "the jitter with width %.1f (%d frames), height %.1f (%d frames) - both should be the "
+             "colour size, a negative is only the sign convention. Jitter repeats every %d frames "
+             "(0 = not within 64; DLSS wants ~8 x ratio^2: 18 Quality, 32 Performance).",
+             quality, cw, ch, median(s_w, s_nw), s_nw, median(s_h, s_nh), s_nh, period);
+    s_nw = s_nh = 0;
+}
+
+uintptr_t __fastcall query_hook(void* self, void* out, void* in, uintptr_t quality)
+{
+    std::lock_guard<std::recursive_mutex> guard(g_ngxBlockLock);
+    return g_realQuery(self, out, in, quality);
+}
+
+/* One match of `sig` (-1 = any byte) in TaleWorlds.Native's code, or null with the
+   count in *matches. A build whose bytes differ finds nothing and is left alone. */
+const uint8_t* find_native_code(const int* sig, size_t len, int* matches, const uint8_t** base_out)
+{
+    *matches = 0;
+    HMODULE mod = GetModuleHandleW(L"TaleWorlds.Native.dll");
+    if (mod == nullptr)
+        return nullptr;
+    const auto* base = reinterpret_cast<const uint8_t*>(mod);
+    *base_out = base;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    const uint8_t* found = nullptr;
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+    {
+        if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
+            continue;
+        const uint8_t* b = base + sec->VirtualAddress;
+        const size_t n = sec->Misc.VirtualSize;
+        for (size_t at = 0; at + len <= n; ++at)
+        {
+            size_t k = 0;
+            while (k < len && (sig[k] < 0 || b[at + k] == sig[k]))
+                ++k;
+            if (k == len)
+            {
+                found = b + at;
+                ++*matches;
+            }
+        }
+    }
+    return *matches == 1 ? found : nullptr;
+}
+
+void install_query_lock()
+{
+    static bool tried = false;
+    if (tried)
+        return;
+    tried = true;
+    if (!bvr::config_bool("ngx_query_lock", true))
+        return;
+    /* -1 = any byte (the rip-relative lea). */
+    static const int kSig[] = {
+        0x40,0x53,0x56,0x57,0x41,0x56,0x48,0x83,0xEC,0x48,0x33,0xC0,0x45,0x8B,0xF1,0x49,0x8B,0xF0,
+        0x48,0x8B,0xFA,0x48,0x8B,0xD9,0x48,0x89,0x44,0x24,0x20,0x48,0x89,0x44,0x24,0x28,0x48,0x89,
+        0x44,0x24,0x70,0x38,0x81,0xD8,0x00,0x00,0x00,0x75,0x1D,0xC7,0x81,0xF0,0x00,0x00,0x00,0x0A,
+        0xD7,0x23,0x3C,0x49,0x8B,0x00,0x48,0x89,0x02,0x48,0x8B,0xC2,0x48,0x83,0xC4,0x48,0x41,0x5E,
+        0x5F,0x5E,0x5B,0xC3,0x48,0x89,0x6C,0x24,0x78,0x48,0x8D,0x15,-1,-1,-1,-1,0x48,0x8B,0xA9,0xE0,
+        0x00,0x00,0x00 };
+    int matches = 0;
+    const uint8_t* base = nullptr;
+    const uint8_t* found = find_native_code(kSig, sizeof(kSig) / sizeof(kSig[0]), &matches, &base);
+    if (found == nullptr)
+    {
+        BVR_WARN("Cheeky TEST 777: the game's DLSS settings query was found %d time(s), not "
+                 "once (another game build?); it is NOT locked.", matches);
+        return;
+    }
+    if (MH_CreateHook(const_cast<uint8_t*>(found), reinterpret_cast<LPVOID>(&query_hook),
+                      reinterpret_cast<LPVOID*>(&g_realQuery)) != MH_OK ||
+        MH_EnableHook(const_cast<uint8_t*>(found)) != MH_OK)
+    {
+        BVR_WARN("Cheeky TEST 777: MinHook refused the game's DLSS settings query; NOT locked.");
+        return;
+    }
+    BVR_INFO("Cheeky TEST 777: the game's DLSS settings query (TaleWorlds.Native.dll+0x%llX) now "
+             "takes turns with DLSS evaluations.",
+             static_cast<unsigned long long>(found - base));
+}
+
+/* TEST 818: THE ENGINE'S POST TARGETS AT THE VIEW'S OWN SIZE.
+ *
+   The engine sizes every render-scaled target (descriptor +0x4C set) in its
+   allocator (TaleWorlds.Native+0x22FA60, the descriptor's vtable slot 0x38, called
+   with the view) as ceil(view render size +0x8590/+0x8594 x the descriptor's double
+   scale +0x58/+0x60). That scale is (re)computed first, every call, by +0x22F990:
+   the target's own float scale (+0x08/+0x0C) x ONE upscale factor per DLSS mode,
+   taken from the flat window (2560x1440: 2560/1707, 1440/960, ...). For an eye
+   whose own ratio differs by a hair, the round-up lands a pixel off its output
+   (+0x8588/+0x858C): 2380 -> 2381. DLSS's correct 2380 output is then resampled
+   into 2381 and the final pass squeezes it back into the 2380 eye - two linear
+   resamples, the "clean but blurry" Quality/Balanced that came and went with the
+   crop value (1 in 3 Quality sizes; Balanced its own set), VD's crop and the game
+   build alike (TESTs 792-817). So after +0x22F990, a scale whose result lands
+   within 2 px of the view's output but not ON it becomes exactly output/render (a
+   hair under, so the round-up lands on it). Half/quarter targets, fixed-size ones
+   and views without DLSS (render = output) are untouched. RESULT 818a: hooking the
+   allocator itself did nothing - +0x22F990 rewrote the scale inside it.
+   ngx_post_size_fix = 0 is off. */
+typedef uintptr_t(__fastcall* PFN_PostScale)(uint8_t*, uint8_t*, uintptr_t, uintptr_t);
+PFN_PostScale g_realPostScale = nullptr;
+
+bool fit_scale(double* scale, int render, int output)
+{
+    if (render <= 0 || output <= 0 || render == output || !(*scale > 0.0))
+        return false;
+    const double size = render * *scale;
+    if (fabs(size - output) >= 2.0 || ceil(size) == static_cast<double>(output))
+        return false;
+    *scale = (output - 1e-6) / render;
+    return true;
+}
+
+uintptr_t __fastcall post_scale_hook(uint8_t* desc, uint8_t* view, uintptr_t a3, uintptr_t a4)
+{
+    const uintptr_t r = g_realPostScale(desc, view, a3, a4);
+    if (desc == nullptr || view == nullptr || desc[0x4C] == 0)
+        return r;
+
+    double* sw = reinterpret_cast<double*>(desc + 0x58);
+    double* sh = reinterpret_cast<double*>(desc + 0x60);
+    const double ow = *sw, oh = *sh;
+    const int outW = *reinterpret_cast<const int*>(view + 0x8588);
+    const int outH = *reinterpret_cast<const int*>(view + 0x858C);
+    const int rw = *reinterpret_cast<const int*>(view + 0x8590);
+    const int rh = *reinterpret_cast<const int*>(view + 0x8594);
+    const bool fw = fit_scale(sw, rw, outW);
+    const bool fh = fit_scale(sh, rh, outH);
+    if (fw || fh)
+    {
+        static std::atomic<int> s_logged{0};
+        if (s_logged.fetch_add(1, std::memory_order_relaxed) < 12)
+            BVR_INFO("Post size fix (TEST 818): a target the engine would make %.0fx%.0f for a %dx%d "
+                     "view (render %dx%d) is made %.0fx%.0f.", ceil(rw * ow), ceil(rh * oh), outW, outH,
+                     rw, rh, ceil(rw * *sw), ceil(rh * *sh));
+    }
+    return r;
+}
+
+void install_post_size_fix()
+{
+    static bool tried = false;
+    if (tried)
+        return;
+    tried = true;
+    if (!bvr::config_bool("ngx_post_size_fix", true))
+        return;
+    /* +0x22F990's head: mov [rsp+8],rbx / push rdi / sub rsp,30h / cmp byte [rcx+38h],0 /
+       mov rbx,rcx / jz / cmp qword [rcx+40h],0 / jz / mov rcx,[rdx+8580h] / mov rax,[rcx] /
+       call [rax+80h]. */
+    static const int kSig[] = {
+        0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x30,0x80,0x79,0x38,0x00,0x48,0x8B,0xD9,0x74,
+        0x5D,0x48,0x83,0x79,0x40,0x00,0x74,0x56,0x48,0x8B,0x8A,0x80,0x85,0x00,0x00,0x48,0x8B,0x01,
+        0xFF,0x90,0x80,0x00,0x00,0x00 };
+    int matches = 0;
+    const uint8_t* base = nullptr;
+    const uint8_t* found = find_native_code(kSig, sizeof(kSig) / sizeof(kSig[0]), &matches, &base);
+    if (found == nullptr)
+    {
+        BVR_WARN("Post size fix (TEST 818): the engine's post-target scale function was found %d "
+                 "time(s), not once (another game build?). A cropped eye may stay soft in DLSS "
+                 "Quality/Balanced.", matches);
+        return;
+    }
+    if (MH_CreateHook(const_cast<uint8_t*>(found), reinterpret_cast<LPVOID>(&post_scale_hook),
+                      reinterpret_cast<LPVOID*>(&g_realPostScale)) != MH_OK ||
+        MH_EnableHook(const_cast<uint8_t*>(found)) != MH_OK)
+    {
+        BVR_WARN("Post size fix (TEST 818): MinHook refused the engine's post-target scale function.");
+        return;
+    }
+    BVR_INFO("Post size fix (TEST 818): the engine's post-target scale (TaleWorlds.Native.dll+0x%llX) "
+             "now fits full-size targets to each view's output.",
+             static_cast<unsigned long long>(found - base));
+}
+
+/* g_realEvaluate, made safe for Cheeky Foveated DLSS (when it was started).
+   Cheeky reads the evaluate block's sizes; the game fills them in more than one
+   order (TEST 187) - its own optimal-settings query leaves Width = display and
+   OutWidth = render - and Cheeky rejected those calls (0xBAD00005, its code 6
+   "Invalid crop dimensions or resource bounds"): the game re-created DLSS, a
+   stutter, a white flash and a flat right eye. So the block gets the sizes the
+   textures really are, and keeps them (TEST 774: putting the game's back made
+   Cheeky read them), under the lock the game's query takes too (TEST 777). */
+std::atomic<bool> g_cheekyRunning{ false };
+
+/* TEST 797: the VR panel's dlss_preset, read at the next DLSS create. */
+constexpr int    kPresetUnset = -1000;   /* the panel has not said: the cfg's */
+std::atomic<int> g_presetChoice{ kPresetUnset };
+
+NVSDK_NGX_Result evaluate_sized(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature,
+                                const NVSDK_NGX_Parameter* params, void* callback, int eye)
+{
+    if (!g_cheekyRunning.load(std::memory_order_relaxed) || params == nullptr)
+        return g_realEvaluate(ctx, feature, params, callback);
+
+    install_query_lock();
+    std::lock_guard<std::recursive_mutex> turn(g_ngxBlockLock);
+    NVSDK_NGX_Parameter* p = const_cast<NVSDK_NGX_Parameter*>(params);
+    ID3D11Resource* color = nullptr;
+    ID3D11Resource* out = nullptr;
+    p->Get("Color", &color);
+    p->Get("Output", &out);
+    unsigned tex[4] = {};
+    if (tex2d_size(color, &tex[0], &tex[1]) && tex2d_size(out, &tex[2], &tex[3]))
+    {
+        p->Set("Width", tex[0]);
+        p->Set("Height", tex[1]);
+        p->Set("OutWidth", tex[2]);
+        p->Set("OutHeight", tex[3]);
+    }
+    const NVSDK_NGX_Result r = g_realEvaluate(ctx, feature, params, callback);
+    static int s_fails[2] = {};
+    if (!NGX_SUCCEED(r) && s_fails[eye & 1]++ < 3)
+        BVR_WARN("Cheeky: eye %d DLSS evaluation returned 0x%08X (textures %ux%u -> %ux%u).",
+                 eye, static_cast<unsigned>(r), tex[0], tex[1], tex[2], tex[3]);
+    return r;
+}
 
 NVSDK_NGX_Result __cdecl EvaluateFeature_hook(ID3D11DeviceContext* ctx,
                                               const NVSDK_NGX_Handle* feature,
@@ -211,6 +532,25 @@ NVSDK_NGX_Result __cdecl EvaluateFeature_hook(ID3D11DeviceContext* ctx,
         const_cast<NVSDK_NGX_Parameter*>(params)->Get("DLSS.Render.Subrect.Dimensions.Width", &subW);
         const_cast<NVSDK_NGX_Parameter*>(params)->Get("DLSS.Render.Subrect.Dimensions.Height", &subH);
         const_cast<NVSDK_NGX_Parameter*>(params)->Get("PerfQualityValue", &quality);
+    }
+    g_lastQuality.store(quality, std::memory_order_relaxed);
+    g_lastEvalMs.store(GetTickCount64(), std::memory_order_relaxed);
+
+    /* EVERY FRAME, NOT ONLY IN THE REPORT BLOCK BELOW.
+     *
+       The reconnaissance block reads these too, but it runs a dozen times in a
+       run and the value is different every single frame - that is what a jitter
+       sequence IS. DR needs THIS frame's, so it is read on the hot path: two
+       parameter fetches on a call that is already doing an upscale. */
+    if (params != nullptr)
+    {
+        float jx = 0.0f, jy = 0.0f;
+        NVSDK_NGX_Parameter* jp = const_cast<NVSDK_NGX_Parameter*>(params);
+        jp->Get("Jitter.Offset.X", &jx);
+        jp->Get("Jitter.Offset.Y", &jy);
+        g_jitterX.store(jx, std::memory_order_relaxed);
+        g_jitterY.store(jy, std::memory_order_relaxed);
+        jitter_probe(jp, jx, jy, quality);
     }
 
     if (params != nullptr && s_reports < 12)
@@ -336,7 +676,9 @@ NVSDK_NGX_Result __cdecl EvaluateFeature_hook(ID3D11DeviceContext* ctx,
     /* THE SUBSTITUTION THAT ACTUALLY MATCHES THE DIAGNOSIS. Same parameters,
        same context, different feature - and the feature is what owns the
        temporal history. */
-    const NVSDK_NGX_Handle* useFeature = pick_feature(feature);
+    const NVSDK_NGX_Handle* useFeature = fit_feature(ctx, feature, params);   /* TEST 594 */
+    if (useFeature == nullptr)
+        useFeature = pick_feature(feature);
 
     /* In a frame-map capture, DLSS's whole input set goes into the op stream at
        the point it is consumed. NGX's Get hands back its own pointers, not
@@ -367,7 +709,33 @@ NVSDK_NGX_Result __cdecl EvaluateFeature_hook(ID3D11DeviceContext* ctx,
         bvr::stereo_perf_ngx_stamp(ctx, 0);
         QueryPerformanceCounter(&e0);
     }
-    const NVSDK_NGX_Result r = g_realEvaluate(ctx, useFeature, params, callback);
+
+    /* TEST 430: the game's eye, foveated. The game's own feature idles meanwhile,
+       so the first evaluation it gets back is a Reset - its history is stale. */
+    NVSDK_NGX_Result r = 1;   /* NVSDK_NGX_Result_Success */
+    ID3D11Resource* fovOut = nullptr;
+    if (params != nullptr && fovea_enabled())
+        const_cast<NVSDK_NGX_Parameter*>(params)->Get("Output", &fovOut);
+    if (fovOut != nullptr &&
+        fovea_eval(ctx, feature, const_cast<NVSDK_NGX_Parameter*>(params), callback, 0, fovOut))
+    {
+        g_fovGameStale = true;
+    }
+    else
+    {
+        int gameReset = 0;
+        const bool resetGame = g_fovGameStale && params != nullptr;
+        if (resetGame)
+        {
+            const_cast<NVSDK_NGX_Parameter*>(params)->Get("Reset", &gameReset);
+            const_cast<NVSDK_NGX_Parameter*>(params)->Set("Reset", 1);
+        }
+        r = evaluate_sized(ctx, useFeature, params, callback, 0);
+        dlss_dump_output(ctx, params, useFeature);
+        if (resetGame)
+            const_cast<NVSDK_NGX_Parameter*>(params)->Set("Reset", gameReset);
+        g_fovGameStale = false;
+    }
     if (timeIt)
     {
         QueryPerformanceCounter(&e1);
@@ -385,6 +753,38 @@ NVSDK_NGX_Result __cdecl EvaluateFeature_hook(ID3D11DeviceContext* ctx,
 }
 
 } /* namespace */
+
+const char* ngx_mode_name()
+{
+    const uint64_t t = g_lastEvalMs.load(std::memory_order_relaxed);
+    if (t == 0 || GetTickCount64() - t > 1000)
+        return "no DLSS";
+    switch (g_lastQuality.load(std::memory_order_relaxed))
+    {
+    case 0:  return "DLSS Performance";
+    case 1:  return "DLSS Balanced";
+    case 2:  return "DLSS Quality";
+    case 3:  return "DLSS Ultra Performance";
+    case 4:  return "DLSS Ultra Quality";
+    case 5:  return "DLAA";
+    default: return "DLSS, mode unknown";
+    }
+}
+
+bool ngx_jitter(float* px, float* py)
+{
+    /* The same staleness test ngx_mode_name uses. A jitter from a second ago is
+       not this frame's, and applying it would move the depth lookup by a
+       fraction of a pixel in an arbitrary direction - which is the artifact, not
+       the fix. */
+    const uint64_t t = g_lastEvalMs.load(std::memory_order_relaxed);
+    if (t == 0 || GetTickCount64() - t > 1000)
+        return false;
+
+    if (px) *px = g_jitterX.load(std::memory_order_relaxed);
+    if (py) *py = g_jitterY.load(std::memory_order_relaxed);
+    return true;
+}
 
 bool ngx_hook_install()
 {
@@ -896,7 +1296,7 @@ bool apply_mv_fix(ID3D11DeviceContext* ctx, NVSDK_NGX_Parameter* p,
     memcpy(mapped.pData, &prm, sizeof(prm));
     ctx->Unmap(g_mvCb, 0);
 
-    /* Borrowed context, so everything is put back. Same discipline as the AFW
+    /* Borrowed context, so everything is put back. Same discipline as the DR
        dispatch: a compute shader or a UAV left bound surfaces three systems away
        as something rendering black. */
     ID3D11ComputeShader*       prevCs = nullptr;
@@ -1007,21 +1407,28 @@ bool per_eye_enabled()
    sees exactly the stream DLSS is built for.
 
    The feature is created lazily, from the evaluation's own parameter block, the
-   first time native stereo evaluates - AFR and AFW never cause one to exist - and
+   first time native stereo evaluates - AFR and DR never cause one to exist - and
    released when the game releases the feature it is paired with, or on the first
    evaluation after native stereo is switched off. None of this touches the AFR
    per-eye pair above (g_featureTwin / pick_feature).
    =========================================================================== */
 
 NVSDK_NGX_Handle*       g_stereoTwin = nullptr;
+unsigned                g_stereoTwinW = 0;     /* the colour size it was made for */
+unsigned                g_stereoTwinPreset = 0;   /* TEST 812: the preset it was made with */
+unsigned                g_stereoTwinH = 0;
 const NVSDK_NGX_Handle* g_stereoPairedWith = nullptr;
 const NVSDK_NGX_Handle* g_stereoFailedFor = nullptr;
+uint64_t                g_stereoRetryAt = 0;   /* GetTickCount64; ~0 = never */
 int                     g_stereoFeatureId = 1;      /* NVSDK_NGX_Feature_SuperSampling */
 bool                    g_stereoReset = true;
 uint64_t                g_stereoEvals = 0;
 uint64_t                g_stereoMissed = 0;
 const char*             g_stereoWhy = "";
 double                  g_stereoCpuMs = 0.0;
+/* TEST 192: evaluations where an input had NO eye-1 twin, so eye 1 got eye 0's.
+   Indexed like kInputs in stereo_evaluate_eye1. */
+uint64_t                g_stereoShared[6] = {};
 uint64_t                g_stereoLastLog = 0;
 
 /* WHAT THE GAME CREATED ITS FEATURE WITH (TEST 183).
@@ -1080,6 +1487,32 @@ void snapshot_write(NVSDK_NGX_Parameter* p, const CreateField* f, int n)
     }
 }
 
+/* TEST 594b: the game's last few creations, newest first by g_snapNext. A
+   released feature's values are still the right recipe for its sizes. */
+CreateSnapshot g_snapHist[4] = {};
+int            g_snapNext = 0;
+
+bool snapshot_sizes_match(const CreateField* f, const unsigned s[4])
+{
+    if (!f[0].have || !f[1].have || !f[2].have || !f[3].have)
+        return false;
+    return (s[0] == f[0].u && s[1] == f[1].u && s[2] == f[2].u && s[3] == f[3].u) ||
+           (s[0] == f[2].u && s[1] == f[3].u && s[2] == f[0].u && s[3] == f[1].u);
+}
+
+/* s = colour w/h, output w/h. Newest creation made for exactly those sizes. */
+const CreateField* snapshot_for_sizes(const unsigned s[4])
+{
+    constexpr int n = static_cast<int>(sizeof(g_snapHist) / sizeof(g_snapHist[0]));
+    for (int k = 1; k <= n; ++k)
+    {
+        const CreateSnapshot& c = g_snapHist[(g_snapNext - k + n) % n];
+        if (c.handle != nullptr && snapshot_sizes_match(c.f, s))
+            return c.f;
+    }
+    return nullptr;
+}
+
 bool stereo_ngx_enabled()
 {
     static bool cached = true;
@@ -1096,6 +1529,7 @@ void stereo_twin_release(const char* why)
         BVR_INFO("Stereo DLSS: the second eye's DLSS feature was released (%s).", why);
     }
     g_stereoTwin = nullptr;
+    g_stereoTwinW = g_stereoTwinH = 0;
     g_stereoPairedWith = nullptr;
 }
 
@@ -1103,6 +1537,662 @@ void stereo_missed(const char* why)
 {
     ++g_stereoMissed;
     g_stereoWhy = why;
+}
+
+bool tex2d_size(ID3D11Resource* r, unsigned* w, unsigned* h)
+{
+    ID3D11Texture2D* t = nullptr;
+    if (r == nullptr || FAILED(r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) || !t)
+        return false;
+    D3D11_TEXTURE2D_DESC d = {};
+    t->GetDesc(&d);
+    t->Release();
+    *w = d.Width;
+    *h = d.Height;
+    return true;
+}
+
+/* ===========================================================================
+   FOVEATED DLSS (TEST 430).
+
+   DLSS costs by the pixels it writes: ~6 ms of TEST 428's 18 ms frame for two
+   3516x3368 outputs, and VRS could not touch it. Most of those pixels are where
+   the eye is not looking and the lens blurs them anyway. So each eye is resolved
+   twice, small:
+
+     - the whole view by DLSS in DLAA mode at the RENDER size - anti-aliased and
+       temporally stable, a quarter of the pixels - then stretched to the eye;
+     - a window around the lens axis by DLSS at the full output density, through
+       NVIDIA's subrect parameters: the inputs read from an offset, the result
+       written into a texture of the window's size;
+
+   and one compute pass blends the window into the stretched periphery with a
+   feathered edge, into the output the game handed DLSS. Each is a feature of
+   its own, so each keeps its own history. The game's features stay alive and
+   idle, and take over again - with a Reset - on any failure.
+
+   The window is FIXED here. TEST 431 moves it with the gaze, which also means
+   moving its history with it.
+   =========================================================================== */
+
+/* Every input DLSS can be given a subrect for. */
+const char* const kFovBases[][2] = {
+    { "DLSS.Input.Color.Subrect.Base.X", "DLSS.Input.Color.Subrect.Base.Y" },
+    { "DLSS.Input.Depth.Subrect.Base.X", "DLSS.Input.Depth.Subrect.Base.Y" },
+    { "DLSS.Input.MV.Subrect.Base.X", "DLSS.Input.MV.Subrect.Base.Y" },
+    { "DLSS.Input.Translucency.Subrect.Base.X", "DLSS.Input.Translucency.Subrect.Base.Y" },
+    { "DLSS.Input.Bias.Current.Color.Subrect.Base.X", "DLSS.Input.Bias.Current.Color.Subrect.Base.Y" },
+};
+constexpr int kFovBaseCount = static_cast<int>(sizeof(kFovBases) / sizeof(kFovBases[0]));
+const char* const kFovDimW = "DLSS.Render.Subrect.Dimensions.Width";
+const char* const kFovDimH = "DLSS.Render.Subrect.Dimensions.Height";
+
+struct FovEye
+{
+    NVSDK_NGX_Handle* periph = nullptr;     /* DLAA, render -> render */
+    NVSDK_NGX_Handle* fovea = nullptr;      /* the window, render -> output density */
+    ID3D11Texture2D* pTex = nullptr;
+    ID3D11ShaderResourceView* pSrv = nullptr;
+    ID3D11Texture2D* fTex = nullptr;
+    ID3D11ShaderResourceView* fSrv = nullptr;
+    unsigned rw = 0, rh = 0, ow = 0, oh = 0;   /* render and output sizes they were made for */
+    unsigned ww = 0, wh = 0;                   /* the window, render pixels */
+    unsigned fw = 0, fh = 0;                   /* the window, output pixels */
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    bool fresh = true;                         /* the next evaluation resets history */
+};
+FovEye                  g_fov[2];
+const NVSDK_NGX_Handle* g_fovPairedWith = nullptr;
+const NVSDK_NGX_Handle* g_fovFailedFor = nullptr;
+int                     g_fovFailures = 0;      /* 3 and it stays off for the session */
+
+/* OUR OWN PARAMETER BLOCK (TEST 430b). TEST 430 wrote the window's subrect into
+   the GAME's block and "restored" it to 0 - but a parameter the game never set
+   cannot be unset (NGX has no remove), and DLSS rejected the leftovers: every
+   evaluation after the first, the game's own included, failed 0xBAD00005 and the
+   eyes froze, then went black. Ours are created and evaluated through a block
+   of ours, which the game's inputs are copied into; the game's is only read. */
+typedef NVSDK_NGX_Result(__cdecl* PFN_AllocateParameters)(NVSDK_NGX_Parameter** out);
+NVSDK_NGX_Parameter* g_fovParams = nullptr;   /* ponytail: never destroyed - one per process */
+
+NVSDK_NGX_Parameter* fov_params()
+{
+    static bool tried = false;
+    if (g_fovParams != nullptr || tried)
+        return g_fovParams;
+    tried = true;
+
+    HMODULE ngx = GetModuleHandleW(L"_nvngx.dll");
+    if (ngx == nullptr)
+        ngx = GetModuleHandleW(L"nvngx.dll");
+    const auto alloc = ngx ? reinterpret_cast<PFN_AllocateParameters>(
+                                 GetProcAddress(ngx, "NVSDK_NGX_D3D11_AllocateParameters"))
+                           : nullptr;
+    NVSDK_NGX_Parameter* made = nullptr;
+    const NVSDK_NGX_Result r = alloc ? alloc(&made) : 0;
+    if (!NGX_SUCCEED(r) || made == nullptr)
+    {
+        BVR_WARN("Foveated DLSS (TEST 430b): no parameter block of our own (%s, 0x%08X); "
+                 "foveated DLSS stays off.", alloc ? "AllocateParameters failed"
+                                                   : "AllocateParameters not exported", r);
+        return nullptr;
+    }
+    g_fovParams = made;
+    return made;
+}
+
+/* This frame's inputs from the game's block into ours. A resource the game does
+   not give is cleared in ours, so last frame's never lingers. */
+void fov_copy_inputs(NVSDK_NGX_Parameter* game, NVSDK_NGX_Parameter* ours)
+{
+    static const char* const kRes[] = {
+        "Color", "Depth", "MotionVectors", "ExposureTexture", "TransparencyMask",
+        "DLSS.Input.Bias.Current.Color.Mask",
+    };
+    for (const char* name : kRes)
+    {
+        ID3D11Resource* r = nullptr;
+        if (!NGX_SUCCEED(game->Get(name, &r)))
+            r = nullptr;
+        ours->Set(name, r);
+    }
+
+    static const char* const kFloat[] = {
+        "Jitter.Offset.X", "Jitter.Offset.Y", "MV.Scale.X", "MV.Scale.Y", "Sharpness",
+        "DLSS.Pre.Exposure", "DLSS.Exposure.Scale",
+    };
+    for (const char* name : kFloat)
+    {
+        float v = 0.0f;
+        if (NGX_SUCCEED(game->Get(name, &v)))
+            ours->Set(name, v);
+    }
+}
+ID3D11ComputeShader*    g_fovCs = nullptr;
+ID3D11Buffer*           g_fovCb = nullptr;
+ID3D11SamplerState*     g_fovSampler = nullptr;
+bool                    g_fovShaderFailed = false;
+uint64_t                g_fovEvals = 0, g_fovMissed = 0;
+const char*             g_fovWhy = "";
+
+/* The output's UAV, kept on the output so it goes when the output does.
+   {5C1E7A20-9D4B-4F3E-8B61-2A7D0E9C4F18} */
+const GUID kFovOutUav = { 0x5c1e7a20, 0x9d4b, 0x4f3e, { 0x8b, 0x61, 0x2a, 0x7d, 0x0e, 0x9c, 0x4f, 0x18 } };
+
+const char* kFovShader = R"(
+Texture2D<float4>   Periph : register(t0);
+Texture2D<float4>   Fovea  : register(t1);
+RWTexture2D<float4> Out    : register(u0);
+SamplerState        Lin    : register(s0);
+
+cbuffer Params : register(b0)
+{
+    float2 gOutSize;    // the eye's output, pixels
+    float2 gWinBase;    // the window's top-left, output pixels
+    float2 gWinSize;    // the window's size, output pixels
+    float  gFeather;    // share of the window's half-size the blend takes
+    float  gPad;
+};
+
+[numthreads(8, 8, 1)]
+void main(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= (uint)gOutSize.x || tid.y >= (uint)gOutSize.y)
+        return;
+
+    float2 here = float2(tid.xy) + 0.5;
+    float4 c = Periph.SampleLevel(Lin, here / gOutSize, 0);
+
+    float2 lp = here - gWinBase;
+    if (all(lp > 0.0) && all(lp < gWinSize))
+    {
+        // 0 at the window's edge, 1 at its centre; smooth over the feather.
+        float2 edge = min(lp, gWinSize - lp) / (0.5 * gWinSize);
+        float  w = saturate(min(edge.x, edge.y) / max(gFeather, 0.001));
+        w = w * w * (3.0 - 2.0 * w);
+        c = lerp(c, Fovea[uint2(lp)], w);
+    }
+    Out[tid.xy] = c;
+}
+)";
+
+struct FovParams
+{
+    float outW, outH, winX, winY, winW, winH, feather, pad;
+};
+
+bool fov_miss(const char* why)
+{
+    ++g_fovMissed;
+    g_fovWhy = why;
+    return false;
+}
+
+void fov_release_eye(FovEye& e)
+{
+    if (e.periph && g_realRelease) g_realRelease(e.periph);
+    if (e.fovea && g_realRelease) g_realRelease(e.fovea);
+    if (e.pSrv) e.pSrv->Release();
+    if (e.pTex) e.pTex->Release();
+    if (e.fSrv) e.fSrv->Release();
+    if (e.fTex) e.fTex->Release();
+    e = FovEye();
+}
+
+void fov_release(const char* why)
+{
+    if (g_fov[0].periph || g_fov[1].periph)
+        BVR_INFO("Foveated DLSS (TEST 430): features released (%s).", why);
+    fov_release_eye(g_fov[0]);
+    fov_release_eye(g_fov[1]);
+    g_fovPairedWith = nullptr;
+}
+
+bool fov_enabled_cfg()
+{
+    static const bool on = config_bool("dlss_foveated", false);
+    return on;
+}
+
+/* A DLSS feature with the game's own creation values and our sizes, made through
+   OUR block (`ours`); the game's (`game`) is only read for its preset hints. */
+NVSDK_NGX_Handle* fov_create(ID3D11DeviceContext* ctx, NVSDK_NGX_Parameter* game,
+                             NVSDK_NGX_Parameter* ours, const NVSDK_NGX_Handle* gameFeature,
+                             unsigned rw, unsigned rh, unsigned ow, unsigned oh, int quality,
+                             const char* what)
+{
+    constexpr int kFields = static_cast<int>(sizeof(g_createSnap.f) / sizeof(g_createSnap.f[0]));
+    if (g_createSnap.handle == gameFeature)
+        snapshot_write(ours, g_createSnap.f, kFields);
+
+    static const char* const kHints[] = {
+        "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+        "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+        "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality",
+    };
+    for (const char* name : kHints)
+    {
+        unsigned v = 0;
+        if (NGX_SUCCEED(game->Get(name, &v)))
+            ours->Set(name, v);
+    }
+    ours->Set("CreationNodeMask", 1u);
+    ours->Set("VisibilityNodeMask", 1u);
+    ours->Set("DLSS.Enable.Output.Subrects", 0);
+    ours->Set("Width", rw);
+    ours->Set("Height", rh);
+    ours->Set("OutWidth", ow);
+    ours->Set("OutHeight", oh);
+    if (quality >= 0)
+        ours->Set("PerfQualityValue", quality);
+    else
+    {
+        int q = 0;
+        if (NGX_SUCCEED(game->Get("PerfQualityValue", &q)))
+            ours->Set("PerfQualityValue", q);
+    }
+
+    NVSDK_NGX_Handle* made = nullptr;
+    const NVSDK_NGX_Result r = g_realCreate(ctx, g_stereoFeatureId, ours, &made);
+
+    if (!NGX_SUCCEED(r) || made == nullptr)
+    {
+        BVR_WARN("Foveated DLSS (TEST 430): could not create the %s feature %ux%u -> %ux%u "
+                 "(0x%08X); the game's own DLSS stays in charge.", what, rw, rh, ow, oh, r);
+        return nullptr;
+    }
+    return made;
+}
+
+bool fov_texture(ID3D11Device* dev, unsigned w, unsigned h, DXGI_FORMAT f,
+                 ID3D11Texture2D** tex, ID3D11ShaderResourceView** srv)
+{
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = f;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;   /* DLSS writes it */
+    return SUCCEEDED(dev->CreateTexture2D(&td, nullptr, tex)) && *tex != nullptr &&
+           SUCCEEDED(dev->CreateShaderResourceView(*tex, nullptr, srv)) && *srv != nullptr;
+}
+
+bool fov_shader(ID3D11Device* dev)
+{
+    if (g_fovCs != nullptr)
+        return true;
+    if (g_fovShaderFailed)
+        return false;
+
+    ID3DBlob* code = nullptr;
+    ID3DBlob* err = nullptr;
+    const HRESULT hr = D3DCompile(kFovShader, strlen(kFovShader), "bvr_fov_blend", nullptr,
+                                  nullptr, "main", "cs_5_0", 0, 0, &code, &err);
+    if (FAILED(hr) || code == nullptr)
+    {
+        BVR_ERR("Foveated DLSS (TEST 430): blend shader compile failed (0x%08X) %s", hr,
+                err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        if (err) err->Release();
+        if (code) code->Release();
+        g_fovShaderFailed = true;
+        return false;
+    }
+    if (err) err->Release();
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = sizeof(FovParams);
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+
+    const bool ok =
+        SUCCEEDED(dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
+                                           nullptr, &g_fovCs)) &&
+        SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &g_fovCb)) &&
+        SUCCEEDED(dev->CreateSamplerState(&sd, &g_fovSampler));
+    code->Release();
+    if (!ok)
+    {
+        BVR_ERR("Foveated DLSS (TEST 430): could not create the blend pass.");
+        g_fovShaderFailed = true;
+        return false;
+    }
+    return true;
+}
+
+/* The output's UAV, made once and kept on the output itself. Not AddRef'd. */
+ID3D11UnorderedAccessView* fov_out_uav(ID3D11Device* dev, ID3D11Resource* out)
+{
+    UINT size = sizeof(void*);
+    IUnknown* held = nullptr;
+    if (SUCCEEDED(out->GetPrivateData(kFovOutUav, &size, &held)) && held != nullptr)
+    {
+        held->Release();   /* the output keeps it alive */
+        return static_cast<ID3D11UnorderedAccessView*>(held);
+    }
+    ID3D11UnorderedAccessView* uav = nullptr;
+    if (FAILED(dev->CreateUnorderedAccessView(out, nullptr, &uav)) || uav == nullptr)
+        return nullptr;
+    out->SetPrivateDataInterface(kFovOutUav, uav);
+    uav->Release();
+    return uav;
+}
+
+/* The window blended into the stretched periphery, into `out`. The context is
+   borrowed, so everything bound is put back. */
+bool fov_blend(ID3D11DeviceContext* ctx, ID3D11Device* dev, const FovEye& e,
+               ID3D11Resource* out, float winX, float winY)
+{
+    ID3D11UnorderedAccessView* uav = fov_out_uav(dev, out);
+    if (uav == nullptr)
+        return false;
+
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (FAILED(ctx->Map(g_fovCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return false;
+    static const float feather = bvr::config_float("dlss_fovea_feather", 0.30f);
+    const FovParams prm = { static_cast<float>(e.ow), static_cast<float>(e.oh), winX, winY,
+                            static_cast<float>(e.fw), static_cast<float>(e.fh), feather, 0.0f };
+    memcpy(m.pData, &prm, sizeof(prm));
+    ctx->Unmap(g_fovCb, 0);
+
+    ID3D11ComputeShader*       prevCs = nullptr;
+    ID3D11Buffer*              prevCb = nullptr;
+    ID3D11ShaderResourceView*  prevSrv[2] = {};
+    ID3D11UnorderedAccessView* prevUav = nullptr;
+    ID3D11SamplerState*        prevSampler = nullptr;
+    ctx->CSGetShader(&prevCs, nullptr, nullptr);
+    ctx->CSGetConstantBuffers(0, 1, &prevCb);
+    ctx->CSGetShaderResources(0, 2, prevSrv);
+    ctx->CSGetUnorderedAccessViews(0, 1, &prevUav);
+    ctx->CSGetSamplers(0, 1, &prevSampler);
+
+    ID3D11ShaderResourceView* srvs[2] = { e.pSrv, e.fSrv };
+    UINT keep = static_cast<UINT>(-1);
+    ctx->CSSetShader(g_fovCs, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &g_fovCb);
+    ctx->CSSetShaderResources(0, 2, srvs);
+    ctx->CSSetSamplers(0, 1, &g_fovSampler);
+    ctx->CSSetUnorderedAccessViews(0, 1, &uav, &keep);
+    ctx->Dispatch((e.ow + 7) / 8, (e.oh + 7) / 8, 1);
+
+    ID3D11UnorderedAccessView* noUav = nullptr;
+    ID3D11ShaderResourceView*  noSrv[2] = {};
+    ctx->CSSetUnorderedAccessViews(0, 1, &noUav, &keep);
+    ctx->CSSetShaderResources(0, 2, noSrv);
+    ctx->CSSetShader(prevCs, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &prevCb);
+    ctx->CSSetShaderResources(0, 2, prevSrv);
+    ctx->CSSetSamplers(0, 1, &prevSampler);
+    ctx->CSSetUnorderedAccessViews(0, 1, &prevUav, &keep);
+
+    if (prevCs) prevCs->Release();
+    if (prevCb) prevCb->Release();
+    if (prevSrv[0]) prevSrv[0]->Release();
+    if (prevSrv[1]) prevSrv[1]->Release();
+    if (prevUav) prevUav->Release();
+    if (prevSampler) prevSampler->Release();
+    return true;
+}
+
+bool fovea_enabled()
+{
+    return fov_enabled_cfg() && bvr::stereo_active();
+}
+
+bool fovea_eval(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* game,
+                NVSDK_NGX_Parameter* p, void* callback, int eye, ID3D11Resource* out)
+{
+    if (ctx == nullptr || p == nullptr || out == nullptr || eye < 0 || eye > 1)
+        return false;
+    if (g_realCreate == nullptr || g_realRelease == nullptr)
+        return fov_miss("CreateFeature is not hooked");
+    if (g_fovFailures >= 3)
+        return fov_miss("it failed 3 times this session, so it stays off");
+    if (g_fovFailedFor == game)
+        return fov_miss("creating its features failed for this DLSS feature");
+    NVSDK_NGX_Parameter* ours = fov_params();
+    if (ours == nullptr)
+        return fov_miss("no parameter block of our own");
+    if (g_fovPairedWith != nullptr && g_fovPairedWith != game)
+        fov_release("the game is evaluating a different DLSS feature");
+
+    /* The sizes from the textures (TEST 187: the parameter block cannot be
+       trusted for them), the render size from the game's subrect when it has one. */
+    ID3D11Resource* color = nullptr;
+    p->Get("Color", &color);
+    unsigned rw = 0, rh = 0, ow = 0, oh = 0;
+    if (!tex2d_size(color, &rw, &rh) || !tex2d_size(out, &ow, &oh))
+        return fov_miss("no colour or output texture");
+    unsigned subW = 0, subH = 0;
+    p->Get(kFovDimW, &subW);
+    p->Get(kFovDimH, &subH);
+    if (subW != 0 && subH != 0)
+    {
+        rw = subW;
+        rh = subH;
+    }
+    for (int i = 0; i < kFovBaseCount; ++i)
+    {
+        unsigned bx = 0, by = 0;
+        p->Get(kFovBases[i][0], &bx);
+        p->Get(kFovBases[i][1], &by);
+        if (bx != 0 || by != 0)
+            return fov_miss("the game already reads its inputs from an offset");
+    }
+    D3D11_TEXTURE2D_DESC od = {};
+    {
+        ID3D11Texture2D* ot = nullptr;
+        if (FAILED(out->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&ot)) || !ot)
+            return fov_miss("the output is not a 2D texture");
+        ot->GetDesc(&od);
+        ot->Release();
+    }
+    if ((od.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
+        return fov_miss("the output has no UAV");
+
+    /* THE WINDOW, in render pixels, centred on the lens axis (where the measured
+       frustum puts tangent 0). Even sizes and origins, so a 1.5x or 2x scale
+       lands it on whole output pixels. */
+    static const float size = std::fmin(0.9f, std::fmax(0.1f, bvr::config_float("dlss_fovea_size", 0.40f)));
+    float cx = 0.5f, cy = 0.5f;
+    {
+        float l = 0.0f, r = 0.0f, u = 0.0f, d = 0.0f;
+        if (bvr::vp_measured_tangents(&l, &r, &u, &d) && r > l && u > d)
+        {
+            cx = -l / (r - l);
+            cy = u / (u - d);
+        }
+    }
+    const unsigned ww = static_cast<unsigned>(rw * size) & ~1u;
+    const unsigned wh = static_cast<unsigned>(rh * size) & ~1u;
+    if (ww < 64 || wh < 64)
+        return fov_miss("the window would be too small");
+    const int bx = std::max(0, std::min(static_cast<int>(rw - ww),
+                                        static_cast<int>(std::lround(cx * rw - ww * 0.5f)) & ~1));
+    const int by = std::max(0, std::min(static_cast<int>(rh - wh),
+                                        static_cast<int>(std::lround(cy * rh - wh * 0.5f)) & ~1));
+    const float sx = static_cast<float>(ow) / static_cast<float>(rw);
+    const float sy = static_cast<float>(oh) / static_cast<float>(rh);
+    const unsigned fw = static_cast<unsigned>(std::lround(ww * sx));
+    const unsigned fh = static_cast<unsigned>(std::lround(wh * sy));
+
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    if (dev == nullptr)
+        return fov_miss("no device");
+
+    FovEye& e = g_fov[eye];
+    if (e.periph != nullptr &&
+        (e.rw != rw || e.rh != rh || e.ow != ow || e.oh != oh || e.ww != ww || e.wh != wh ||
+         e.fmt != od.Format))
+        fov_release_eye(e);
+
+    if (e.periph == nullptr)
+    {
+        bool ok = fov_shader(dev);
+        if (ok)
+        {
+            e.periph = fov_create(ctx, p, ours, game, rw, rh, rw, rh, 5 /* DLAA */,
+                                  "periphery (DLAA)");
+            e.fovea = e.periph ? fov_create(ctx, p, ours, game, ww, wh, fw, fh, -1, "window")
+                               : nullptr;
+            ok = e.fovea != nullptr &&
+                 fov_texture(dev, rw, rh, od.Format, &e.pTex, &e.pSrv) &&
+                 fov_texture(dev, fw, fh, od.Format, &e.fTex, &e.fSrv);
+        }
+        if (!ok)
+        {
+            dev->Release();
+            fov_release_eye(e);
+            g_fovFailedFor = game;
+            ++g_fovFailures;
+            return fov_miss("creating its features failed");
+        }
+        e.rw = rw; e.rh = rh; e.ow = ow; e.oh = oh;
+        e.ww = ww; e.wh = wh; e.fw = fw; e.fh = fh;
+        e.fmt = od.Format;
+        e.fresh = true;
+        BVR_INFO("Foveated DLSS (TEST 430): eye %d - periphery DLAA %ux%u stretched to %ux%u; "
+                 "window %ux%u at (%d, %d) -> %ux%u, %.0f%% of the output at full density "
+                 "(DLSS used to write all %ux%u).", eye, rw, rh, ow, oh, ww, wh, bx, by, fw, fh,
+                 100.0 * fw * fh / (static_cast<double>(ow) * oh), ow, oh);
+    }
+    g_fovPairedWith = game;
+
+    /* Everything below goes through OUR block; the game's is only read. Each
+       evaluation states its whole subrect, so neither inherits the other's. */
+    fov_copy_inputs(p, ours);
+    int gameReset = 0;
+    p->Get("Reset", &gameReset);
+    ours->Set("Reset", (gameReset != 0 || e.fresh) ? 1 : 0);
+
+    NVSDK_NGX_Result r1 = 0, r2 = 0;
+    bool blended = false;
+    {
+        bvr::StereoIgnore ignore;   /* ours, not the engine's frame */
+
+        for (int i = 0; i < kFovBaseCount; ++i)
+        {
+            ours->Set(kFovBases[i][0], 0u);
+            ours->Set(kFovBases[i][1], 0u);
+        }
+        ours->Set(kFovDimW, rw);
+        ours->Set(kFovDimH, rh);
+        ours->Set("Output", static_cast<ID3D11Resource*>(e.pTex));
+        r1 = g_realEvaluate(ctx, e.periph, ours, callback);
+
+        if (NGX_SUCCEED(r1))
+        {
+            for (int i = 0; i < kFovBaseCount; ++i)
+            {
+                ours->Set(kFovBases[i][0], static_cast<unsigned>(bx));
+                ours->Set(kFovBases[i][1], static_cast<unsigned>(by));
+            }
+            ours->Set(kFovDimW, ww);
+            ours->Set(kFovDimH, wh);
+            ours->Set("Output", static_cast<ID3D11Resource*>(e.fTex));
+            r2 = g_realEvaluate(ctx, e.fovea, ours, callback);
+        }
+
+        blended = NGX_SUCCEED(r1) && NGX_SUCCEED(r2) &&
+                  fov_blend(ctx, dev, e, out, bx * sx, by * sy);
+    }
+    dev->Release();
+
+    if (!blended)
+    {
+        ++g_fovFailures;
+        BVR_WARN("Foveated DLSS (TEST 430b): eye %d failed (periphery 0x%08X, window 0x%08X, "
+                 "blend %s), failure %d of 3; the game's own DLSS takes over.", eye, r1, r2,
+                 NGX_SUCCEED(r1) && NGX_SUCCEED(r2) ? "FAILED" : "not run", g_fovFailures);
+        fov_release("an evaluation failed");
+        g_fovFailedFor = game;
+        return fov_miss("an evaluation failed");
+    }
+
+    e.fresh = false;
+    ++g_fovEvals;
+    return true;
+}
+
+/* A feature like the game's `feature`, made for the sizes this evaluation really
+   has: the game's creation values where recorded, the four sizes from the
+   textures. The game's block is put back as it was. rw/rh = the colour size used
+   (0 if unreadable); w/h/ow/oh = the block's sizes at creation, for the log. */
+NVSDK_NGX_Result create_from_textures(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature,
+                                      NVSDK_NGX_Parameter* p, ID3D11Resource* output,
+                                      NVSDK_NGX_Handle** made, unsigned* rw, unsigned* rh,
+                                      unsigned* w, unsigned* h, unsigned* ow, unsigned* oh)
+{
+    std::lock_guard<std::recursive_mutex> turn(g_ngxBlockLock);   /* TEST 777 */
+    constexpr int kFields = static_cast<int>(sizeof(g_createSnap.f) / sizeof(g_createSnap.f[0]));
+    CreateField saved[kFields];
+    memcpy(saved, g_createSnap.f, sizeof(saved));
+    snapshot_read(p, saved, kFields);
+
+    /* TEST 594b: the game's own creation for THESE sizes if it ever made one - the
+       feature it is evaluating may have been made for another view (the smithy's),
+       with other flags, and those flags made the right-sized copy trail. */
+    ID3D11Resource* sizeColor = nullptr;
+    p->Get("Color", &sizeColor);
+    unsigned s[4] = {};
+    const CreateField* snap = nullptr;
+    if (tex2d_size(sizeColor, &s[0], &s[1]) && tex2d_size(output, &s[2], &s[3]))
+        snap = snapshot_for_sizes(s);
+    if (snap == nullptr && g_createSnap.handle == feature)
+        snap = g_createSnap.f;
+    if (snap != nullptr)
+        snapshot_write(p, snap, kFields);
+
+    /* THE SIZES FROM THE TEXTURES THEMSELVES (TEST 187). Neither block can be
+       trusted for them: TEST 184's create-time record had Width = render, and
+       TEST 186's came back output-first and failed 0xBAD00005 again - so the
+       game fills that block in more than one order. What DLSS is actually
+       handed cannot lie: the colour input is the render size, the output is
+       the output size. */
+    unsigned tw = 0, th = 0;
+    {
+        ID3D11Resource* colorRes = nullptr;
+        p->Get("Color", &colorRes);
+        if (tex2d_size(colorRes, rw, rh) && tex2d_size(output, &tw, &th))
+        {
+            p->Set("Width", *rw);
+            p->Set("Height", *rh);
+            p->Set("OutWidth", tw);
+            p->Set("OutHeight", th);
+        }
+        else
+        {
+            *rw = *rh = 0;
+        }
+    }
+
+    const NVSDK_NGX_Result cr = g_realCreate(ctx, g_stereoFeatureId, p, made);
+
+    p->Get("Width", w);
+    p->Get("Height", h);
+    p->Get("OutWidth", ow);
+    p->Get("OutHeight", oh);
+    snapshot_write(p, saved, kFields);       /* the game's block as it was */
+
+    /* TEST 774: except the sizes, which stay the textures' - see evaluate_sized. */
+    if (*rw != 0 && tw != 0)
+    {
+        p->Set("Width", *rw);
+        p->Set("Height", *rh);
+        p->Set("OutWidth", tw);
+        p->Set("OutHeight", th);
+    }
+    return cr;
 }
 
 bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature,
@@ -1121,11 +2211,26 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
     if (g_stereoTwin != nullptr && g_stereoPairedWith != feature)
         stereo_twin_release("the game is evaluating a different DLSS feature");
 
+    /* THE COLOUR SIZE MOVED UNDER THE FEATURE (TEST 195). Switching to a SMALLER
+       DLSS mode, the game makes its new feature one frame before it resizes its
+       targets, and its own evaluation of that frame succeeds on the old, larger
+       colour. Eye 1's feature was built on that frame from the old size; the next
+       frame's smaller colour failed it with 0xBAD00005 and the TEST 189 retry kept
+       eye 1 flat for half a second (33 and 47 frames in the 17:53 run, switching
+       to Balanced and to Performance). A size change is not a failure burst, so
+       it is rebuilt now, from the colour it is about to be given. */
+    unsigned cw = 0, ch = 0;
+    if (g_stereoTwin != nullptr && g_stereoTwinW != 0 && tex2d_size(color, &cw, &ch) &&
+        (cw != g_stereoTwinW || ch != g_stereoTwinH))
+        stereo_twin_release("the game's colour input changed size");
+    if (g_stereoTwin != nullptr && g_stereoTwinPreset != live_preset())   /* TEST 812 */
+        stereo_twin_release("the DLSS preset changed");
+
     if (g_stereoTwin == nullptr)
     {
-        if (g_stereoFailedFor == feature)
+        if (g_stereoFailedFor == feature && GetTickCount64() < g_stereoRetryAt)
         {
-            stereo_missed("no eye-1 feature (its creation failed)");
+            stereo_missed("no eye-1 feature (its creation or evaluation failed)");
             return false;
         }
         if (g_realCreate == nullptr)
@@ -1134,58 +2239,18 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
             return false;
         }
 
-        constexpr int kFields = static_cast<int>(sizeof(g_createSnap.f) / sizeof(g_createSnap.f[0]));
         const bool useSnap = g_createSnap.handle == feature;
-        CreateField saved[kFields];
-        memcpy(saved, g_createSnap.f, sizeof(saved));
-        snapshot_read(p, saved, kFields);
-        if (useSnap)
-            snapshot_write(p, g_createSnap.f, kFields);
-
-        /* THE SIZES FROM THE TEXTURES THEMSELVES (TEST 187). Neither block can be
-           trusted for them: TEST 184's create-time record had Width = render, and
-           TEST 186's came back output-first and failed 0xBAD00005 again - so the
-           game fills that block in more than one order. What DLSS is actually
-           handed cannot lie: the colour input is the render size, the output is
-           the output size. */
-        {
-            auto size_of = [](ID3D11Resource* r, unsigned* w, unsigned* h) {
-                ID3D11Texture2D* t = nullptr;
-                if (r == nullptr ||
-                    FAILED(r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) || !t)
-                    return false;
-                D3D11_TEXTURE2D_DESC d = {};
-                t->GetDesc(&d);
-                t->Release();
-                *w = d.Width;
-                *h = d.Height;
-                return true;
-            };
-            unsigned rw = 0, rh = 0, ow = 0, oh = 0;
-            ID3D11Resource* colorRes = nullptr;
-            p->Get("Color", &colorRes);
-            if (size_of(colorRes, &rw, &rh) && size_of(output, &ow, &oh))
-            {
-                p->Set("Width", rw);
-                p->Set("Height", rh);
-                p->Set("OutWidth", ow);
-                p->Set("OutHeight", oh);
-            }
-        }
-
+        unsigned rw = 0, rh = 0, w = 0, h = 0, ow = 0, oh = 0;
         NVSDK_NGX_Handle* made = nullptr;
-        const NVSDK_NGX_Result cr = g_realCreate(ctx, g_stereoFeatureId, p, &made);
-
-        unsigned w = 0, h = 0, ow = 0, oh = 0;
-        p->Get("Width", &w);
-        p->Get("Height", &h);
-        p->Get("OutWidth", &ow);
-        p->Get("OutHeight", &oh);
-        snapshot_write(p, saved, kFields);       /* the game's block as it was */
+        const unsigned preset = live_preset();   /* TEST 812 */
+        set_preset_hints(p, preset);
+        const NVSDK_NGX_Result cr = create_from_textures(ctx, feature, p, output, &made,
+                                                         &rw, &rh, &w, &h, &ow, &oh);
 
         if (!NGX_SUCCEED(cr) || made == nullptr)
         {
             g_stereoFailedFor = feature;
+            g_stereoRetryAt = ~0ull;
             BVR_WARN("Stereo DLSS: could not create a DLSS feature for the second eye "
                      "(0x%08X) from %ux%u -> %ux%u (%s). Eye 1 will show eye 0's DLSS "
                      "image - flat, no depth.", cr, w, h, ow, oh,
@@ -1196,6 +2261,9 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
         }
 
         g_stereoTwin = made;
+        g_stereoTwinW = rw;
+        g_stereoTwinPreset = preset;
+        g_stereoTwinH = rh;
         g_stereoPairedWith = feature;
         g_stereoFailedFor = nullptr;
         g_stereoReset = true;
@@ -1222,6 +2290,8 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
         twin[i] = bvr::stereo_twin_for_read(orig[i]);
         if (twin[i] != nullptr)
             p->Set(kInputs[i], twin[i]);
+        else
+            ++g_stereoShared[i];
     }
 
     bool ok = false;
@@ -1231,11 +2301,16 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
         p->Set("Output", outTwin);
         int reset = 0;
         p->Get("Reset", &reset);
-        const bool forceReset = g_stereoReset;
+
+        /* TEST 430: eye 1 foveated, like eye 0. Its full-size feature idles and
+           is reset when it is next used (g_stereoReset below). */
+        const bool fov = fovea_enabled() && fovea_eval(ctx, feature, p, callback, 1, outTwin);
+
+        const bool forceReset = !fov && g_stereoReset;
         if (forceReset)
             p->Set("Reset", 1);
 
-        if (bvr::frame_map_capturing())
+        if (!fov && bvr::frame_map_capturing())
         {
             static const char* const kNames[] = {
                 "Color", "Output", "Depth", "MotionVectors", "ExposureTexture",
@@ -1254,12 +2329,13 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
 
         LARGE_INTEGER t0 = {}, t1 = {}, freq = {};
         QueryPerformanceCounter(&t0);
-        NVSDK_NGX_Result r2 = 0;
+        NVSDK_NGX_Result r2 = 1;   /* NVSDK_NGX_Result_Success: the foveated pass did it */
+        if (!fov)
         {
             /* Anything NGX does on the context in here is ours, not the engine's
                frame - not tracked, not duplicated. */
             bvr::StereoIgnore ignore;
-            r2 = g_realEvaluate(ctx, g_stereoTwin, p, callback);
+            r2 = evaluate_sized(ctx, g_stereoTwin, p, callback, 1);
         }
         QueryPerformanceCounter(&t1);
         bvr::stereo_perf_ngx_cpu(t1.QuadPart - t0.QuadPart);
@@ -1277,18 +2353,30 @@ bool stereo_evaluate_eye1(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feat
         ok = NGX_SUCCEED(r2);
         if (ok)
         {
-            g_stereoReset = false;
+            g_stereoReset = fov;    /* idle while foveated: reset when used again */
             ++g_stereoEvals;
         }
         else
         {
-            static bool warned = false;
-            if (!warned)
+            /* TEST 189: the game rebuilds its targets a frame or more after a new
+               feature, so a feature made in between can be wrong for every frame
+               that follows - 20 s of a flat right eye in the 16:48 run. Drop it and
+               let the next evaluation build it from the textures as they are then. */
+            ID3D11Resource* col = nullptr;
+            p->Get("Color", &col);
+            D3D11_TEXTURE2D_DESC cd = {};
+            ID3D11Texture2D* ct = nullptr;
+            if (col && SUCCEEDED(col->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&ct)) && ct)
             {
-                warned = true;
-                BVR_WARN("Stereo DLSS: the second eye's evaluation returned 0x%08X; eye 1 "
-                         "falls back to eye 0's DLSS image for those frames.", r2);
+                ct->GetDesc(&cd);
+                ct->Release();
             }
+            BVR_WARN("Stereo DLSS: the second eye's evaluation returned 0x%08X (colour now "
+                     "%ux%u); its feature is dropped and rebuilt on the next frame. Eye 1 "
+                     "shows eye 0's DLSS image until then.", r2, cd.Width, cd.Height);
+            stereo_twin_release("its evaluation failed");
+            g_stereoFailedFor = feature;
+            g_stereoRetryAt = GetTickCount64() + 500;
             stereo_missed("the eye-1 evaluation returned an error");
         }
     }
@@ -1316,6 +2404,7 @@ void stereo_second_eye(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature
     {
         if (g_stereoTwin != nullptr)
             stereo_twin_release("native stereo is off");
+        fov_release("native stereo is off");
         g_stereoReset = true;
         g_stereoLastLog = 0;
         return;
@@ -1352,6 +2441,26 @@ void stereo_second_eye(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature
                  *g_stereoWhy ? g_stereoWhy : "none",
                  g_stereoEvals ? g_stereoCpuMs / static_cast<double>(g_stereoEvals) : 0.0,
                  (void*)g_stereoTwin);
+        BVR_INFO("Stereo DLSS inputs eye 1 took from eye 0 (no twin) in ~5 s: colour %llu, "
+                 "depth %llu, motion vectors %llu, exposure %llu, transparency %llu, "
+                 "bias mask %llu. Anything but ~0 on colour/depth/motion is a flat or "
+                 "flickering right eye.",
+                 static_cast<unsigned long long>(g_stereoShared[0]),
+                 static_cast<unsigned long long>(g_stereoShared[1]),
+                 static_cast<unsigned long long>(g_stereoShared[2]),
+                 static_cast<unsigned long long>(g_stereoShared[3]),
+                 static_cast<unsigned long long>(g_stereoShared[4]),
+                 static_cast<unsigned long long>(g_stereoShared[5]));
+        if (fov_enabled_cfg())
+            BVR_INFO("Foveated DLSS (TEST 430): %llu eye(s) resolved as DLAA periphery + DLSS "
+                     "window in ~5 s, %llu fell back to the full-size DLSS (last reason: %s).",
+                     static_cast<unsigned long long>(g_fovEvals),
+                     static_cast<unsigned long long>(g_fovMissed),
+                     *g_fovWhy ? g_fovWhy : "none");
+        g_fovEvals = 0;
+        g_fovMissed = 0;
+        g_fovWhy = "";
+        memset(g_stereoShared, 0, sizeof(g_stereoShared));
         g_stereoEvals = 0;
         g_stereoMissed = 0;
         g_stereoWhy = "";
@@ -1359,11 +2468,285 @@ void stereo_second_eye(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature
     }
 }
 
+/* ===========================================================================
+   THE GAME'S FEATURE, THE WRONG SIZE (TEST 594).
+
+   rgl makes its one DLSS feature for the view that is being created, and never
+   again for a view that already exists. The smithy's crafting scene is window-
+   sized, so after leaving it the map's 1778x1686 -> 3556x3372 eye was upscaled
+   by a feature made for 1280x720 -> 2560x1440: DLSS filled the eye's top-left
+   2560x1440 and the rest stayed black, with PAUSED drawn over it. That was the
+   left eye in native stereo (eye 1's feature is built from the textures) and
+   both eyes under AFR. Vanilla never meets it: every view there is window-sized.
+
+   So when an evaluation's colour and output are not the sizes the game created
+   its feature for (in either order, see TEST 187), it runs on a feature of ours
+   made from the textures - one per AFR eye, as pick_feature splits them. The
+   game's feature idles until the sizes fit again. ngx_fit_feature = 0 is off.
+   =========================================================================== */
+const NVSDK_NGX_Handle* g_fitFor = nullptr;        /* the game feature the ones below stand in for */
+NVSDK_NGX_Handle*       g_fit[2] = {};
+unsigned                g_fitSize[2][4] = {};      /* colour w/h, output w/h each was made for */
+unsigned                g_fitPreset[2] = {};       /* TEST 812: the preset each was made with */
+bool                    g_fitFailed = false;
+uint64_t                g_fitUses = 0;
+uint64_t                g_fitLastLog = 0;
+
+bool fit_enabled()
+{
+    static const bool v = config_bool("ngx_fit_feature", true);
+    return v;
+}
+
+void fit_release(const char* why)
+{
+    bool any = false;
+    for (NVSDK_NGX_Handle*& f : g_fit)
+    {
+        if (f != nullptr && g_realRelease != nullptr)
+        {
+            g_realRelease(f);
+            any = true;
+        }
+        f = nullptr;
+    }
+    if (any)
+        BVR_INFO("DLSS fit (TEST 594): our right-sized feature(s) released (%s).", why);
+    g_fitFor = nullptr;
+    g_fitFailed = false;
+}
+
+const NVSDK_NGX_Handle* fit_feature(ID3D11DeviceContext* ctx, const NVSDK_NGX_Handle* feature,
+                                    const NVSDK_NGX_Parameter* params)
+{
+    if (!fit_enabled() || feature == nullptr || params == nullptr || g_realCreate == nullptr ||
+        g_createSnap.handle != feature)
+        return nullptr;
+
+    const CreateField* f = g_createSnap.f;   /* Width, Height, OutWidth, OutHeight first */
+    if (!f[0].have || !f[1].have || !f[2].have || !f[3].have)
+        return nullptr;
+
+    NVSDK_NGX_Parameter* p = const_cast<NVSDK_NGX_Parameter*>(params);
+    ID3D11Resource* color = nullptr;
+    ID3D11Resource* output = nullptr;
+    p->Get("Color", &color);
+    p->Get("Output", &output);
+    unsigned s[4] = {};
+    if (!tex2d_size(color, &s[0], &s[1]) || !tex2d_size(output, &s[2], &s[3]))
+        return nullptr;
+
+    if (g_fitFor != feature)
+        fit_release("the game made a new DLSS feature");
+
+    if (g_fitFailed)
+        return nullptr;
+    const unsigned want = live_preset();   /* TEST 812 */
+    if (snapshot_sizes_match(f, s) && want == g_gamePreset)
+    {
+        if (g_fit[0] != nullptr || g_fit[1] != nullptr)
+            fit_release("the game's own feature fits again");
+        return nullptr;
+    }
+
+    const int eye = (per_eye_enabled() && g_featureTwin != nullptr && feature == g_featureGame &&
+                     bvr::xr_current_afr_eye() == 1) ? 1 : 0;
+    if (g_fit[eye] != nullptr && (memcmp(g_fitSize[eye], s, sizeof(s)) != 0 || g_fitPreset[eye] != want) &&
+        g_realRelease != nullptr)
+    {
+        g_realRelease(g_fit[eye]);
+        g_fit[eye] = nullptr;
+    }
+
+    if (g_fit[eye] == nullptr)
+    {
+        unsigned rw = 0, rh = 0, w = 0, h = 0, ow = 0, oh = 0;
+        set_preset_hints(p, want);
+        const NVSDK_NGX_Result cr = create_from_textures(ctx, feature, p, output, &g_fit[eye],
+                                                         &rw, &rh, &w, &h, &ow, &oh);
+        g_fitFor = feature;
+        if (!NGX_SUCCEED(cr) || g_fit[eye] == nullptr)
+        {
+            g_fit[eye] = nullptr;
+            g_fitFailed = true;
+            BVR_WARN("DLSS fit (TEST 594): the game's DLSS feature was made for %ux%u -> %ux%u but "
+                     "is given %ux%u -> %ux%u, and a feature for those sizes was refused (0x%08X). "
+                     "Part of the eye stays black until the game makes a new one.",
+                     f[0].u, f[1].u, f[2].u, f[3].u, s[0], s[1], s[2], s[3], cr);
+            return nullptr;
+        }
+        memcpy(g_fitSize[eye], s, sizeof(s));
+        g_fitPreset[eye] = want;
+        if (snapshot_sizes_match(f, s))
+            BVR_INFO("DLSS preset (TEST 812): eye %d now runs on our own feature %p with preset %u "
+                     "(the game's was made with %u) until the game makes a new one.",
+                     eye, (void*)g_fit[eye], want, g_gamePreset);
+        else
+            BVR_INFO("DLSS fit (TEST 594): the game's DLSS feature was made for %ux%u -> %ux%u but is "
+                     "given %ux%u -> %ux%u (it never rebuilds it for a view that already exists - the "
+                     "map after the smithy). Eye %d now runs on our own feature %p made for the real "
+                     "sizes; without it DLSS fills only part of the eye and the rest is black.",
+                     f[0].u, f[1].u, f[2].u, f[3].u, s[0], s[1], s[2], s[3], eye, (void*)g_fit[eye]);
+    }
+
+    ++g_fitUses;
+    const uint64_t now = GetTickCount64();
+    if (now - g_fitLastLog >= 5000)
+    {
+        if (g_fitLastLog != 0)
+            BVR_INFO("DLSS fit (TEST 594): %llu evaluation(s) in ~5 s ran on our right-sized feature.",
+                     static_cast<unsigned long long>(g_fitUses));
+        g_fitLastLog = now;
+        g_fitUses = 0;
+    }
+    return g_fit[eye];
+}
+
+/* TEST 795: the SR preset DLSS Swapper / the NVIDIA App / Profile Inspector put
+   in this exe's driver profile ("Override DLSS-SR presets"), 1-26 = A-Z, or 0
+   for none / Default / Latest (those stay the driver's to resolve). Read once. */
+unsigned driver_profile_preset()
+{
+    static int s_cached = -1;
+    if (s_cached >= 0)
+        return static_cast<unsigned>(s_cached);
+    s_cached = 0;
+    if (NvAPI_Initialize() != NVAPI_OK)
+        return 0;
+    NvDRSSessionHandle s = nullptr;
+    if (NvAPI_DRS_CreateSession(&s) != NVAPI_OK)
+        return 0;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const wchar_t* exe = wcsrchr(path, L'\\');
+    exe = exe ? exe + 1 : path;
+    NvDRSProfileHandle profile = nullptr;
+    NVDRS_APPLICATION app = {};
+    app.version = NVDRS_APPLICATION_VER;
+    NVDRS_SETTING st = {};
+    st.version = NVDRS_SETTING_VER;
+    if (NvAPI_DRS_LoadSettings(s) == NVAPI_OK &&
+        NvAPI_DRS_FindApplicationByName(s, reinterpret_cast<NvU16*>(const_cast<wchar_t*>(exe)),
+                                        &profile, &app) == NVAPI_OK &&
+        NvAPI_DRS_GetSetting(s, profile, 0x10E41DF3 /* NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION */,
+                             &st) == NVAPI_OK &&
+        st.u32CurrentValue >= 1 && st.u32CurrentValue <= 26)
+        s_cached = static_cast<int>(st.u32CurrentValue);
+    NvAPI_DRS_DestroySession(s);
+    BVR_INFO("NGX preset (TEST 795): the driver profile for %ls asks for preset %c.", exe,
+             s_cached ? static_cast<char>('A' + s_cached - 1) : '-');
+    return static_cast<unsigned>(s_cached);
+}
+
+const char* const kPresetHints[6] = {
+    "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+    "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+    "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality",
+};
+
+/* The preset the game's feature was made with. */
+unsigned g_gamePreset = 0;
+bool     g_presetRefused = false;   /* this DLSS took no preset (TEST 796) */
+
+void set_preset_hints(NVSDK_NGX_Parameter* p, unsigned preset)
+{
+    /* Always: the hints stay on the game's block, so 0 must clear ours. */
+    for (const char* name : kPresetHints)
+        p->Set(name, preset);
+}
+
+unsigned preset_now()
+{
+    /* TEST 794/795: THE DLSS PRESET, SET HERE ON EVERY MODE. The driver applies
+       its profile's preset override only in Performance here (live state: SR
+       feedback 0x205, no ENABLED or PRESET bit), so Quality/Balanced ran DLSS's
+       own pick and read soft. So the preset goes in as the game's hints, which
+       eye 1's feature gets too (they stay on the game's block). dlss_preset
+       11 = K, 12 = L, 13 = M wins; 0 = the driver profile's (DLSS Swapper, NVIDIA
+       App), else K (TEST 796: shipped, so nobody has to override it); -1 = DLSS's
+       own choice. */
+    static const int cfgPreset = static_cast<int>(lroundf(bvr::config_float("dlss_preset", 0.0f)));
+    const int choice = g_presetChoice.load(std::memory_order_relaxed) == kPresetUnset
+                     ? cfgPreset : g_presetChoice.load(std::memory_order_relaxed);   /* TEST 797: the panel's */
+    return choice > 0 ? static_cast<unsigned>(choice)
+         : choice < 0 ? 0u
+         : driver_profile_preset() != 0 ? driver_profile_preset() : 11u;
+}
+
+/* TEST 812: THE PANEL'S PRESET, LIVE. Our own features (eye 1's twin, and eye 0's
+   fit while it differs from the game's feature) are built with this and rebuilt
+   when it changes, so a dropdown change shows at once; the game's next create
+   takes it too. TEST 799's blur was the engine's post-target rounding (TEST 818).
+   A DLSS that refused a preset keeps the game's. */
+unsigned live_preset()
+{
+    return g_presetRefused ? g_gamePreset : preset_now();
+}
+
 NVSDK_NGX_Result __cdecl CreateFeature_hook(ID3D11DeviceContext* ctx, int featureId,
                                             NVSDK_NGX_Parameter* params,
                                             NVSDK_NGX_Handle** outHandle)
 {
-    const NVSDK_NGX_Result r = g_realCreate(ctx, featureId, params, outHandle);
+    /* TEST 815: THE CREATE GETS ITS SIZES THE RIGHT WAY ROUND. The game's settings
+       query (TEST 776/777) writes Width/Height = display and OutWidth/OutHeight =
+       render into this same block, from the game thread, at any time - so a create
+       could go in as render 3540 -> output 2360: a DLSS that thinks it shrinks the
+       image. Which create got hit was luck ("random; Quality is sharp if the game
+       STARTS in Quality"), and after every mode switch or crop rebuild it usually
+       was. Upscaling never has render > output, so that is put back, under the
+       query's lock so it cannot be re-torn before DLSS reads it. */
+    install_query_lock();
+    install_post_size_fix();   /* TEST 818 */
+    std::lock_guard<std::recursive_mutex> turn(g_ngxBlockLock);
+    if (params != nullptr)
+    {
+        unsigned w = 0, h = 0, ow = 0, oh = 0;
+        params->Get("Width", &w);
+        params->Get("Height", &h);
+        params->Get("OutWidth", &ow);
+        params->Get("OutHeight", &oh);
+        const bool swapped = ow != 0 && oh != 0 && w > ow && h > oh;
+        if (swapped)
+        {
+            params->Set("Width", ow);
+            params->Set("Height", oh);
+            params->Set("OutWidth", w);
+            params->Set("OutHeight", h);
+        }
+        BVR_INFO("NGX create (TEST 815): the block came in as Width %u Height %u -> OutWidth %u "
+                 "OutHeight %u%s.", w, h, ow, oh,
+                 swapped ? " - SWAPPED by the game's settings query, put back to render -> output" : "");
+    }
+
+    unsigned preset = preset_now();
+    if (params != nullptr)
+    {
+        unsigned was[6] = {};
+        for (int k = 0; k < 6; ++k)
+            params->Get(kPresetHints[k], &was[k]);
+        set_preset_hints(params, preset);
+        BVR_INFO("NGX preset (TEST 794): the block's hints were DLAA %u Quality %u Balanced %u "
+                 "Performance %u UltraPerf %u UltraQuality %u (0 = DLSS picks); now preset %u "
+                 "on every mode.", was[0], was[1], was[2], was[3], was[4], was[5], preset);
+    }
+
+    NVSDK_NGX_Result r = g_realCreate(ctx, featureId, params, outHandle);
+    if (!NGX_SUCCEED(r) && preset != 0 && params != nullptr)
+    {
+        /* An older DLSS without this preset: DLSS's own choice instead. */
+        const NVSDK_NGX_Result refused = r;
+        set_preset_hints(params, 0u);
+        r = g_realCreate(ctx, featureId, params, outHandle);
+        BVR_WARN("NGX preset (TEST 796): DLSS refused preset %u (0x%08X); created with its own "
+                 "choice instead -> 0x%08X.", preset, static_cast<unsigned>(refused),
+                 static_cast<unsigned>(r));
+        preset = 0;
+    }
+    if (NGX_SUCCEED(r))
+    {
+        g_gamePreset = preset;
+        g_presetRefused = preset == 0 && preset_now() != 0;
+    }
 
     /* Which feature kind the game makes, for native stereo's own. Recording it
        creates nothing and changes nothing below. */
@@ -1375,6 +2758,17 @@ NVSDK_NGX_Result __cdecl CreateFeature_hook(ID3D11DeviceContext* ctx, int featur
             snapshot_read(params, g_createSnap.f,
                           static_cast<int>(sizeof(g_createSnap.f) / sizeof(g_createSnap.f[0])));
             g_createSnap.handle = *outHandle;
+
+            g_snapHist[g_snapNext] = g_createSnap;
+            g_snapNext = (g_snapNext + 1) % static_cast<int>(sizeof(g_snapHist) / sizeof(g_snapHist[0]));
+            const CreateField* f = g_createSnap.f;
+            BVR_INFO("NGX create (TEST 594b): the game made DLSS feature %p - Width %u Height %u "
+                     "OutWidth %u OutHeight %u, PerfQualityValue %d, Create.Flags 0x%X, "
+                     "Output.Subrects %d, RTXValue %d (a field not set reads 0).",
+                     (void*)*outHandle, f[0].have ? f[0].u : 0, f[1].have ? f[1].u : 0,
+                     f[2].have ? f[2].u : 0, f[3].have ? f[3].u : 0,
+                     f[4].have ? f[4].i : 0, f[5].have ? f[5].i : 0,
+                     f[6].have ? f[6].i : 0, f[7].have ? f[7].i : 0);
         }
     }
 
@@ -1413,11 +2807,18 @@ NVSDK_NGX_Result __cdecl CreateFeature_hook(ID3D11DeviceContext* ctx, int featur
 
 NVSDK_NGX_Result __cdecl ReleaseFeature_hook(NVSDK_NGX_Handle* handle)
 {
-    /* Native stereo's eye-1 feature goes with the game feature it was paired with. */
+    /* Native stereo's eye-1 feature goes with the game feature it was paired with,
+       and so do the foveated ones (TEST 430). */
     if (handle != nullptr && handle == g_stereoPairedWith)
         stereo_twin_release("the game released its DLSS feature");
+    if (handle != nullptr && handle == g_fovPairedWith)
+        fov_release("the game released its DLSS feature");
+    if (handle != nullptr && handle == g_fovFailedFor)
+        g_fovFailedFor = nullptr;
     if (handle != nullptr && handle == g_stereoFailedFor)
         g_stereoFailedFor = nullptr;
+    if (handle != nullptr && handle == g_fitFor)
+        fit_release("the game released its DLSS feature");
 
     if (handle != nullptr && handle == g_featureGame && g_featureTwin != nullptr)
     {
@@ -1447,3 +2848,374 @@ const NVSDK_NGX_Handle* pick_feature(const NVSDK_NGX_Handle* incoming)
 }
 
 } /* namespace */
+
+void ngx_set_cheeky_running() { g_cheekyRunning.store(true); }
+
+void ngx_set_preset(int preset) { g_presetChoice.store(preset, std::memory_order_relaxed); }
+
+/* TEST 800: WHICH PRESET DOES DLSS REALLY RUN? With ShowDlssIndicator = 0x400 in
+   HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore, DLSS writes its version, mode
+   and preset into the bottom-left of its output - where no headset lens shows it.
+   So ~8 s into each of the first two DLSS features, eye 0's output is saved:
+   Logs\BVR_DLSS_<n>_corner.bmp (bottom-left 1200x500, full size) and
+   Logs\BVR_DLSS_<n>_full.bmp (a quarter size). ngx_dump_output = 0 is off. */
+#include <shlobj.h>
+namespace {
+
+std::atomic<int> g_finalPending[2] = { -1, -1 };   /* TEST 805: the dump number the next eye-0 submit saves; TEST 814: [0] before our sharpener, [1] after */
+
+float half_to_float(uint16_t h)
+{
+    const uint32_t s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    uint32_t bits;
+    if (e == 0)
+        return (s ? -1.0f : 1.0f) * ldexpf(static_cast<float>(m), -24);
+    if (e == 31)
+        bits = s | 0x7F800000u | (m << 13);
+    else
+        bits = s | ((e + 112) << 23) | (m << 13);
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+uint8_t to_srgb8(float v)
+{
+    if (!(v > 0.0f)) return 0;
+    v = v / (1.0f + v);                          /* HDR -> 0..1 */
+    return static_cast<uint8_t>(fminf(255.0f, 255.0f * powf(v, 1.0f / 2.2f) + 0.5f));
+}
+
+void write_bmp(const wchar_t* name, const std::vector<uint8_t>& px, UINT w, UINT h)
+{
+    wchar_t docs[MAX_PATH] = {}, path[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_MYDOCUMENTS, nullptr, 0, docs)))
+        return;
+    _snwprintf_s(path, _TRUNCATE, L"%s\\Mount and Blade II Bannerlord\\Logs\\%s", docs, name);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || f == nullptr)
+        return;
+    uint8_t hdr[54] = { 'B', 'M' };
+    auto put32 = [&](int at, uint32_t v) { memcpy(hdr + at, &v, 4); };
+    put32(2, static_cast<uint32_t>(54 + px.size()));
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, w);
+    put32(22, h);
+    hdr[26] = 1;
+    hdr[28] = 24;
+    put32(34, static_cast<uint32_t>(px.size()));
+    fwrite(hdr, 1, sizeof(hdr), f);
+    fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
+}
+
+/* One region of a mapped RGBA16F image, every `step` pixels, as a bottom-up BMP. */
+std::vector<uint8_t> region(const D3D11_MAPPED_SUBRESOURCE& m, UINT x0, UINT y0, UINT w, UINT h, UINT step,
+                            UINT* ow, UINT* oh)
+{
+    *ow = w / step;
+    *oh = h / step;
+    const UINT row = (*ow * 3 + 3) & ~3u;
+    std::vector<uint8_t> px(static_cast<size_t>(row) * *oh);
+    for (UINT y = 0; y < *oh; ++y)
+    {
+        const uint16_t* in = reinterpret_cast<const uint16_t*>(
+            static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(m.RowPitch) * (y0 + y * step));
+        uint8_t* out = px.data() + static_cast<size_t>(row) * (*oh - 1 - y);
+        for (UINT x = 0; x < *ow; ++x)
+        {
+            const uint16_t* p = in + (x0 + x * step) * 4;
+            out[x * 3 + 0] = to_srgb8(half_to_float(p[2]));
+            out[x * 3 + 1] = to_srgb8(half_to_float(p[1]));
+            out[x * 3 + 2] = to_srgb8(half_to_float(p[0]));
+        }
+    }
+    return px;
+}
+
+/* TEST 809: one R11G11B10_FLOAT channel (mantissa bits mb) to float. */
+float small_float(uint32_t v, int mb)
+{
+    const uint32_t m = v & ((1u << mb) - 1), e = v >> mb;
+    if (e == 0) return ldexpf(static_cast<float>(m), -14 - mb);
+    if (e == 31) return 65504.0f;
+    return ldexpf(1.0f + static_cast<float>(m) / static_cast<float>(1u << mb), static_cast<int>(e) - 15);
+}
+
+/* TEST 809: the centre 1024x1024 of DLSS's INPUT colour, at the render size -
+   whether the game's own render is already soft with the fov crop on. */
+void dump_color_center(ID3D11DeviceContext* ctx, const NVSDK_NGX_Parameter* params, int n)
+{
+    ID3D11Resource* res = nullptr;
+    const_cast<NVSDK_NGX_Parameter*>(params)->Get("Color", &res);
+    ID3D11Texture2D* tex = nullptr;
+    if (res == nullptr || FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))))
+        return;
+    D3D11_TEXTURE2D_DESC d = {};
+    tex->GetDesc(&d);
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    sd.MipLevels = 1;
+    sd.ArraySize = 1;
+    ID3D11Texture2D* st = nullptr;
+    if (d.Format != DXGI_FORMAT_R11G11B10_FLOAT || d.Width < 1024 || d.Height < 1024 || dev == nullptr ||
+        FAILED(dev->CreateTexture2D(&sd, nullptr, &st)))
+    {
+        BVR_INFO("DLSS input dump (TEST 809): colour format %d %ux%u not handled.", d.Format, d.Width, d.Height);
+        if (dev) dev->Release();
+        tex->Release();
+        return;
+    }
+    ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, nullptr);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)))
+    {
+        const UINT w = 1024, h = 1024, x0 = d.Width / 2 - 512, y0 = d.Height / 2 - 512, row = w * 3;
+        std::vector<uint8_t> px(static_cast<size_t>(row) * h);
+        for (UINT y = 0; y < h; ++y)
+        {
+            const uint32_t* in = reinterpret_cast<const uint32_t*>(
+                static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(m.RowPitch) * (y0 + y)) + x0;
+            uint8_t* out = px.data() + static_cast<size_t>(row) * (h - 1 - y);
+            for (UINT x = 0; x < w; ++x)
+            {
+                const uint32_t v = in[x];
+                out[x * 3 + 0] = to_srgb8(small_float(v >> 22, 5));
+                out[x * 3 + 1] = to_srgb8(small_float((v >> 11) & 0x7FF, 6));
+                out[x * 3 + 2] = to_srgb8(small_float(v & 0x7FF, 6));
+            }
+        }
+        ctx->Unmap(st, 0);
+        wchar_t name[64];
+        swprintf_s(name, L"BVR_DLSSIN_%d_center.bmp", n);
+        write_bmp(name, px, w, h);
+        BVR_INFO("DLSS input dump (TEST 809): wrote Logs\\BVR_DLSSIN_%d_center.bmp from eye 0's %ux%u colour.",
+                 n, d.Width, d.Height);
+    }
+    st->Release();
+    dev->Release();
+    tex->Release();
+}
+
+void dlss_dump_output(ID3D11DeviceContext* ctx, const NVSDK_NGX_Parameter* params, const void* feature)
+{
+    static const bool on = bvr::config_bool("ngx_dump_output", false);
+    static const void* s_for = nullptr;
+    static uint64_t s_since = 0;
+    static int s_dumps = 0;
+    if (!on || s_dumps >= 8 || params == nullptr || ctx == nullptr)   /* TEST 808: 8, was 2 */
+        return;
+    const uint64_t now = GetTickCount64();
+    if (feature != s_for)
+    {
+        s_for = feature;
+        s_since = now;
+        return;
+    }
+    if (s_since == 0 || now - s_since < 8000)
+        return;
+    s_since = 0;   /* once per feature */
+    dump_color_center(ctx, params, s_dumps);   /* TEST 809 */
+
+    ID3D11Resource* res = nullptr;
+    const_cast<NVSDK_NGX_Parameter*>(params)->Get("Output", &res);
+    ID3D11Texture2D* tex = nullptr;
+    if (res == nullptr || FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))))
+        return;
+    D3D11_TEXTURE2D_DESC d = {};
+    tex->GetDesc(&d);
+    if (d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || d.Width < 1200 || d.Height < 500)
+    {
+        BVR_INFO("DLSS dump (TEST 800): output format %d %ux%u not handled.", d.Format, d.Width, d.Height);
+        tex->Release();
+        return;
+    }
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    sd.MipLevels = 1;
+    sd.ArraySize = 1;
+    ID3D11Texture2D* st = nullptr;
+    if (dev == nullptr || FAILED(dev->CreateTexture2D(&sd, nullptr, &st)))
+    {
+        if (dev) dev->Release();
+        tex->Release();
+        return;
+    }
+    ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, nullptr);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)))   /* one stall, twice a session */
+    {
+        UINT w = 0, h = 0;
+        wchar_t name[64];
+        std::vector<uint8_t> corner = region(m, 0, d.Height - 500, 1200, 500, 1, &w, &h);
+        swprintf_s(name, L"BVR_DLSS_%d_corner.bmp", s_dumps);
+        write_bmp(name, corner, w, h);
+        /* TEST 808: the centre at full size - the same view whatever the fov crop,
+           so crop on/off and each DLSS mode compare on identical content. */
+        std::vector<uint8_t> centre = region(m, d.Width / 2 - 512, d.Height / 2 - 512, 1024, 1024, 1, &w, &h);
+        swprintf_s(name, L"BVR_DLSS_%d_center.bmp", s_dumps);
+        write_bmp(name, centre, w, h);
+        std::vector<uint8_t> full = region(m, 0, 0, d.Width, d.Height, 4, &w, &h);
+        swprintf_s(name, L"BVR_DLSS_%d_full.bmp", s_dumps);
+        write_bmp(name, full, w, h);
+        ctx->Unmap(st, 0);
+        BVR_INFO("DLSS dump (TEST 800): wrote Logs\\BVR_DLSS_%d_corner.bmp and _full.bmp from eye 0's "
+                 "%ux%u output (PerfQualityValue %d).", s_dumps, d.Width, d.Height, g_lastQuality.load());
+        g_finalPending[0].store(s_dumps);
+        g_finalPending[1].store(s_dumps);
+        /* TEST 816: the engine's post-DLSS passes (sizes, uv scale cb2[33]) of this
+           very state, beside its sharpness numbers. Needs frame_map = 1. */
+        bvr::frame_map_request_capture("TEST 816: beside a DLSS dump");
+        ++s_dumps;
+    }
+    st->Release();
+    dev->Release();
+    tex->Release();
+}
+
+} /* namespace */
+
+/* TEST 805: THE IMAGE THE RUNTIME GETS, BESIDE THE TEST 800 DUMP. With the fov
+   crop on, DLSS's own output was sharp while the headset was not, so the next
+   submit of eye 0 after a DLSS dump saves the same corner of what it hands the
+   runtime - after the engine's passes and the sharpener - as
+   Logs\BVR_FINAL_<n>_corner.bmp. Same frame or the next; stand still.
+   TEST 813: every single-frame dump was sharp, but the headset sees a STREAM - a
+   frame-to-frame wobble (jitter left in, a sub-pixel shift) reads as blur and no
+   still can show it. So the next 8 eye-0 submits also save their centre 1024x1024
+   (BVR_FINAL_<n>_seq<k>.bmp) and the log gives each frame's mean |Laplacian|
+   (sharpness) and mean |change| from the frame before (wobble). Game paused, head still. */
+void ngx_dump_final(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int stage)
+{
+    static int s_nn[2] = { -1, -1 }, s_kk[2] = {};   /* TEST 813: the sequence in progress, per stage (TEST 814) */
+    static std::vector<uint8_t> s_pp[2];             /* its previous frame's centre luma */
+    stage = stage != 0 ? 1 : 0;
+    int& s_n = s_nn[stage];
+    int& s_k = s_kk[stage];
+    std::vector<uint8_t>& s_prev = s_pp[stage];
+    const char* const tag = stage == 0 ? "PRE" : "FINAL";
+    if (ctx == nullptr || tex == nullptr)
+        return;
+    if (s_n < 0)
+    {
+        if (g_finalPending[stage].load(std::memory_order_relaxed) < 0)
+            return;
+        s_n = g_finalPending[stage].exchange(-1);
+        s_k = 0;
+        s_prev.clear();
+    }
+    const int n = s_n;
+    const int k = s_k++;
+    if (s_k >= 8)
+        s_n = -1;
+    D3D11_TEXTURE2D_DESC d = {};
+    tex->GetDesc(&d);
+    const bool bgra = d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ||
+                      d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool rgba = d.Format == DXGI_FORMAT_R8G8B8A8_UNORM || d.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+                      d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if ((!bgra && !rgba) || d.Width < 1200 || d.Height < 500 || d.SampleDesc.Count != 1)
+    {
+        BVR_INFO("Final dump (TEST 805): format %d %ux%u not handled.", d.Format, d.Width, d.Height);
+        return;
+    }
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    sd.MipLevels = 1;
+    sd.ArraySize = 1;
+    ID3D11Texture2D* st = nullptr;
+    if (dev == nullptr || FAILED(dev->CreateTexture2D(&sd, nullptr, &st)))
+    {
+        if (dev) dev->Release();
+        return;
+    }
+    ctx->CopySubresourceRegion(st, 0, 0, 0, 0, tex, 0, nullptr);
+    D3D11_MAPPED_SUBRESOURCE m = {};
+    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)) && d.Width >= 1024 && d.Height >= 1024)
+    {
+        /* TEST 813: the centre, full size, plus its sharpness and its change. */
+        const UINT cw = 1024, cx = d.Width / 2 - 512, cy = d.Height / 2 - 512;
+        std::vector<uint8_t> cpx(static_cast<size_t>(cw) * 3 * cw), luma(static_cast<size_t>(cw) * cw);
+        for (UINT y = 0; y < cw; ++y)
+        {
+            const uint8_t* in = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(m.RowPitch) * (cy + y) + cx * 4;
+            uint8_t* out = cpx.data() + static_cast<size_t>(cw) * 3 * (cw - 1 - y);
+            for (UINT x = 0; x < cw; ++x)
+            {
+                const uint8_t b = in[x * 4 + (bgra ? 0 : 2)], g = in[x * 4 + 1], r = in[x * 4 + (bgra ? 2 : 0)];
+                out[x * 3 + 0] = b;
+                out[x * 3 + 1] = g;
+                out[x * 3 + 2] = r;
+                luma[static_cast<size_t>(y) * cw + x] = static_cast<uint8_t>((r * 54 + g * 183 + b * 19) >> 8);
+            }
+        }
+        double lap = 0.0, diff = 0.0;
+        for (UINT y = 1; y + 1 < cw; ++y)
+            for (UINT x = 1; x + 1 < cw; ++x)
+            {
+                const size_t i = static_cast<size_t>(y) * cw + x;
+                lap += abs(4 * luma[i] - luma[i - 1] - luma[i + 1] - luma[i - cw] - luma[i + cw]);
+            }
+        lap /= static_cast<double>(cw - 2) * (cw - 2);
+        if (!s_prev.empty())
+        {
+            for (size_t i = 0; i < luma.size(); ++i)
+                diff += abs(luma[i] - s_prev[i]);
+            diff /= static_cast<double>(luma.size());
+        }
+        s_prev.swap(luma);
+        wchar_t cname[64];
+        swprintf_s(cname, L"BVR_%hs_%d_seq%d.bmp", tag, n, k);
+        write_bmp(cname, cpx, cw, cw);
+        BVR_INFO("Final sequence (TEST 813, %s): dump %d frame %d - sharpness %.2f, change from the frame before %.3f "
+                 "(PerfQualityValue %d, %ux%u).", tag, n, k, lap, diff, g_lastQuality.load(), d.Width, d.Height);
+    }
+    if (k > 0 || stage == 0)   /* TEST 814: the corner only after the sharpener, as before */
+    {
+        if (m.pData != nullptr)
+            ctx->Unmap(st, 0);
+        st->Release();
+        dev->Release();
+        return;
+    }
+    if (m.pData != nullptr)
+    {
+        const UINT w = 1200, h = 500, y0 = d.Height - h, row = (w * 3 + 3) & ~3u;
+        std::vector<uint8_t> px(static_cast<size_t>(row) * h);
+        for (UINT y = 0; y < h; ++y)
+        {
+            const uint8_t* in = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(m.RowPitch) * (y0 + y);
+            uint8_t* out = px.data() + static_cast<size_t>(row) * (h - 1 - y);
+            for (UINT x = 0; x < w; ++x)
+            {
+                out[x * 3 + 0] = in[x * 4 + (bgra ? 0 : 2)];
+                out[x * 3 + 1] = in[x * 4 + 1];
+                out[x * 3 + 2] = in[x * 4 + (bgra ? 2 : 0)];
+            }
+        }
+        ctx->Unmap(st, 0);
+        wchar_t name[64];
+        swprintf_s(name, L"BVR_FINAL_%d_corner.bmp", n);
+        write_bmp(name, px, w, h);
+        BVR_INFO("Final dump (TEST 805): wrote Logs\\BVR_FINAL_%d_corner.bmp from eye 0's submitted "
+                 "%ux%u image (format %d).", n, d.Width, d.Height, d.Format);
+    }
+    st->Release();
+    dev->Release();
+}

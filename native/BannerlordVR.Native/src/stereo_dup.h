@@ -95,6 +95,11 @@ namespace bvr {
 void stereo_set_active(bool active);
 bool stereo_active();
 
+/* World units per metre of the published eyes (1 in a battle; the table's scale on
+   the campaign map, TEST 287). The IPD plausibility bounds and the IPD-hold
+   hysteresis are in metres and scale with it. */
+void stereo_set_world_scale(float scale);
+
 /* A constant-buffer upload, with the bytes the GPU will see. Builds the second
    eye's copy when the upload is the main view, and records whether it is -
    which is what makes the operations that bind it view-dependent. */
@@ -105,15 +110,6 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
 void stereo_on_update(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub,
                       const D3D11_BOX* box, const void* data, UINT rowPitch,
                       UINT depthPitch);
-
-/* A CPU write (Map/Unmap) into a buffer that is NOT a constant buffer.
-   stereo_wants_buffer_write says, at Map, whether the write is one native stereo
-   corrects for eye 1 - today the per-mesh previous-frame transforms
-   (g_meshf1_buffer, 304-byte stride), whose previous camera lands in every
-   dynamic mesh's velocity. stereo_on_buffer_write is called at Unmap with the
-   bytes; the corrected copy reaches the shaders when the engine copies this
-   buffer into the one they read. */
-bool stereo_wants_buffer_write(ID3D11Resource* r);
 
 /* DELAYED TINY READBACKS (TEST 185). A copy into a small CPU-read staging texture
    is redirected into one of three of ours (stereo_readback_copy_dst returns the
@@ -127,7 +123,6 @@ ID3D11Resource* stereo_readback_copy_dst(ID3D11Resource* dst);
 ID3D11Resource* stereo_readback_map(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub,
                                     D3D11_MAP type, UINT flags, D3D11_MAPPED_SUBRESOURCE* m,
                                     StereoMapFn origMap, HRESULT* hr);
-void stereo_on_buffer_write(ID3D11Resource* r, const void* data, uint32_t bytes);
 
 /* Called from shader creation with the bytecode: records which constant
    buffer, texture and UAV slots the shader actually declares. */
@@ -152,6 +147,7 @@ struct StereoOp
 {
     bool duplicate;
     bool compute;
+    bool skip;          /* TEST 548: the water cost probe says do not issue it */
 
     ID3D11RenderTargetView*    rtv[kStereoOutSlots];
     ID3D11DepthStencilView*    dsv;
@@ -165,7 +161,22 @@ struct StereoOp
     StereoSwap swap[kStereoSwapMax];
 
     int64_t    t0;
+
+    /* TEST 425: the scissor that keeps each eye out of the strip its lens
+       never shows. [0] the engine's eye, [1] the re-issued one; the engine's
+       rasterizer state and scissor rects are held to be put back. */
+    bool                   masked;
+    ID3D11RasterizerState* maskRs;
+    D3D11_RECT             maskRect[2];
+    UINT                   maskSaved;
+    D3D11_RECT             maskSavedRects[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
 };
+
+/* TEST 425: the runtime's eye field of view, from the frame's located views -
+   the tangent of the eye's NASAL half-angle (the side facing the other eye)
+   and the eye image's width / height. */
+void stereo_set_eye_fov(float nasalTan, float eyeAspect, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH);
+
 
 /* Reads the bindings, decides whether this operation is view-dependent, and -
    if it is - makes sure every surface it is about to write has a twin holding
@@ -181,6 +192,12 @@ void stereo_bind(ID3D11DeviceContext* c, StereoOp& op);
 
 /* Puts the engine's own bindings back and releases everything held. */
 void stereo_end(ID3D11DeviceContext* c, StereoOp& op);
+
+/* The argument buffer an INDIRECT re-issue reads (TEST 340): the twin when a
+   duplicated pass wrote the second eye's own counts, otherwise the original.
+   Not AddRef'd - the original owns its twin. Call between stereo_bind and
+   stereo_end. */
+ID3D11Buffer* stereo_eye1_args(ID3D11Buffer* b);
 
 /* The operations that are not draws but still write surfaces. Each keeps the
    twin and the surface state right. All are called BEFORE the original runs. */
@@ -235,6 +252,9 @@ bool stereo_in_dup();
 
 /* Per-Present: rolls counters and reports. */
 void stereo_frame_boundary();
+
+/* TEST 793: this frame's rendered jitter in NDC (main view, from per_framef). */
+bool stereo_render_jitter(float* ndcX, float* ndcY);
 
 } // namespace bvr
 

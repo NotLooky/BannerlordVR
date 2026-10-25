@@ -1,6 +1,7 @@
 using System;
 using TaleWorlds.Library;
 using TaleWorlds.MountAndBlade;
+using TaleWorlds.MountAndBlade.View.MissionViews;
 
 namespace BannerlordVR.VR
 {
@@ -86,6 +87,7 @@ namespace BannerlordVR.VR
                 if (agent == null || !agent.IsActive() || !VrCameraDriver.HasPose)
                 {
                     Active = false;
+                    HoldBody(null);
                     return;
                 }
 
@@ -97,18 +99,34 @@ namespace BannerlordVR.VR
                 if (!VrEngineAim.MaintainsBodyHeading)
                 {
                     Active = false;
+                    HoldBody(null);
                     WarnOnce();
+                    return;
+                }
+
+                // TEST 510: on a ladder the engine faces the body up the rungs; no
+                // look, held look or body facing of ours. Active stays as it was, so
+                // the anchor keeps reading the body heading.
+                if (VrLadder.Gated(agent))
+                {
+                    HoldBody(null);
+                    _haveWrote = _haveFaced = false;
                     return;
                 }
 
                 Measure(agent);
 
-                Vec3 look = HeadLook();
+                Vec3 look = HeadLook(agent, out bool held);
                 if (look.LengthSquared < 1e-6f)
                 {
                     Active = false;
+                    HoldBody(null);
                     return;
                 }
+
+                HoldBody(held ? (Vec3?)look : null);
+                if (held)
+                    FaceBody(agent, look);
 
                 Active = true;
 
@@ -129,22 +147,185 @@ namespace BannerlordVR.VR
             {
                 _broken = true;
                 Active = false;
+                HoldBody(null);
                 VrLog.Error("Head aiming failed; the agent goes back to aiming where the "
                             + "game's camera points. Head look and head movement are "
                             + "unaffected.", ex);
             }
         }
 
+        /// <summary>TEST 291. How far the head may turn from the body before the
+        /// body follows - and then only by the excess. 0 is the old behaviour, the
+        /// body turning with every glance. Live: the VR tab sets it.</summary>
+        public static float BodyTurnDeg { get; set; } =
+            Math.Max(0f, Math.Min(180f, VrConfig.Float("body_turn_deadzone_deg", 90f)));
+
+        // The yaw the body is told to face, flat and unit, in the ANCHOR's frame
+        // (TEST 291d): the right stick turns the anchor, so the body turns with the
+        // stick at once and only the physical head turn is held. Held across
+        // frames: that holding is the deadzone.
+        private static Vec2 _bodyDir;
+        private static bool _haveBodyDir;
+        private static bool _loggedDeadzone;
+
         /// <summary>
-        /// The head's world forward, flattened to yaw only if pitch is off.
+        /// The head's world forward, flattened to yaw only if pitch is off, with
+        /// its yaw held inside the body-turn deadzone (TEST 291).
+        ///
+        /// Only the look is held, not the engine bearing in VrEngineAim: that
+        /// drives the camera's culling, and 90 degrees off it would cull what you
+        /// are looking at.
         /// </summary>
-        private static Vec3 HeadLook()
+        private static Vec3 HeadLook(Agent agent, out bool held)
         {
+            held = false;
             Mat3 rotation = VrCameraDriver.HeadFrame.rotation;
 
             Vec3 f = DrivePitch ? rotation.f : VrMath.YawOnly(rotation).f;
             f.Normalize();
-            return f;
+
+            float flat = (float)Math.Sqrt(f.x * f.x + f.y * f.y);
+            if (flat < 1e-3f)
+                return f;                       // straight up or down: no yaw to hold
+
+            // Into the anchor's frame: +y its forward, +x its right.
+            Vec3 af = VrCameraDriver.Anchor.rotation.f;
+            float aLen = (float)Math.Sqrt(af.x * af.x + af.y * af.y);
+            Vec2 a = aLen > 1e-4f ? new Vec2(af.x / aLen, af.y / aLen) : new Vec2(0f, 1f);
+            Vec2 r = new Vec2(a.y, -a.x);
+
+            Vec2 headWorld = new Vec2(f.x / flat, f.y / flat);
+            Vec2 head = new Vec2(headWorld.x * r.x + headWorld.y * r.y,
+                                 headWorld.x * a.x + headWorld.y * a.y);
+
+            // Follow fully where vanilla aims with the look: a crossbow or a thrown
+            // weapon (and a bow when manual archery is off). Mounted, the body sits
+            // the saddle and the horse turns it anyway.
+            bool follow = BodyTurnDeg <= 0f || !_haveBodyDir || agent.HasMount || AimsWithLook(agent);
+
+            _bodyDir = follow ? head : Deadzone(_bodyDir, head, BodyTurnDeg * (float)(Math.PI / 180.0));
+            _haveBodyDir = true;
+            held = !follow;
+
+            if (!_loggedDeadzone && !follow)
+            {
+                _loggedDeadzone = true;
+                VrLog.Info(string.Format(
+                    "TEST 291: the body turns only once the head is more than {0:F0} deg off it, "
+                    + "and then only by the excess (body_turn_deadzone_deg, or the VR tab).",
+                    BodyTurnDeg));
+            }
+
+            Vec2 body = new Vec2(r.x * _bodyDir.x + a.x * _bodyDir.y,
+                                 r.y * _bodyDir.x + a.y * _bodyDir.y);
+            return new Vec3(body.x * flat, body.y * flat, f.z);
+        }
+
+        /// <summary>
+        /// TEST 291b. The engine's own look override.
+        ///
+        /// Writing agent.LookDirection alone did not hold the body: the log showed
+        /// the look drifting 16-24 deg from our write on foot. The game's
+        /// MissionMainAgentController.LookTick sets LookDirection from the camera
+        /// bearing in OnPreMissionTick - BEFORE the agents move - and our write
+        /// lands after, so the body only ever saw the head. LookTick uses
+        /// CustomLookDir instead of the camera whenever it is non-zero, so the held
+        /// look goes there. Zero hands the look back to the camera, as vanilla.
+        /// </summary>
+        private static void HoldBody(Vec3? look)
+        {
+            Vec3 want = look ?? Vec3.Zero;
+            if (!look.HasValue && !_holding)
+                return;
+
+            MissionMainAgentController controller =
+                Mission.Current?.GetMissionBehavior<MissionMainAgentController>();
+            if (controller == null)
+            {
+                _holding = false;
+                return;
+            }
+
+            controller.CustomLookDir = want;
+            _holding = look.HasValue;
+        }
+
+        private static bool _holding;
+
+        /// <summary>
+        /// TEST 291e. The body faces the held direction NOW.
+        ///
+        /// 291d held the look in the stick-turned frame, but a right-stick turn
+        /// still lagged: a standing agent turns its body toward its look only once
+        /// they are far enough apart - the engine's own deadzone, on top of ours.
+        /// Agent.SetMovementDirection is the body's facing, so it is written with
+        /// the held look every frame and the engine has nothing left to catch up.
+        /// The probe logs how far the engine moved it between frames.
+        /// </summary>
+        private static void FaceBody(Agent agent, Vec3 look)
+        {
+            float len = (float)Math.Sqrt(look.x * look.x + look.y * look.y);
+            if (len < 1e-4f)
+                return;
+
+            Vec2 dir = new Vec2(look.x / len, look.y / len);
+
+            if (_haveFaced)
+            {
+                Vec2 now = agent.GetMovementDirection();
+                float dot = Math.Max(-1f, Math.Min(1f, now.x * _faced.x + now.y * _faced.y));
+                _faceDriftSum += (float)Math.Acos(dot);
+                if (++_faceTick >= 450)
+                {
+                    VrLog.Info(string.Format(
+                        "TEST 291e: the body's facing moved {0:F1} deg between our writes, on "
+                        + "average. Near 0: the engine keeps it and the body turns with the stick "
+                        + "at once.", _faceDriftSum / _faceTick * 57.2957795f));
+                    _faceTick = 0;
+                    _faceDriftSum = 0f;
+                }
+            }
+
+            agent.SetMovementDirection(in dir);
+            _faced = dir;
+            _haveFaced = true;
+        }
+
+        private static Vec2 _faced;
+        private static bool _haveFaced;
+        private static float _faceDriftSum;
+        private static int _faceTick;
+
+        private static bool AimsWithLook(Agent agent)
+        {
+            MissionWeapon held = agent.WieldedWeapon;
+            if (held.IsEmpty || held.CurrentUsageItem == null || !held.CurrentUsageItem.IsRangedWeapon)
+                return false;
+
+            // TEST 373: the manual crossbow aims with the hands, like the manual bow.
+            return !(held.CurrentUsageItem.IsBow && VrBow.Enabled)
+                   && !(held.CurrentUsageItem.IsCrossBow && VrCrossbow.Enabled);
+        }
+
+        /// <summary>
+        /// TEST 291. body turned toward head by only as much as puts it limitRad
+        /// off; unchanged inside the limit. Both flat and unit.
+        /// </summary>
+        public static Vec2 Deadzone(Vec2 body, Vec2 head, float limitRad)
+        {
+            float cross = body.x * head.y - body.y * head.x;
+            float dot = body.x * head.x + body.y * head.y;
+            float angle = (float)Math.Atan2(cross, dot);
+
+            float excess = Math.Abs(angle) - limitRad;
+            if (excess <= 0f)
+                return body;
+
+            float turn = Math.Sign(angle) * excess;
+            float c = (float)Math.Cos(turn), s = (float)Math.Sin(turn);
+            Vec2 r = new Vec2(body.x * c - body.y * s, body.x * s + body.y * c);
+            float len = (float)Math.Sqrt(r.x * r.x + r.y * r.y);
+            return len > 1e-6f ? new Vec2(r.x / len, r.y / len) : head;
         }
 
         /// <summary>
@@ -198,10 +379,17 @@ namespace BannerlordVR.VR
                        + "the calibration failed, and head aiming stays off.");
         }
 
+        /// <summary>TEST 291d. A recentre means "face where I look": the held body
+        /// snaps to the head on the next frame.</summary>
+        public static void SnapBody() => _haveBodyDir = false;
+
         public static void Reset()
         {
             Active = false;
             _haveWrote = false;
+            _haveBodyDir = false;
+            _haveFaced = false;
+            HoldBody(null);
             _driftSum = 0f;
             _driftCount = 0;
             _tick = 0;

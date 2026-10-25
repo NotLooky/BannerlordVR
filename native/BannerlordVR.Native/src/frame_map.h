@@ -80,6 +80,10 @@ void frame_map_compute(ID3D11DeviceContext* c, const char* kind, const char* arg
 void frame_map_clear_dsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv,
                          UINT flags, float depth, UINT stencil);
 
+/* TEST 595: vp_patch's ClearRenderTargetView detour records through this when it,
+   not the frame map's, holds the hook. */
+void frame_map_clear_rtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const float col[4]);
+
 /* The ORIGINAL bytes of a constant-buffer upload, before anything rewrites
    them. `offset` is the byte offset of `data` within the buffer. */
 void frame_map_cb_upload(ID3D11Resource* r, const void* data, uint32_t bytes,

@@ -361,7 +361,7 @@ Keep the shipped default file with its build. Edit your **personal** file rather
 | `gamepad_deadzone` | Stick deadzone |
 | `bow_full_draw_m` | Physical draw distance for full bow power |
 
-To reset personal overrides, close the game and **back up, then rename** your personal config. On the next launch, the shipped defaults take over. Do not copy the repository's `config/BannerlordVR.cfg` into your Documents folder: it is a development journal, not a player preset.
+To reset personal overrides, close the game and **back up, then rename** your personal config. On the next launch, the shipped defaults take over.
 
 ## Troubleshooting
 

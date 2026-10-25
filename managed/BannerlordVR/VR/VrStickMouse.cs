@@ -41,10 +41,34 @@ namespace BannerlordVR.VR
         /// <summary>On, and LATCHED rather than momentary - see Active.</summary>
         public static bool Enabled { get; } = VrConfig.Bool("stick_mouse", true);
 
-        /// <summary>Screen widths per second at full deflection. A pointer that
-        /// crosses the screen in about a second is quick enough not to be a chore
-        /// and slow enough to land on a button.</summary>
-        private static readonly float Speed = VrConfig.Float("stick_mouse_speed", 1.1f);
+        /// <summary>
+        /// Screen widths per second at full deflection.
+        ///
+        /// The default crosses the screen in about a second, which was picked as
+        /// quick enough not to be a chore and slow enough to land on a button.
+        /// It reads as quick enough to be a chore in the other direction for
+        /// plenty of people, and there is no value here that is right for every
+        /// stick and every menu - so it is on a slider in the panel rather than
+        /// settled by argument. Live, because it is judged by moving it.
+        /// </summary>
+        public static float Speed { get; private set; } =
+            Clamp(VrConfig.Float("stick_mouse_speed", 1.1f), MinSpeed, MaxSpeed);
+
+        /// <summary>The range the panel's slider offers, and the clamp on
+        /// anything the config hands us. Below 0.2 the pointer cannot cross the
+        /// screen in a reasonable push; above 3 it cannot be aimed. The slider
+        /// in vr_overlay.cpp offers exactly these two numbers.</summary>
+        public const float MinSpeed = 0.20f;
+        public const float MaxSpeed = 3.00f;
+
+        /// <summary>Applies a new speed and returns what was actually taken, so
+        /// the panel can show the clamp rather than a number that did not stick.
+        /// The config write is the caller's - this half only knows the value.</summary>
+        public static float SetSpeed(float speed)
+        {
+            Speed = Clamp(speed, MinSpeed, MaxSpeed);
+            return Speed;
+        }
 
         /// <summary>Below this the stick is at rest. Larger than the movement
         /// deadzone: a cursor that creeps while you read is worse than one that
@@ -64,10 +88,68 @@ namespace BannerlordVR.VR
         ///
         /// Set stick_mouse_stick = right to put it back.
         /// </summary>
-        private static readonly bool UseRightStick =
+        private static readonly bool ConfiguredRightStick =
             string.Equals(VrConfig.String("stick_mouse_stick", "left"), "right",
                           StringComparison.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// DEPLOYMENT SWAPS HANDS, AND IT HAS TO.
+        ///
+        /// The pointer and the deployment camera both want the left stick: the
+        /// pointer by the reasoning above, the camera because VrGamepad reports
+        /// the left trigger held for the whole phase so the movement axis flies
+        /// it (see deployment_stick_fly). The latch would nominally sort that out
+        /// - push one stick to take the pointer, push the other to give it back -
+        /// but with both on the SAME stick there is no "other" to push with, and
+        /// the first nudge meant to fly the camera would silently turn into a
+        /// cursor drag instead.
+        ///
+        /// So for deployment only, the pointer moves to the right hand. That is
+        /// also the arrangement that reads best: left flies, right points, and
+        /// the latch's give-it-back gesture is exactly the one the player already
+        /// makes to move somewhere else. An explicit stick_mouse_stick = right
+        /// changes nothing, because that is already where it is.
+        /// </summary>
+        private static bool UseRightStick
+        {
+            get
+            {
+                if (ConfiguredRightStick)
+                    return true;
+
+                try
+                {
+                    // Fully qualified, and var: TaleWorlds.MountAndBlade is not
+                    // a using in this file and the rest of it reaches Mission
+                    // the same way.
+                    var m = TaleWorlds.MountAndBlade.Mission.Current;
+
+                    // THE SWAP STOPS AT THE MENU, and leaving that out is what
+                    // made the pause menu's cursor die a second time.
+                    //
+                    // The swap exists for one reason: during deployment the left
+                    // stick FLIES the camera, so the pointer cannot also have it.
+                    // Open a menu and there is no camera being flown any more -
+                    // the menu is what is being used - so the reason is gone while
+                    // the swap stayed, and the pointer sat on the right stick in
+                    // the one screen where the hand has spent every other menu in
+                    // the game on the left one.
+                    //
+                    // Worse than merely unresponsive: pushing the left stick is
+                    // the latch's own "give the menu back to the pad" gesture, so
+                    // the instinctive reaction to a cursor that has not moved is
+                    // the exact input that switches it off. Which reads, precisely
+                    // as reported, as the cursor not moving at all.
+                    return m != null
+                        && m.Mode == MissionMode.Deployment
+                        && !VrMissionPhase.UiMenuOpen;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
         /// <summary>
         /// True while the pointer is genuinely under stick control.
         ///
@@ -122,7 +204,8 @@ namespace BannerlordVR.VR
 
             try
             {
-                if (!InMenu() || !VrGamepad.Active)
+                // TEST 378: the laser owns the cursor while it is on the interface.
+                if (!InMenu() || !VrGamepad.Active || VrMenu.Open || VrLaser.Active || VrLaser.GroundActive)
                 {
                     Active = false;
                     return;
@@ -261,8 +344,13 @@ namespace BannerlordVR.VR
         {
             try
             {
+                // UiMenuOpen, NOT UiWantsScreen. The latter is "the flat panel is
+                // up", which a mission turns off even with the escape menu open,
+                // because the panel would only show a frozen game window. That is
+                // a question about presentation; this one is about whether there
+                // is a menu to point at. See VrMissionPhase.UiMenuOpen.
                 if (TaleWorlds.MountAndBlade.Mission.Current != null)
-                    return VrMissionPhase.UiWantsScreen;
+                    return VrMissionPhase.UiMenuOpen;
 
                 // Outside a mission "no mission" used to be the whole test, which
                 // made the campaign map a menu. It is not one: with nothing open
@@ -299,7 +387,7 @@ namespace BannerlordVR.VR
         /// a mod that cannot be configured from inside the headset, which is far
         /// worse than a map camera that occasionally defers to the cursor.
         /// </summary>
-        private static bool PointerWanted()
+        internal static bool PointerWanted()
         {
             try
             {
@@ -322,7 +410,46 @@ namespace BannerlordVR.VR
                 if (active is MapState)
                 {
                     Campaign campaign = Campaign.Current;
-                    return campaign != null && campaign.CurrentMenuContext != null;
+                    if (campaign != null && campaign.CurrentMenuContext != null)
+                        return true;
+
+                    // ...AND THE ESCAPE MENU, WHICH IS NEITHER A STATE NOR A
+                    // MENU CONTEXT.
+                    //
+                    // CurrentMenuContext covers settlement and other game menus
+                    // and nothing else. Press Escape on the map and the state is
+                    // STILL MapState and the menu context is STILL null, because
+                    // SandBox's GauntletMapEscapeMenuView does not push either -
+                    // it adds a layer to the map screen:
+                    //
+                    //     base.Layer = new GauntletLayer("MapEscapeMenu", 4400,
+                    //                                    false) { IsFocusLayer = true };
+                    //     ScreenManager.TrySetFocus(base.Layer);
+                    //
+                    // So both tests above answer no to a screen that is plainly a
+                    // menu, and the pointer stays off in the one place on the map
+                    // where there is no camera to protect.
+                    //
+                    // FOCUS, NOT THE CURSOR, and that distinction is the whole
+                    // reason the layer walk was abandoned here before. Asking
+                    // "does any layer want the mouse" is always yes on the map -
+                    // the map is driven by clicking, so its own furniture asks -
+                    // which is what made the bare map read as a menu and killed
+                    // the map camera. Asking who holds FOCUS is a different
+                    // question with a different answer: SandBox.View, which owns
+                    // MapScreen, never sets IsFocusLayer at all, so the bare map
+                    // has no focused layer. Every layer that takes focus over the
+                    // map - the escape menu, army management, the encyclopedia -
+                    // is something opened deliberately and wanting a pointer.
+                    //
+                    // ...EXCEPT THE MAP'S OWN SCENE LAYER. On a pad the game gives it
+                    // focus on the bare map (MapScreen tests FocusedLayer == SceneLayer
+                    // for its gamepad cursor), so this read "menu" there and the
+                    // pointer took the left stick from the map pan - TEST 284, "left
+                    // stick moves my camera only when the VR menu is open" (the one
+                    // thing that switches the pointer off).
+                    ScreenLayer focused = ScreenManager.FocusedLayer;
+                    return focused != null && !(focused is TaleWorlds.Engine.Screens.SceneLayer);
                 }
 
                 // Anything that is not the map and not a mission is a screen made

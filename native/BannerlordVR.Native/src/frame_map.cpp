@@ -4,10 +4,12 @@
 #include <shlobj.h>
 
 #include "bvr_config.h"
+#include "perf_options.h"
 #include "bvr_log.h"
 #include "d3d_hooks.h"
 #include "vp_patch.h"
 #include "stereo_dup.h"
+#include "water_spec_aa.h"
 #include "xr_context.h"
 
 #include <d3d11_1.h>
@@ -352,7 +354,10 @@ int shader_id(ID3D11DeviceChild* s, char stage)
 // snapshots - taken WITHOUT g_mu, released after formatting
 // ---------------------------------------------------------------------------
 
-constexpr int kSrv = 48;
+// Character compute shaders use high slots (including t68). Capture every
+// legal slot so resource-flow analysis cannot mistake an omitted binding for
+// an unbound input. Snapshots only run during an explicitly requested capture.
+constexpr int kSrv = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;
 constexpr int kCb = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
 
 enum { SV = 0, SH, SD, SG, SP, SC, kStages };
@@ -753,6 +758,8 @@ struct FmSlot
     void*       detour[kVariants];
     void*       target[kVariants];
     void*       tramp[kVariants];
+    uint64_t    retryAt;        /* GetTickCount64 after a transient refusal */
+    bool        allocWarned;
 };
 
 FmSlot g_slots[kSlotCount] = {};
@@ -818,6 +825,26 @@ void indirect_args(ID3D11Buffer* b, UINT off, char* out, size_t n)
     _snprintf_s(out, n, _TRUNCATE, "args=R%d+%u", res_id(b), off);
 }
 
+using PFN_Indirect = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+
+/* Native stereo re-issues indirect operations like the direct ones (TEST 340):
+   the campaign map's ground is drawn with DrawIndexedInstancedIndirect, and eye
+   1 had none. Examining them also keeps the twins of what they write in step. */
+void indirect_op(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off, PFN_Indirect fn,
+                 bool compute)
+{
+    StereoOp sop;
+    const bool sdup = stereo_begin(c, sop, compute);
+    if (!sop.skip)
+        fn(c, b, off);
+    if (sdup)
+    {
+        stereo_bind(c, sop);
+        fn(c, stereo_eye1_args(b), off);
+        stereo_end(c, sop);
+    }
+}
+
 template <int V>
 void STDMETHODCALLTYPE d_draw_idx_inst_indirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT off)
 {
@@ -827,7 +854,7 @@ void STDMETHODCALLTYPE d_draw_idx_inst_indirect(ID3D11DeviceContext* c, ID3D11Bu
         indirect_args(b, off, a, sizeof(a));
         record_pipeline(c, false, "DrawIndexedInstancedIndirect", a);
     }
-    tramp_of<void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT)>(kDrawIdxInstIndirect, V)(c, b, off);
+    indirect_op(c, b, off, tramp_of<PFN_Indirect>(kDrawIdxInstIndirect, V), false);
 }
 
 template <int V>
@@ -839,7 +866,7 @@ void STDMETHODCALLTYPE d_draw_inst_indirect(ID3D11DeviceContext* c, ID3D11Buffer
         indirect_args(b, off, a, sizeof(a));
         record_pipeline(c, false, "DrawInstancedIndirect", a);
     }
-    tramp_of<void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT)>(kDrawInstIndirect, V)(c, b, off);
+    indirect_op(c, b, off, tramp_of<PFN_Indirect>(kDrawInstIndirect, V), false);
 }
 
 template <int V>
@@ -851,7 +878,7 @@ void STDMETHODCALLTYPE d_dispatch_indirect(ID3D11DeviceContext* c, ID3D11Buffer*
         indirect_args(b, off, a, sizeof(a));
         record_pipeline(c, true, "DispatchIndirect", a);
     }
-    tramp_of<void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT)>(kDispatchIndirect, V)(c, b, off);
+    indirect_op(c, b, off, tramp_of<PFN_Indirect>(kDispatchIndirect, V), true);
 }
 
 void note_copy_region(const char* kind, ID3D11Resource* dst, UINT dstSub, UINT x, UINT y,
@@ -909,11 +936,7 @@ void STDMETHODCALLTYPE d_clear_rtv(ID3D11DeviceContext* c, ID3D11RenderTargetVie
                                    const FLOAT col[4])
 {
     if (capturing())
-        record_plain("ClearRTV", [&](std::string& s) {
-            appendf(s, " %s col=%.3f,%.3f,%.3f,%.3f", view_ref(v, 'R').c_str(),
-                    col ? col[0] : 0.0f, col ? col[1] : 0.0f, col ? col[2] : 0.0f,
-                    col ? col[3] : 0.0f);
-        });
+        frame_map_clear_rtv(c, v, col);
     stereo_clear_rtv(c, v, col);
     tramp_of<void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*,
                                        const FLOAT*)>(kClearRtv, V)(c, v, col);
@@ -1110,6 +1133,11 @@ void hook_slot(FmSlot& s, void** table)
     void* t = table[s.index];
     if (t == nullptr || is_refused(t))
         return;
+    for (int v = 0; v < kVariants; ++v)
+        if (s.detour[v] == t)
+            return;             /* our own vtable fallback, below */
+    if (GetTickCount64() < s.retryAt)
+        return;
 
     for (int v = 0; v < kVariants; ++v)
         if (s.target[v] == t)
@@ -1130,6 +1158,33 @@ void hook_slot(FmSlot& s, void** table)
     /* The trampoline is written by MH_CreateHook, before MH_EnableHook makes the
        detour reachable - so no call can find the detour with a null forward. */
     const MH_STATUS st = MH_CreateHook(t, s.detour[v], &s.tramp[v]);
+    if (st == MH_ERROR_MEMORY_ALLOC)
+    {
+        /* TEST 190: transient - no trampoline memory near the target at THIS
+           moment. Refusing it for good left the 16:59 run without any copy hook:
+           no motion-vector correction, no readback delay, per-eye copies not
+           tracked. The draw hooks retry and got in seconds later; so do these. */
+        s.retryAt = GetTickCount64() + 1000;
+
+        /* Meanwhile through the vtable slot, which needs no trampoline: the
+           detour forwards to the untouched original. The 17:04 run waited 20 s
+           for memory, and native stereo was flat until then. The inline hook
+           keeps being retried; once in, the slot's forward goes through it. */
+        if (s.tramp[v] == nullptr || s.tramp[v] == t)
+        {
+            s.tramp[v] = t;
+            MemoryBarrier();
+            vtable_write(&table[s.index], s.detour[v]);
+        }
+        if (!s.allocWarned)
+        {
+            s.allocWarned = true;
+            BVR_WARN("Frame map: no trampoline memory near %s at %p yet; hooked through "
+                     "its vtable slot meanwhile, inline hook retried every second.",
+                     s.name, t);
+        }
+        return;
+    }
     if (st != MH_OK)
     {
         refuse(t);
@@ -1187,7 +1242,8 @@ void retain_bytecode(void* shader, const void* code, SIZE_T len)
     if (shader == nullptr || code == nullptr || len == 0 || len > 0x7FFFFFFF)
         return;
     ID3D11DeviceChild* child = reinterpret_cast<ID3D11DeviceChild*>(shader);
-    if (SUCCEEDED(child->SetPrivateData(kFmBytecode, static_cast<UINT>(len), code)))
+    if ((fm_cfg().enabled || perf_legacy()) &&
+        SUCCEEDED(child->SetPrivateData(kFmBytecode, static_cast<UINT>(len), code)))
         g_shRetained.fetch_add(1, std::memory_order_relaxed);
 
     /* Native stereo counts only the slots a shader DECLARES - read here, once,
@@ -1199,9 +1255,25 @@ template <int K>
 HRESULT STDMETHODCALLTYPE d_create_shader(ID3D11Device* d, const void* code, SIZE_T len,
                                           ID3D11ClassLinkage* link, void** out)
 {
+    if constexpr (K == 2)   /* pixel: TEST 544, the sea with specular AA */
+    {
+        const void* aa = nullptr;
+        size_t aaLen = 0;
+        if (out != nullptr && water_spec_aa_code(code, len, &aa, &aaLen) &&
+            SUCCEEDED(g_origCreate[K](d, aa, aaLen, link, out)) && *out != nullptr)
+        {
+            retain_bytecode(*out, aa, aaLen);
+            water_probe_tag(*out, code, len);
+            return S_OK;
+        }
+    }
+
     const HRESULT hr = g_origCreate[K](d, code, len, link, out);
     if (SUCCEEDED(hr) && out != nullptr)
+    {
         retain_bytecode(*out, code, len);
+        water_probe_tag(*out, code, len);   /* TEST 548 */
+    }
     return hr;
 }
 
@@ -1361,10 +1433,10 @@ void begin_capture()
     g_shIds.clear();
     g_sh.clear();
 
-    appendf(g_ops, "BannerlordVR frame map. vp_patch=%.0f vp_latch=%.2f afr=%.0f afw=%.0f "
-            "frames=%d. Shaders with retained bytecode so far: %llu.\n",
+    appendf(g_ops, "BannerlordVR frame map. vp_patch=%.0f vp_latch=%.2f afr=%.0f depth_reproject=%.0f "
+            "frames=%d srv_slots=%d. Shaders with retained bytecode so far: %llu.\n",
             config_float("vp_patch", -1.0f), config_float("vp_latch", -1.0f),
-            config_float("afr", -1.0f), config_float("afw", -1.0f), fm_cfg().frames,
+            config_float("afr", -1.0f), config_float("depth_reproject", -1.0f), fm_cfg().frames, kSrv,
             static_cast<unsigned long long>(g_shRetained.load(std::memory_order_relaxed)));
     g_ops += "Op line: #seq f<frame> th<thread> [ours]=issued inside our Present tick, "
              "then the op, its args, and after '||' every binding live at that moment.\n";
@@ -1455,10 +1527,10 @@ void frame_map_install(ID3D11Device* device, ID3D11DeviceContext* context)
     hook_shader_creation(device);
 
     g_installed.store(true, std::memory_order_release);
-    BVR_INFO("Frame map ARMED: a capture of %d frame(s) is taken %.0f s after each mission "
-             "goes active, or whenever Logs\\BannerlordVR.FrameMap.trigger appears. Output "
-             "goes to Logs\\BannerlordVR.FrameMap\\<time>\\.",
-             fm_cfg().frames, fm_cfg().delaySec);
+    BVR_INFO("Frame map hooks installed (also required by stereo). Capture %s; %d frame(s), "
+             "automatic mission capture %s. Manual trigger: Logs\\BannerlordVR.FrameMap.trigger.",
+             fm_cfg().enabled ? "enabled" : "disabled", fm_cfg().frames,
+             (perf_legacy() || config_bool("frame_map_auto", false)) ? "enabled" : "disabled");
 }
 
 void frame_map_present(ID3D11DeviceContext* context)
@@ -1496,6 +1568,12 @@ void frame_map_present(ID3D11DeviceContext* context)
     if (g_writing.load(std::memory_order_acquire))
         return;
 
+    /* The hooks above stay installed whenever stereo_dup wants them even with
+       frame_map = 0, so the trigger itself - not just install() - has to be
+       the gate, or a disabled frame_map still captures every mission. */
+    if (!fm_cfg().enabled)
+        return;
+
     bool trigger = false;
     if (++g_triggerPoll >= 45)
     {
@@ -1509,7 +1587,8 @@ void frame_map_present(ID3D11DeviceContext* context)
         trigger = true;
     }
 
-    if (mission && !g_capturedThisMission &&
+    static const bool autoCapture = perf_legacy() || config_bool("frame_map_auto", false);
+    if (autoCapture && mission && !g_capturedThisMission &&
         now - g_missionStartMs >= static_cast<uint64_t>(fm_cfg().delaySec * 1000.0f))
     {
         g_capturedThisMission = true;
@@ -1528,6 +1607,16 @@ void frame_map_draw(ID3D11DeviceContext* c, const char* kind, const char* args)
 void frame_map_compute(ID3D11DeviceContext* c, const char* kind, const char* args)
 {
     record_pipeline(c, true, kind, args);
+}
+
+void frame_map_clear_rtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const float col[4])
+{
+    (void)c;
+    record_plain("ClearRTV", [&](std::string& s) {
+        appendf(s, " %s col=%.3f,%.3f,%.3f,%.3f", view_ref(v, 'R').c_str(),
+                col ? col[0] : 0.0f, col ? col[1] : 0.0f, col ? col[2] : 0.0f,
+                col ? col[3] : 0.0f);
+    });
 }
 
 void frame_map_clear_dsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, UINT flags,

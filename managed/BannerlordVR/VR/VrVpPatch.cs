@@ -64,7 +64,7 @@ namespace BannerlordVR.VR
         /// a frame and changes not one pixel by itself.
         /// </summary>
         public static bool Enabled { get; } =
-            VrConfig.Bool("vp_patch", false) || VrConfig.Bool("vp_measure", false);
+            VrConfig.Bool("vp_patch", false) || VrConfig.Bool("vp_measure", true);   // TEST 540: on by default
 
         /// <summary>
         /// True only when the native side actually REWRITES matrices.
@@ -138,14 +138,18 @@ namespace BannerlordVR.VR
 
         public static void Publish(MissionScreen screen, int eye)
         {
-            if (!Enabled || _standDown || screen == null || eye < 0 || eye > 1)
+            if (screen != null)
+                Publish(screen.CombatCamera, eye);
+        }
+
+        /// <summary>The same publication from any engine camera - the campaign map's
+        /// native stereo (TEST 286) has no MissionScreen.</summary>
+        public static void Publish(Camera combat, int eye)
+        {
+            if (!Enabled || _standDown || combat == null || eye < 0 || eye > 1)
                 return;
 
             if (!VrCameraDriver.HaveEyeFrames)
-                return;
-
-            Camera combat = screen.CombatCamera;
-            if (combat == null)
                 return;
 
             try

@@ -55,7 +55,7 @@ function Fwd([string]$p) { $p.Replace('\', '/') }
 
 $root = Fwd $repoRoot
 $compile = @(
-    'cl /std:c++17 /EHsc /nologo /W3'
+    'cl /std:c++17 /EHsc /nologo /W3 /MD'
     "/Fo:`"$(Fwd $outDir)/`" /Fe:`"$(Fwd $exe)`""
     "/I `"$root/native/BannerlordVR.Native/src`""
     "/I `"$root/native/BannerlordVR.Native/include`""
@@ -63,7 +63,7 @@ $compile = @(
     "`"$root/tests/vp_math_test.cpp`""
     "`"$root/native/BannerlordVR.Native/src/bvr_log.cpp`""
     "`"$root/native/BannerlordVR.Native/src/bvr_config.cpp`""
-    "`"$(Fwd $minhookLib)`" user32.lib shell32.lib"
+    "`"$(Fwd $minhookLib)`" user32.lib shell32.lib d3dcompiler.lib"
 ) -join ' '
 
 Write-Host 'Compiling vp_math_test...' -ForegroundColor Cyan

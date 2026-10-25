@@ -91,7 +91,7 @@ void vp_publish_other(const VpFrame& frame);
 
 /* True when the second-eye duplicate exists and can be blitted. */
 /* Whether draw-duplication stereo is the running mode. Off for every other
-   mode, so AFR and AFW are untouched by this path existing. */
+   mode, so AFR and DR are untouched by this path existing. */
 void vp_set_draw_stereo(bool active);
 
 bool vp_second_eye_ready();

@@ -64,6 +64,29 @@ namespace BannerlordVR.VR
             return frame;
         }
 
+        /// <summary>
+        /// TEST 596: an OpenXR orientation with its roll taken out - same look
+        /// direction, up as close to the world's +Y as that allows. Heading comes
+        /// from the forward vector exactly; only in the last ~18 deg before
+        /// vertical is the head's up blended in (looking straight down, up is where
+        /// the head faces), so straight down never spins.
+        /// </summary>
+        public static BvrQuat RollFree(BvrQuat q)
+        {
+            BvrVec3 f = Rotate(q, 0f, 0f, -1f);
+            BvrVec3 u = Rotate(q, 0f, 1f, 0f);
+            float k = f.Y * Math.Max(0f, Math.Min(1f, (Math.Abs(f.Y) - 0.95f) / 0.05f));
+            float hx = f.X - k * u.X;
+            float hz = f.Z - k * u.Z;
+            float yaw = (float)Math.Atan2(-hx, -hz);
+            float pitch = (float)Math.Asin(Math.Max(-1f, Math.Min(1f, f.Y)));
+
+            // yaw about +Y after pitch about +X: (0,sy,0,cy) * (sp,0,0,cp)
+            float sy = (float)Math.Sin(0.5f * yaw), cy = (float)Math.Cos(0.5f * yaw);
+            float sp = (float)Math.Sin(0.5f * pitch), cp = (float)Math.Cos(0.5f * pitch);
+            return new BvrQuat { X = cy * sp, Y = sy * cp, Z = -sy * sp, W = cy * cp };
+        }
+
         /// <summary>Rotate (x,y,z) by quaternion q. Standard v + 2q_v x (q_v x v + w v).</summary>
         private static BvrVec3 Rotate(BvrQuat q, float x, float y, float z)
         {

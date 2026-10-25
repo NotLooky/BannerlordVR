@@ -15,8 +15,8 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
+    <AssemblyVersion>0.2.7.0</AssemblyVersion>
+    <FileVersion>0.2.7.0</FileVersion>
     <Deterministic>true</Deterministic>
     <DebugType>portable</DebugType>
 
@@ -34,6 +34,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Include="..\..\native\thirdparty\dlss\nvngx_dlss.dll" Link="nvngx_dlss.dll" CopyToOutputDirectory="PreserveNewest"
+          Condition="Exists('..\..\native\thirdparty\dlss\nvngx_dlss.dll')" />
     <!-- Reference assemblies for net472, so the build does not depend on a
          machine-wide targeting pack being installed. -->
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
@@ -75,9 +77,14 @@
     <GameReference Include="TaleWorlds.GauntletUI.Data" />
     <GameReference Include="TaleWorlds.Engine.GauntletUI" />
     <GameReference Include="TaleWorlds.TwoDimension" />
+    <!-- Widget.GlobalPosition / Size are System.Numerics.Vector2 (TEST 377).
+         Aliased: the framework's System.Numerics has a Vector2 too. -->
+    <GameReference Include="System.Numerics.Vectors" Aliases="NumericsVectors" />
 
     <!-- ViewModelCollection also lives in bin\ -->
     <GameReference Include="TaleWorlds.MountAndBlade.ViewModelCollection" />
+    <!-- TEST 645: the pre-battle formation marker widget (DeployMarkerCullPatch) -->
+    <GameReference Include="TaleWorlds.MountAndBlade.GauntletUI.Widgets" />
 
     <!-- The View layer lives in the Native MODULE folder, not bin\ -->
     <NativeModuleReference Include="TaleWorlds.MountAndBlade.View" />
@@ -93,6 +100,11 @@
     </Reference>
     <Reference Include="@(NativeModuleReference)">
       <HintPath>$(NativeModuleBinDir)\%(Identity).dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- The campaign map's MapScreen. Sandbox is already a DependedModule. -->
+    <Reference Include="SandBox.View">
+      <HintPath>$(BannerlordDir)\Modules\SandBox\bin\Win64_Shipping_Client\SandBox.View.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
@@ -114,6 +126,7 @@
   <Target Name="DeployToGame" AfterTargets="Build" Condition="'$(SkipDeploy)' != 'true'">
     <ItemGroup>
       <DeployBin Include="$(OutputPath)BannerlordVR.dll" />
+      <DeployBin Include="$(OutputPath)nvngx_dlss.dll" Condition="Exists('$(OutputPath)nvngx_dlss.dll')" />
       <DeployBin Include="$(OutputPath)BannerlordVR.pdb" Condition="Exists('$(OutputPath)BannerlordVR.pdb')" />
       <DeployBin Include="$(OutputPath)0Harmony.dll" Condition="'$(ShipHarmonyPrivately)' == 'true' And Exists('$(OutputPath)0Harmony.dll')" />
       <DeployNative Include="$(MSBuildThisFileDirectory)..\..\build\native\*.dll" />
@@ -122,6 +135,9 @@
     <Copy SourceFiles="@(DeployBin)" DestinationFolder="$(ModuleDeployDir)\bin\Win64_Shipping_Client\" SkipUnchangedFiles="true" />
     <Copy SourceFiles="@(DeployNative)" DestinationFolder="$(ModuleDeployDir)\bin\Win64_Shipping_Client\" SkipUnchangedFiles="true" Condition="'@(DeployNative)' != ''" />
     <Copy SourceFiles="@(DeployModule)" DestinationFiles="@(DeployModule->'$(ModuleDeployDir)\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <!-- TEST 540: the live config's effective values as the module's defaults, so
+         a deleted Documents config renders the tested setup, not stale code defaults. -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\..\tools\write-default-cfg.ps1&quot; -OutFile &quot;$(ModuleDeployDir)\BannerlordVR.default.cfg&quot;" />
     <Message Importance="high" Text="BannerlordVR deployed -> $(ModuleDeployDir)" />
   </Target>
 

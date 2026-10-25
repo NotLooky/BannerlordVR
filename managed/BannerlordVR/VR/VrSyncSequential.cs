@@ -70,24 +70,12 @@ namespace BannerlordVR.VR
         public static bool Enabled { get; } = VrConfig.Bool("sync_sequential", false);
 
         /// <summary>
-        /// Whether the freeze is actually running, which is NOT the same as the
-        /// config above.
-        ///
-        /// Full AFR requires it and does not ask. The whole claim of that mode
-        /// is that the two eyes of a pair are one moment; without the freeze the
-        /// pair is two moments rendered back to back, which is ordinary AFR with
-        /// the frames merely closer together - the artefact intact and twice the
-        /// frame rate paid for it. There is no configuration in which that is
-        /// what someone wanted, so the mode turns it on rather than offering it.
-        ///
-        /// It is also FREE there, which is why the honest cost written down at
-        /// the top of this file does not apply. That cost is "the world advances
-        /// at half the frame rate" - true when a pair spans two display frames.
-        /// Full AFR fits the pair inside one, so the world advances once per
-        /// display frame: full sim rate, and the freeze is pure gain.
+        /// Whether the freeze is running. The config alone since full AFR, which
+        /// forced it on, was removed; kept as its own name because the patch and
+        /// the camera latch ask this, not the config.
         /// </summary>
-        public static bool Engaged =>
-            Enabled || VrRenderMode.FullAfrActive;
+        public static bool Engaged => Enabled;
+
 
         /// <summary>
         /// The tick the world is on. Advances on every frame the simulation was
@@ -120,7 +108,7 @@ namespace BannerlordVR.VR
 // -1 whenever pairing is not actually operating, which is NOT the
                 // same as "sync_sequential = 0".
                 //
-                // This cost a whole round. In AFW the freeze is correctly
+                // This cost a whole round. In DR the freeze is correctly
                 // stood down - both eyes come from one render, so there is
                 // nothing to freeze - but the GENERATION kept being published,
                 // and it now advanced on EVERY frame because no frame was ever
@@ -132,7 +120,7 @@ namespace BannerlordVR.VR
                 //
                 // Pairing is an AFR device. If the freeze is not running, the
                 // pairing it exists to complete must not be running either.
-                bool pairing = Engaged && !VrAfw.Enabled;
+                bool pairing = Engaged && !VrDepthReproject.Enabled;
 
                 NativeMethods.bvr_set_sim_generation(pairing ? Generation : -1);
             }
@@ -171,10 +159,10 @@ namespace BannerlordVR.VR
             if (!Engaged || !VrAfrRenderer.Enabled || !VrCameraDriver.HasPose)
                 return false;
 
-            // AFW builds both eyes out of one render, so they already share a
+            // DR builds both eyes out of one render, so they already share a
             // tick and there is nothing for a freeze to fix. Running it anyway
             // would halve the world rate and buy nothing at all.
-            if (VrAfw.Enabled)
+            if (VrDepthReproject.Enabled)
                 return false;
 
             // AFR flips its eye in MissionScreen.OnFrameTick's postfix, which runs

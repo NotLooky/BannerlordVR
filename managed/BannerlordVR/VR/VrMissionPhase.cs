@@ -19,38 +19,97 @@ namespace BannerlordVR.VR
     /// simply undo the ones that do. Asking here means there is a single
     /// condition to change rather than four to keep in step.
     ///
-    /// DEPLOYMENT IS VANILLA, DELIBERATELY
+    /// DEPLOYMENT IS TWO QUESTIONS, NOT ONE
     ///
     /// Before Ready is pressed, Bannerlord gives the player a free-flying camera
     /// to place their army with. There is no player agent yet, nothing to anchor
-    /// a head to, and no first person to be in - so every VR camera write during
+    /// a head to, and no first person to be in - so every VR LOOK INJECTION in
     /// that phase is a write on top of a camera the player is actively steering
-    /// somewhere else. The result was a camera that drifted and then flew.
+    /// somewhere else. That is what drifted and then flew.
     ///
-    /// So VR does not touch it. The deployment camera stays exactly what the game
-    /// makes it, and the headset shows it on the flat screen - which is the same
-    /// thing it does for the campaign map, and for the same reason: this is a 2D
-    /// RTS view, not a world to stand in.
+    /// The answer used to be to stand the whole mod down for the phase and show
+    /// the game's own window on the flat screen. It does not work, and it cannot:
+    /// the eye texture is bound to the engine's scene view at
+    /// OnSceneRenderingStarted, which fires BEFORE deployment begins. Stand the
+    /// renderer down after that and the world goes on being drawn into a texture
+    /// nobody submits, while the window keeps whatever it last drew - the loading
+    /// screen. Deployment showed a frozen picture with the formation cards on top
+    /// of it, on the monitor and in the headset alike.
+    ///
+    /// So the two halves are separated. RENDERING stays on: deployment is a real
+    /// battlefield seen from a real position, and of all the parts of a battle it
+    /// is the one that is purely about reading terrain - the phase that gains
+    /// most from being stood in. INJECTION stands down: the head moves the view
+    /// and nothing else, and the camera stays the free-flying one the game builds
+    /// from the stick and the mouse. See VrDrivesLook.
     /// </summary>
     public static class VrMissionPhase
     {
         /// <summary>
-        /// 0 puts VR back in charge of the deployment camera, which is what it
-        /// did before - kept because "the camera flies before Ready" and "the
-        /// deployment camera is not what I expected" are different complaints
-        /// and only one of them is fixed by standing down.
+        /// 1 restores the old stand-down: no stereo during deployment, the game's
+        /// own window on the flat screen.
+        ///
+        /// Kept as an escape hatch rather than deleted, but OFF - it never
+        /// delivered the vanilla view it promised. The scene view is retargeted
+        /// before deployment starts, so "hands off" only meant the flat screen
+        /// was showing a window the world had stopped being drawn into.
         /// </summary>
         private static readonly bool VanillaDeployment =
-            VrConfig.Bool("vanilla_deployment", true);
+            VrConfig.Bool("vanilla_deployment", false);
 
         /// <summary>
-        /// Whether VR owns the mission camera this frame.
+        /// Whether VR owns the mission camera this frame - that is, whether the
+        /// stereo path is rendering at all.
         ///
-        /// False during deployment and whenever there is no mission at all. Every
-        /// camera write in the mod is gated on this, so a false here really does
-        /// mean the game is left alone rather than mostly left alone.
+        /// True for the whole of a mission INCLUDING deployment, and false only
+        /// when there is no mission. Everything that decides whether the headset
+        /// gets a world is gated on this.
         /// </summary>
         public static bool VrOwnsCamera { get; private set; }
+
+        /// <summary>
+        /// Whether VR may write the game's own LOOK - inject head movement into
+        /// the camera deltas, force first person, steer the agent's aim.
+        ///
+        /// WHY THIS IS NOT VrOwnsCamera
+        ///
+        /// Rendering and steering are separate permissions, and deployment wants
+        /// exactly one of them. The player is flying the camera themselves; head
+        /// movement added to _cameraBearingDelta on top of that is a second hand
+        /// on the stick, and because the movement axis flies along the camera's
+        /// own heading, a camera that rotates by itself is a camera that departs
+        /// by itself. That is the drift-then-fly, and it belongs to injection
+        /// rather than to rendering.
+        ///
+        /// With this false the head still turns the VIEW - the anchor is the
+        /// engine camera's own heading and the head pose composes on top of it,
+        /// which is free head-look over a camera the game owns outright.
+        ///
+        /// FALSE WITH NO MAIN AGENT TOO (TEST 397). After the player dies the game
+        /// hands over its free camera, the same one deployment flies. Left true,
+        /// the anchor cut froze the heading (nothing integrates BodyHeading without
+        /// an agent, so the right stick turned the culling but not the picture)
+        /// and the restore that stops the origin feeding back never ran, so the
+        /// camera drifted on every frame it moved.
+        /// </summary>
+        public static bool VrDrivesLook { get; private set; }
+
+        /// <summary>
+        /// Whether the game's free camera should fly the deployment way - planar,
+        /// faster with height, stick without the trigger - which is deployment
+        /// itself and the free camera after the player dies (TEST 397). Read by
+        /// FreeCameraFlightPatch and VrGamepad.
+        /// </summary>
+        public static bool FlyLikeDeployment { get; private set; }
+
+        /// <summary>The pre-battle formation phase (MissionMode.Deployment). No
+        /// hands or weapons are posed in it and the laser is on (TEST 570).</summary>
+        public static bool Deploying { get; private set; }
+
+        /// <summary>The order menu is open. Its move-to-flag is confirmed by the
+        /// left mouse or the right trigger (OrderTroopPlacer), so VrHolster gives
+        /// the trigger back to the game meanwhile (TEST 571).</summary>
+        public static bool OrderMenuOpen { get; private set; }
 
         /// <summary>
         /// Whether a user interface is open that the player needs to READ.
@@ -105,8 +164,34 @@ namespace BannerlordVR.VR
         /// </summary>
         public static bool UiWantsOverlay { get; private set; }
 
+        /// <summary>
+        /// Whether a menu that is READ is open - whatever it ends up drawn on.
+        ///
+        /// WHY THIS IS NOT UiWantsScreen
+        ///
+        /// It was, and that is how the pointer died in the pause menu. Classify
+        /// works out that a read-menu is up, and then the panel swap at the end
+        /// of it turns wantsScreen back OFF inside a mission: the flat panel
+        /// shows the game WINDOW, and the window is not being drawn while the
+        /// stereo path owns the frame. The menu is still open. It is floating
+        /// over the world instead of replacing it.
+        ///
+        /// So everything that asked "is a menu open" was reading the answer to a
+        /// different question - "is the flat panel up" - and got false for every
+        /// menu opened during a battle. The stick pointer never activated and
+        /// held directions never repeated, in the one place a menu is hardest to
+        /// work any other way.
+        ///
+        /// This is the menu question, asked once, with no opinion about how the
+        /// menu reaches the headset.
+        /// </summary>
+        public static bool UiMenuOpen { get; private set; }
+
         private static bool _wasMounted;
         private static bool _haveMountState;
+        private static DateTime? _dismountAt;
+        private static readonly float DismountRecentreDelay =
+            Math.Max(0f, VrConfig.Float("dismount_recentre_delay_s", 1.5f));
         private static bool _loggedDeployment;
         private static bool _loggedHandback;
 
@@ -122,39 +207,71 @@ namespace BannerlordVR.VR
                 Mission mission = Mission.Current;
                 if (mission == null)
                 {
-                    VrOwnsCamera = false;
+                    // The stereo campaign map renders like a battle - mirror, keyed
+                    // interface over the world - but never has its look driven.
+                    bool map = VrMapStereo.Live;
+                    VrOwnsCamera = map;
+                    VrDrivesLook = false;
+                    FlyLikeDeployment = false;
+                    Deploying = false;
+                    OrderMenuOpen = false;
+                    UiWantsScreen = false;
+                    UiWantsOverlay = map;
+                    UiMenuOpen = false;
                     _haveMountState = false;
                     return;
                 }
 
-                bool deploying = VanillaDeployment && mission.Mode == MissionMode.Deployment;
+                bool deployment = mission.Mode == MissionMode.Deployment;
+                Deploying = deployment;
+                OrderMenuOpen = mission.CurrentState == Mission.State.Continuing
+                    && ScreenManager.TopScreen is MissionScreen orderScreen && ReadOrderMenu(orderScreen);
 
-                if (deploying && !_loggedDeployment)
+                // The old stand-down, kept behind a switch. It takes the stereo
+                // path away as well, which is what made deployment a frozen
+                // picture; see the class note.
+                bool standDown = VanillaDeployment && deployment;
+
+                if (deployment && !_loggedDeployment)
                 {
                     _loggedDeployment = true;
-                    VrLog.Info("Deployment: VR has let go of the camera entirely, so moving "
-                               + "the army from the air behaves exactly as it does without "
-                               + "the mod. The headset shows it on the flat screen until "
-                               + "Ready is pressed. Set vanilla_deployment = 0 to take it "
-                               + "back.");
+                    VrLog.Info(standDown
+                        ? "Deployment: VR has stood down completely (vanilla_deployment = 1). "
+                          + "Expect a frozen picture - the engine's scene view is already "
+                          + "bound to the eye texture by this point, so nothing is drawing "
+                          + "into the window the flat screen shows. Set it back to 0."
+                        : "Deployment in VR: the battlefield is rendered in stereo and you "
+                          + "look around it with your head. The camera itself is the game's "
+                          + "own free-flying one - VR injects no look input until Ready is "
+                          + "pressed, so flying it behaves exactly as it does without the "
+                          + "mod. vanilla_deployment = 1 stands the whole path down again.");
                 }
 
-                if (!deploying && _loggedDeployment && !_loggedHandback)
+                if (!deployment && _loggedDeployment && !_loggedHandback)
                 {
                     _loggedHandback = true;
-                    VrLog.Info("Deployment over; VR has the camera and the stereo path is "
-                               + "live.");
+                    VrLog.Info("Deployment over; VR has the look as well as the camera.");
                 }
 
-                VrOwnsCamera = !deploying;
+                VrOwnsCamera = !standDown;
+
+                // The one permission deployment does not get. Everything that
+                // WRITES the game's look reads this rather than VrOwnsCamera, so
+                // the free-flying camera stays entirely the player's.
+                bool noAgent = mission.MainAgent == null;
+                VrDrivesLook = VrOwnsCamera && !deployment && !noAgent;
+                FlyLikeDeployment = VrOwnsCamera
+                    && (deployment || (mission.Mode == MissionMode.Battle && noAgent));
 
                 bool wantsOverlay = false;
                 bool wantsScreen = false;
+                bool menuOpen = false;
 
-                if (!deploying)
-                    Classify(mission, out wantsScreen, out wantsOverlay);
+                if (!standDown)
+                    Classify(mission, out wantsScreen, out wantsOverlay, out menuOpen);
 
                 UiWantsScreen = wantsScreen;
+                UiMenuOpen = menuOpen;
 
                 // Opaque wins. A wheel under an escape menu is not what is being
                 // looked at, and submitting both would key one over the other.
@@ -261,7 +378,7 @@ namespace BannerlordVR.VR
             string name;
             try
             {
-                name = layer.GetType().Name;
+                name = layer.Name;
             }
             catch
             {
@@ -290,7 +407,13 @@ namespace BannerlordVR.VR
 
                 foreach (ScreenLayer layer in top.Layers)
                 {
-                    if (layer == null || ReferenceEquals(layer, scene) || !layer.IsActive)
+                    // The two deployment order layers both request the mouse
+                    // while the camera is idle; neither is a separate menu.
+                    // VrCursorLayer only frees the mouse for the VR panel.
+                    if (layer == null || ReferenceEquals(layer, scene) || !layer.IsActive
+                        || layer is VrCursorLayer
+                        || (Deploying && layer is TaleWorlds.Engine.GauntletUI.GauntletLayer g
+                            && (VrLaser.IsDeploymentLayer(g.Name) || g.Name == "MissionOrder")))
                         continue;
 
                     if (layer.IsFocusLayer)
@@ -411,10 +534,12 @@ namespace BannerlordVR.VR
         /// <summary>
         /// Sorts whatever is open into the two treatments. See UiWantsOverlay.
         /// </summary>
-        private static void Classify(Mission mission, out bool wantsScreen, out bool wantsOverlay)
+        private static void Classify(Mission mission, out bool wantsScreen,
+                                     out bool wantsOverlay, out bool menuOpen)
         {
             wantsScreen = false;
             wantsOverlay = false;
+            menuOpen = false;
 
             if (!UiOnScreen)
                 return;
@@ -491,6 +616,24 @@ namespace BannerlordVR.VR
                 // narrower than making either of them lie about what they do.
                 wantsOverlay = true;
 
+                // AND IT IS A MENU, whatever the panel does with it.
+                //
+                // menuOpen is set here rather than left to the assignment at
+                // the end of Classify, which this return skips. That one reads
+                // menuOpen = wantsScreen - "a menu is open" taken from "the
+                // flat panel is up" - and the two came apart the moment
+                // conversation moved onto the overlay: the dialogue went to
+                // the world, wantsScreen stayed false, and the mod believed no
+                // menu was open for the whole conversation.
+                //
+                // What that cost is the POINTER. VrStickMouse.InMenu and
+                // VrGamepad.InMenu both ask this property, so the stick mouse
+                // never took hold of the cursor, the pad lost its priority to
+                // the idle timer while the player was reading, and held
+                // directions lost their repeat - in the one screen that is
+                // nothing but a list of lines to click.
+                menuOpen = true;
+
                 // AND NOTHING BELOW GETS A SAY.
                 //
                 // Returning rather than setting a flag, because every test that
@@ -551,6 +694,12 @@ namespace BannerlordVR.VR
             // Outside a mission nothing changes: the window is genuinely live
             // there, which is the case the panel was designed for and is still
             // the right answer for the main menu and the campaign map.
+            // TAKEN BEFORE THE SWAP BELOW, which is the whole reason there are
+            // two flags. From here down wantsScreen means "put it on the panel",
+            // and in a mission the answer to that is no while the answer to "is
+            // a menu open" is still yes.
+            menuOpen = wantsScreen;
+
             if (wantsScreen && !ScreenPanelIsLive)
             {
                 wantsScreen = false;
@@ -608,11 +757,36 @@ namespace BannerlordVR.VR
 
             bool mounted = agent.HasMount;
 
+            // TEST 292. Not on the transition frame: that is mid-dismount, and the
+            // view came out high until F10 was pressed later. The recentre waits
+            // out the dismount and then runs once, the same as the key.
             if (_haveMountState && _wasMounted && !mounted)
+                _dismountAt = DateTime.UtcNow;
+
+            if (mounted)
+                _dismountAt = null;
+            else if (_dismountAt.HasValue
+                     && (DateTime.UtcNow - _dismountAt.Value).TotalSeconds >= DismountRecentreDelay)
             {
-                VrCameraDriver.RequestRecentre();
-                VrLog.Info("Dismounted; recentred so the character faces where you are "
-                           + "looking rather than where the horse was pointing.");
+                _dismountAt = null;
+
+                // TEST 449: under the head-driven body the dismount rides the
+                // animation and glides onto the standing body (VrHeadBody.Saddled,
+                // the anchor seam), and the body turns after the head on its own -
+                // the recentre would only snap the view's yaw, which mounting never does.
+                if (VrHeadBody.HoldsDismount)
+                {
+                    VrLog.Info("TEST 449: dismounted; no TEST 292 recentre - the hand-over glides the view "
+                               + "onto the standing body instead (dismount_hold = 0 brings it back).");
+                }
+                else
+                {
+                    VrCameraDriver.RequestRecentre(keepHeight: true);
+                    VrLog.Info(string.Format(
+                        "TEST 292: dismounted {0:F1} s ago; recentred so the view sits on the body and "
+                        + "the character faces where you are looking rather than where the horse was "
+                        + "pointing.", DismountRecentreDelay));
+                }
             }
 
             _wasMounted = mounted;
@@ -623,6 +797,7 @@ namespace BannerlordVR.VR
         {
             _haveMountState = false;
             _wasMounted = false;
+            _dismountAt = null;
             _loggedDeployment = false;
             _loggedHandback = false;
         }

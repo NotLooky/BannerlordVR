@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -71,6 +71,55 @@ namespace BannerlordVR.Interop
         public BvrHandState Right;
     }
 
+    /// <summary>TEST 377: where the wrist HUDs' widgets are, in window pixels.
+    /// Rects is [hand][region][x, y, w, h], hand 0 = left. 144 bytes, matching
+    /// bvr_api.h.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BvrWristRegions
+    {
+        public const int MaxRegions = 4;
+
+        public float ScreenWidth;
+        public float ScreenHeight;
+        public int CountLeft;
+        public int CountRight;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 2 * MaxRegions * 4)]
+        public float[] Rects;
+    }
+
+    /// <summary>TEST 590: which parts of the interface image are the world page
+    /// (at 0,0) and the HUD page (at HudX,0), in window pixels. 36 bytes, matching
+    /// bvr_api.h.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BvrUiSplit
+    {
+        public int Active;
+        public float ScreenWidth;
+        public float ScreenHeight;
+        public float WorldW;
+        public float WorldH;
+        public float HudX;
+        public float HudW;
+        public float HudH;
+        /// <summary>The HUD quad's width in metres; it hangs at the world panel's
+        /// distance, so the two never disagree in depth.</summary>
+        public float HudWidthM;
+    }
+
+    /// <summary>TEST 378: where the laser landed this frame. 24 bytes, matching
+    /// bvr_api.h. Target 1 = the game's interface, 2 = the VR panel.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BvrLaser
+    {
+        public int Valid;
+        public int Hand;
+        public int Target;
+        public float U;
+        public float V;
+        public float Distance;
+    }
+
     /// <summary>What the calibration is currently doing. Pushed to the panel;
     /// the panel only reads it, because starting and stopping are its requests
     /// rather than its decisions - see <see cref="BvrCalibCommand"/>.</summary>
@@ -118,7 +167,7 @@ namespace BannerlordVR.Interop
         public float WorldScale;
         public float RenderScale;
 
-        /// <summary>0 = alternate-frame, 1 = native stereo, 2 = AFW.</summary>
+        /// <summary>0 = alternate-frame, 1 = native stereo, 2 = DR.</summary>
         public int StereoMode;
 
         /// <summary>Push-only: a mode is waiting on a scene restart.</summary>
@@ -192,6 +241,256 @@ namespace BannerlordVR.Interop
         /// Appended LAST, matching bvr_api.h, so no earlier field moves.
         /// </summary>
         public float Sharpen;
+
+        /// <summary>
+        /// Menu pointer speed, in screen widths per second at full stick. Two-way
+        /// and applied live. Nothing native reads it - it is a managed setting
+        /// that rides this struct because the panel is the only place it can be
+        /// changed from inside a headset. Appended LAST, matching bvr_api.h.
+        /// </summary>
+        public float StickMouseSpeed;
+
+        /// <summary>
+        /// Poll-only. 1 when the panel's "Apply now" button under the resolution
+        /// slider has been clicked; cleared by the native side as it is read, so
+        /// one click is one rebuild.
+        ///
+        /// The slider itself is half live without this: shading the scene at a
+        /// smaller fraction of the eye target is immediate, and there is nothing
+        /// to rebuild for it. Raising the resolution has no detail to ask for
+        /// until the targets themselves are bigger, which is what Apply does.
+        /// Appended LAST, matching bvr_api.h, so no earlier field moves.
+        /// </summary>
+        public int ResolutionApply;
+
+        /// <summary>Push-only, so the button can report rather than the player
+        /// wondering what a black flash meant: 0 idle, 1 rebuilding, 2 live at
+        /// the new size, 3 failed.</summary>
+        public int ResolutionState;
+
+        /// <summary>
+        /// Physical collision combat (TEST 244): the player's swings hit, their
+        /// raised shield blocks, and arrows stop on it. Two-way, like HideBody,
+        /// so the panel's checkbox shows the truth and clicking it means
+        /// something. Off leaves motion-control hands and weapons posed and the
+        /// game's own trigger attacks in charge - nothing of this mod's physics
+        /// remains. Appended LAST, matching bvr_api.h.
+        /// </summary>
+        public int PhysicalCombat;
+
+        /// <summary>
+        /// The full-body IK (TEST 253-257): the pelvis and torso follow the
+        /// player, the legs are solved to the game's own gait, and the held body
+        /// (body_anim = legs) keeps the animation off the torso. Two-way, like
+        /// HideBody. Off reverts to the normal animated body: no follow, no leg
+        /// solve, no held pose, and the camera anchors to the engine's own head
+        /// again. Appended LAST, matching bvr_api.h.
+        /// </summary>
+        public int BodyIk;
+
+        /// <summary>
+        /// Motion-control combat (TEST 245-252): swings write the game's own
+        /// attack direction, a raised hand is the guard, the blade lands the hit
+        /// itself and the body holds still through engine attacks. Two-way, like
+        /// the toggles above. Off is the game's own combat - the trigger and the
+        /// movement stick - with every animation playing. Appended LAST,
+        /// matching bvr_api.h.
+        /// </summary>
+        public int MotionMelee;
+
+        /// <summary>
+        /// Friendly fire (TEST 261): whether a physical swing can land on
+        /// friends and neutrals. Off by default - the vanilla single-player
+        /// rule, enemies only. Two-way, like the toggles above; missions that
+        /// forbid friendly fire refuse it either way. Appended LAST, matching
+        /// bvr_api.h.
+        /// </summary>
+        public int FriendlyFire;
+
+        /// <summary>
+        /// Which controller the grip calibration saves under - the dropdown on
+        /// the Calibration section. Two-way. Appended LAST, matching bvr_api.h.
+        /// </summary>
+        public int GripController;
+
+        /// <summary>Body holsters (TEST 271). Two-way. Appended LAST, matching
+        /// bvr_api.h.</summary>
+        public int Holster;
+
+        /// <summary>The campaign map in VR (map_stereo). Two-way. Appended LAST,
+        /// matching bvr_api.h.</summary>
+        public int MapVr;
+
+        /// <summary>The VR tab (TEST 293): the head camera's offset along the
+        /// body's heading in metres, and the body-turn deadzone in degrees.
+        /// Two-way. Recenter is the panel's one-shot, like ResolutionApply.
+        /// Appended LAST, matching bvr_api.h.</summary>
+        public float HeadUp;
+        public float HeadForward;
+        public float BodyTurnDeg;
+        public int Recenter;
+
+        /// <summary>
+        /// Hands only. Two-way, like HideBody, and only has an effect while
+        /// HideBody is on: keeps the hand meshes drawn alongside the weapon
+        /// instead of hiding everything but the weapon. Appended LAST, matching
+        /// bvr_api.h.
+        /// </summary>
+        public int HandsOnly;
+
+        /// <summary>TEST 356, the VR tab: the player's standing height in metres
+        /// (0 = the game's own size), a one-shot "measure now", and the scale it
+        /// gave (push-only). Appended LAST, after HandsOnly.</summary>
+        public float PlayerHeight;
+        public int HeightMeasure;
+        public float BodyScale;
+
+        /// <summary>TEST 377e: the wrist HUD's width in metres. Two-way; native
+        /// applies it the moment the slider moves, managed saves it.</summary>
+        public float WristHudWidth;
+
+        /// <summary>TEST 427: foveated rendering (NVIDIA VRS), 0 off, 1 wide,
+        /// 2 balanced, 3 narrow. Two-way; native applies it the moment the
+        /// dropdown moves, managed saves it.</summary>
+        public int Vrs;
+
+        /// <summary>TEST 428: 1 = the VRS centre follows the eye tracker's gaze.
+        /// Two-way; native applies it, managed saves vrs_eye.</summary>
+        public int VrsEye;
+
+        /// <summary>TEST 442: the head camera's height in the saddle, metres -
+        /// used instead of HeadUp while riding. Two-way; managed saves
+        /// head_offset_mounted_up_m.</summary>
+        public float HeadUpMounted;
+
+        /// <summary>TEST 450: the arms' length against the character's own,
+        /// 0.80-1.30. Two-way; managed saves arm_length_scale.</summary>
+        public float ArmScale;
+
+        /// <summary>TEST 447: seconds the chest takes to follow the head's turn,
+        /// 0 = instant. Two-way; managed saves body_weight_s.</summary>
+        public float BodyWeight;
+
+        /// <summary>TEST 462: 1 = the crosshair's hit marker shows (no reticle).
+        /// Two-way; managed saves hud_hit_marker.</summary>
+        public int HudHitMarker;
+
+        /// <summary>TEST 462: 1 = the pickup prompt (item name and button) shows.
+        /// Two-way; managed saves hud_prompts.</summary>
+        public int HudPrompts;
+
+        /// <summary>TEST 485: 1 = five-finger hands (VrHandMesh). Two-way;
+        /// managed saves finger_mesh.</summary>
+        public int HandFingers;
+
+        /// <summary>TEST 527: the campaign map palette's width in metres, apart
+        /// from WristHudWidth (the battle wrists). Two-way; native applies it,
+        /// managed saves hand_ui_width_m.</summary>
+        public float MapHandUiWidth;
+
+        /// <summary>1 = the left thumbrest is a D-pad modifier for the right
+        /// stick too. Two-way; managed saves dpad_thumbrest.</summary>
+        public int DpadThumbrest;
+
+        /// <summary>TEST 620: battle markers / campaign map labels size, x the
+        /// game's UI scale (VrUiSplit). Two-way; managed saves
+        /// ui_world_scale_battle / ui_world_scale_map.</summary>
+        public float UiWorldScaleBattle;
+        public float UiWorldScaleMap;
+
+        /// <summary>TEST 645: 1 = the weapon is solid against your own shield
+        /// (TEST 642). Two-way; managed saves collide_own_shield.</summary>
+        public int OwnShieldBash;
+
+        /// <summary>TEST 648: the pre-battle formation markers' size (VrUiSplit).
+        /// Two-way; managed saves ui_world_scale_deploy_markers.</summary>
+        public float UiWorldScaleDeploy;
+
+        /// <summary>TEST 711: re-centre a new screen (1/0), and only when the head is
+        /// turned more than UiRecenterAngle degrees away. Two-way; managed saves
+        /// ui_recenter_new_screen and ui_recenter_angle.</summary>
+        public int UiRecenterNewScreen;
+        public float UiRecenterAngle;
+
+        /// <summary>fov_true_vertical (1/0): symmetric across, the runtime's own
+        /// up/down. Two-way; managed saves fov_true_vertical.</summary>
+        public int FovTrueVertical;
+
+        /// <summary>TEST 750, the Calibration tool tab. ToolMode (0 weapon, 1 hand
+        /// grip) and ToolHand (0 main, 1 off) are the panel's, echoed back.
+        /// ToolLive is push-only: 1 held now, 0 dropped (sliders grey, saves
+        /// stay), -1 nothing. ToolValue is x, y, z m then yaw, pitch, roll deg.
+        /// ToolCommand is poll-only, see <see cref="BvrToolCommand"/>. Appended
+        /// LAST, matching bvr_api.h.</summary>
+        public int ToolMode;
+        public int ToolHand;
+        public int ToolLive;
+        public int ToolCommand;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)]
+        public float[] ToolValue;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string ToolLabel;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+        public string ToolStatus;
+
+        /// <summary>TEST 751: 0 Original, 1 Profile 1, 2 Profile 2 - two-way.
+        /// ToolWielded: the main hand's slot 0..3 or -1, push-only. ToolSlot0..3:
+        /// the weapon slots' names, "" when empty, push-only. Appended LAST.</summary>
+        public int ToolProfile;
+        public int ToolWielded;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 48)]
+        public string ToolSlot0;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 48)]
+        public string ToolSlot1;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 48)]
+        public string ToolSlot2;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 48)]
+        public string ToolSlot3;
+
+        /// <summary>TEST 770: fov crop tangent multipliers, 0.5-1.0. Two-way;
+        /// managed saves fov_crop_h / fov_crop_v. Appended LAST.</summary>
+        public float FovCropH;
+        public float FovCropV;
+
+        /// <summary>TEST 785: detailed fov crop - 1 = the four edges apply instead
+        /// of FovCropH/V. Two-way; managed saves fov_crop_detailed / _left /
+        /// _right / _up / _down. Appended LAST.</summary>
+        public int FovCropDetailed;
+        public float FovCropLeft;
+        public float FovCropRight;
+        public float FovCropUp;
+        public float FovCropDown;
+
+        /// <summary>TEST 790: sharpener, 0 CAS / 1 RCAS. Two-way; managed saves
+        /// sharpen_mode. Appended LAST.</summary>
+        public int SharpenMode;
+
+        /// <summary>TEST 797: DLSS preset - the cfg's dlss_preset (0 auto, 10-13 J-M,
+        /// -1 DLSS's own). Two-way; managed saves it. Appended LAST.</summary>
+        public int DlssPreset;
+        public int GripToggle;
+    }
+
+    /// <summary>TEST 750: the Calibration tool's buttons. SAME VALUES as
+    /// BVR_TOOL_CMD_* in bvr_api.h.</summary>
+    public enum BvrToolCommand
+    {
+        None = 0,
+        Adjust = 1,      // a slider moved; ToolValue carries it
+        SaveItem = 2,
+        SaveClass = 3,
+        Zero = 4,
+        Revert = 5,
+        SaveHand = 6,
+        Equip0 = 7,      // 7..10: wield weapon slot 0..3 (TEST 751)
+        Sheathe = 11,
     }
 
     /// <summary>
@@ -329,6 +628,36 @@ namespace BannerlordVR.Interop
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int bvr_end_texture_capture(int eye);
 
+        /// <summary>The same capture bracket for the interface render target
+        /// (TEST 299). See VrUiTarget.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_begin_ui_capture(uint width, uint height);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_end_ui_capture();
+
+        /// <summary>1 while the Gauntlet views are drawing into the dense UI
+        /// target, 0 while they are back on the game window. Native keys and
+        /// submits whichever one this names.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_ui_source(int fromTarget);
+
+        /// <summary>TEST 531: the campaign map bar's own render target (BVR_HAND),
+        /// captured like the UI target. bvr_set_hand_source(1) while the MapBar
+        /// layer draws into it; the state is 0 off, 1 checking, 2 content seen,
+        /// 3 empty (swap the view back).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_begin_hand_capture(uint width, uint height);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_end_hand_capture();
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_hand_source(int live);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_get_hand_source_state();
+
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int bvr_set_used_views([In] BvrEyeView[] views, long displayTime);
 
@@ -368,7 +697,7 @@ namespace BannerlordVR.Interop
         /// Ask before pinning the source eye - see VrAfrRenderer.AlternatesEye.
         /// </summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int bvr_afw_ready();
+        internal static extern int bvr_depth_reproject_ready();
 
         /// <summary>Stamps which piece of managed VR code is in flight, so the
         /// native crash logger can name it. See VrBreadcrumb.</summary>
@@ -414,21 +743,6 @@ namespace BannerlordVR.Interop
         internal static extern int bvr_set_sim_generation(int generation);
 
         /// <summary>
-        /// Whether full AFR is running: two game frames inside one display
-        /// frame, so both eyes of a pair are real renders of one simulation
-        /// tick at the full refresh rate.
-        ///
-        /// The native side needs it because the first Present of a pair must
-        /// hand its begun XR frame BACK rather than end it - that is what makes
-        /// the second eye render from the same locate and the same world, and
-        /// what makes the pair go up together. Published every frame beside the
-        /// eye index; nothing infers it from the mode, because the mode can
-        /// change between a deferred frame and its partner.
-        /// </summary>
-        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int bvr_set_full_afr(int active);
-
-        /// <summary>
         /// Whether draw-duplication stereo is the running mode. The native side
         /// owns the duplication, so it has to be told - and it must be OFF for
         /// every other mode, or enabling the path would change what AFR does.
@@ -453,12 +767,115 @@ namespace BannerlordVR.Interop
         internal static extern int bvr_set_mission_active(int active);
 
         /// <summary>
+        /// Rebuilds the eye swapchains at a new render scale, live.
+        ///
+        /// A HANDSHAKE, not a call. The eye TEXTURES belong to the engine and
+        /// only this side can release and re-ask for them; the SWAPCHAINS belong
+        /// to OpenXR and only the frame-loop thread may touch them. So each half
+        /// watches a stage rather than blocking on the other. VrResolution owns
+        /// the sequence; see the note there and the longer one in xr_context.cpp.
+        ///
+        /// scale is ABSOLUTE, 0.25 to 1.0 - the same number render_scale holds -
+        /// and is passed rather than re-read from the config because the write
+        /// and this call would otherwise race.
+        /// </summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_request_rescale(float scale);
+
+        /// <summary>Managed has the new textures; rebuild the swapchains to
+        /// match. The first irreversible step, deliberately last.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_rescale_swap();
+
+        /// <summary>rgl would not allocate at the new size. Puts the view
+        /// configs back to the previous scale - which the untouched swapchains
+        /// still fit - so managed can re-allocate and get a picture back.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_rescale_abort(float previousScale);
+
+        /// <summary>0 idle, 1 draining frames, 2 let go and re-sized with the
+        /// swapchains untouched, 3 swapping them over, 4 failed.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_rescale_stage();
+
+        /// <summary>Tells native the new targets are live and the normal frame
+        /// path may resume.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_rescale_finish();
+
+        /// <summary>
         /// Composite the game interface OVER the world instead of replacing it.
         /// For menus meant to be used while playing - the tactics wheel above
         /// all, which is useless without the field behind it.
         /// </summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int bvr_set_ui_overlay(int active);
+
+        /// <summary>ui_per_eye: this frame's interface was laid out for
+        /// <paramref name="eye"/>, projected from this head pose (stage, OpenXR
+        /// axes). See VrUiProjection.</summary>
+        /// <summary>World units per metre of the published eyes: 1 in a battle, the
+        /// table's scale on the campaign map (native stereo's IPD bounds, TEST 287).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_stereo_world_scale(float unitsPerMetre);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_ui_projection(int eye, float px, float py, float pz,
+                                                         float qx, float qy, float qz, float qw);
+
+        /// <summary>TEST 377: the wrist HUDs' widget rectangles. Native crops them
+        /// onto each inner wrist and punches them off the head panel.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_wrist_regions(ref BvrWristRegions regions);
+
+        /// <summary>TEST 590: the interface image shared out between the world
+        /// panel, the HUD and the hands. Active 0 = one full-window image.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_ui_split(ref BvrUiSplit split);
+
+        /// <summary>TEST 591: draw the interface at factor x the window (0 off).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_ui_supersample(float factor);
+
+        /// <summary>TEST 591: 0 off, 1 drawing into the dense target, 2 armed but
+        /// the interface never reached the window's backbuffer.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_get_ui_supersample();
+
+        /// <summary>TEST 377d: the wrist panel's pose on the DRAWN wrist, in stage
+        /// space (OpenXR axes, metres). valid 0 returns that hand to the
+        /// controller-relative placement.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_wrist_pose(int hand, int valid, float px, float py, float pz,
+                                                      float qx, float qy, float qz, float qw);
+
+        /// <summary>TEST 378: whether the laser may point at the game's interface,
+        /// from which hand, whether to draw its beam there, and the active hand's
+        /// trigger (for the VR panel).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_laser(int enabled, int hand, int beamToUi, int click,
+                                                  float groundDistance);
+
+        /// <summary>TEST 378: where the laser landed on the last frame native drew.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_get_laser(out BvrLaser laser);
+
+        /// <summary>TEST 651: the laser ray as drawn (stage space, smoothed), when
+        /// that hand was drawn in the last 100 ms.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_get_laser_ray(int hand, out BvrVec3 origin, out BvrVec3 dir);
+
+        /// <summary>TEST 378: pin the interface quad in the room while a menu is open.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_ui_pin(int pinned);
+
+        /// <summary>TEST 379: ui_eye_lag per context (the map vs a mission).</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_set_ui_eye_lag(int lag);
+
+        /// <summary>TEST 633: display refreshes per app frame, smoothed.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern float bvr_get_periods_per_frame();
 
         /// <summary>
         /// Whether a mission exists at all - distinct from whether the STEREO
@@ -487,22 +904,27 @@ namespace BannerlordVR.Interop
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int bvr_repin_flat_screen();
 
+        /// <summary>TEST 710: re-pins only if the head is turned more than
+        /// <paramref name="degrees"/> away from the screen.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_repin_flat_screen_if_turned(float degrees);
+
         /// <summary>
         /// Selects which of the three single-render stereo modes runs, and hands
         /// over the stereo geometry they need.
         ///
         ///   0  AFR - the eye that was not rendered is HELD from its own last
         ///      real render and submitted with the pose it was drawn at.
-        ///   1  AFW - that eye is SYNTHESISED from the rendered one through its
+        ///   1  DR - that eye is SYNTHESISED from the rendered one through its
         ///      depth buffer, so both eyes come from one instant.
-        ///   2  AFW+AFR hybrid - held while the head is still, warped once it
+        ///   2  DR+AFR hybrid - held while the head is still, warped once it
         ///      moves.
         ///
         /// The geometry is applied in every mode including 0; the reticle places
         /// itself from the same focal length and baseline under AFR.
         /// </summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int bvr_set_afw(int mode, float focalPx, float baseline,
+        internal static extern int bvr_set_depth_reproject(int mode, float focalPx, float baseline,
                                                float zNear, float zFar);
 
         // --- settings panel --------------------------------------------------
@@ -522,6 +944,11 @@ namespace BannerlordVR.Interop
         /// <summary>1 when the panel is on screen.</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int bvr_overlay_visible();
+
+        /// <summary>Mouse-wheel notches for the panel; the render thread cannot
+        /// read the wheel itself.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int bvr_overlay_scroll(float notches);
 
         /// <summary>Shows or hides the panel outright. The calibration key opens
         /// it ON the calibration tab, and a toggle would close it for anyone who
@@ -561,8 +988,74 @@ namespace BannerlordVR.Interop
         internal static extern int bvr_set_vp_frame_other([In] float[] data, int floatCount,
                                                           int eye, int valid);
 
+        [DllImport(Dll, EntryPoint = "bvr_get_input_state", CallingConvention = CallingConvention.Cdecl)]
+        private static extern int bvr_get_input_state_native(out BvrInputState state);
+
+        /// <summary>TEST 452: once per game frame, before the hands are posed - the
+        /// game thread locates both controllers for its own moment plus leadFrames
+        /// display periods, and every bvr_get_input_state after it takes its poses
+        /// from that sample (buttons stay the newest).</summary>
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int bvr_get_input_state(out BvrInputState state);
+        internal static extern int bvr_latch_input(float leadFrames);
+
+        /// <summary>TEST 482: the touch sensors - the left hand in bits 0-7, the
+        /// right in 8-15, each a VrFingerRig.Touch* set. Never swapped by
+        /// controls_swap_trigger_grip: the finger hands read the physical controls.</summary>
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern uint bvr_get_finger_touch();
+
+        /// <summary>The controllers, with controls_swap_trigger_grip applied: on,
+        /// the GRIP does everything the trigger did (two-hand hold, the slide,
+        /// holsters, the bow string, menus) and the TRIGGER is the grip - the
+        /// game's bumpers. Swapped here, where every reader gets its state, so no
+        /// reader can miss it.</summary>
+        internal static int bvr_get_input_state(out BvrInputState state, bool battleGrip = false)
+        {
+            int status = bvr_get_input_state_native(out state);
+            if (status == (int)BvrStatus.Ok && SwapTriggerGrip)
+            {
+                SwapTriggerAndGrip(ref state.Left);
+                SwapTriggerAndGrip(ref state.Right);
+            }
+
+            if (status == (int)BvrStatus.Ok)
+                VR.VrGrip.Read(ref state, battleGrip);
+            return status;
+        }
+
+        private static bool? _swapTriggerGrip;
+
+        /// <summary>The physical grip of a hand read through bvr_get_input_state,
+        /// whatever controls_swap_trigger_grip says.</summary>
+        internal static float PhysicalGrip(in BvrHandState hand) =>
+            SwapTriggerGrip ? hand.Trigger : hand.Grip;
+
+        /// <summary>The physical trigger, likewise.</summary>
+        internal static float PhysicalTrigger(in BvrHandState hand) =>
+            SwapTriggerGrip ? hand.Grip : hand.Trigger;
+
+        private static bool SwapTriggerGrip
+        {
+            get
+            {
+                if (!_swapTriggerGrip.HasValue)
+                    _swapTriggerGrip = VR.VrConfig.Bool("controls_swap_trigger_grip", false);
+                return _swapTriggerGrip.Value;
+            }
+        }
+
+        private static void SwapTriggerAndGrip(ref BvrHandState hand)
+        {
+            float trigger = hand.Trigger;
+            hand.Trigger = hand.Grip;
+            hand.Grip = trigger;
+
+            const int both = (int)BvrButton.Trigger | (int)BvrButton.Grip;
+            int was = hand.Buttons;
+            hand.Buttons = (was & ~both)
+                           | ((was & (int)BvrButton.Trigger) != 0 ? (int)BvrButton.Grip : 0)
+                           | ((was & (int)BvrButton.Grip) != 0 ? (int)BvrButton.Trigger : 0);
+        }
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int bvr_trigger_haptic(int hand, float amplitude, float durationSeconds);

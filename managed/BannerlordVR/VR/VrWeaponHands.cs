@@ -84,10 +84,50 @@ namespace BannerlordVR.VR
         private static bool _haveRoot;
 
         private static bool _loggedMounted;
+        private static int _mountYawTick;
 
         private static bool _broken;
         private static bool _loggedBones;
         private static bool _loggedDriving;
+
+        // Whether the weapon pass ran this tick at all. When it did not - no
+        // agent, nothing posed, calibration sampling - every held item is handed
+        // back to the engine rather than left on the last pose (TEST 228).
+        private static bool _droveWeapons;
+
+        // Per hand: was it posed this tick, and the frame the entity drive would
+        // use. The weapon pass runs after the entitial rebuild, and the bones it
+        // reads are only this frame's once that has run, so the pose is written
+        // down here and the weapons are placed from it there.
+        private static readonly bool[] _posed = new bool[2];
+        private static readonly MatrixFrame[] _posedWorld = new MatrixFrame[2];
+
+        // Paused: which hands the last unpaused tick posed, and the clock that
+        // tells a stopped mission from a ticking one.
+        private static readonly bool[] _posedLast = new bool[2];
+        private static float _missionTime = -1f;
+        private static long _missionTimeMovedAt;
+        private static bool _loggedPause;
+
+        /// <summary>Which seam writes the weapons: "predisplay" (default) is the
+        /// last hook before the frame is drawn, owned by VrLateWeapon; anything
+        /// else leaves it at AfterMissionTick. Config-switchable so the two can
+        /// be compared in one session - TEST 216 chose predisplay and the
+        /// journal's live cfg carries it.</summary>
+        private static readonly string Seam = VrConfig.String("weapon_seam", "predisplay")
+            .Trim().ToLowerInvariant();
+        private static readonly bool LateSeam = Seam == "predisplay";
+
+        /// <summary>weapon_refresh: rebuild the agent's renderer data at the
+        /// pre-display seam. TEST 209: that rebuild is what lands the write -
+        /// the weapon read back 0.000 m from the hand, both hands, every sample.</summary>
+        private static readonly bool RefreshRenderer = VrConfig.Bool("weapon_refresh", true);
+
+        /// <summary>TEST 662: the finger copies swap in LateWeaponPass, before its
+        /// renderer rebuild (VrHandMesh.LateShow); off that seam, at AfterMissionTick.</summary>
+        internal static bool ShowsFingersLate => LateSeam && RefreshRenderer;
+
+        private static bool _loggedSeam;
 
         // Bones written this frame and the entitial frame each was aimed at, held
         // until the entitial frames have been recomputed. Two hands, so two slots.
@@ -100,6 +140,26 @@ namespace BannerlordVR.VR
         private static int _alignTick;
 
         public static void Tick()
+        {
+            _droveWeapons = false;
+            _posed[0] = false;
+            _posed[1] = false;
+
+            // The weapon tuner, before anything of ours writes: TEST 229's
+            // numpad keys move the LIVE copy, so it has to run while the copy is
+            // what the last frame left, not what this frame is about to write.
+            VrSkinnedWeapon.TuneTick();
+
+            TickCore();
+
+            // A frame that drove nothing gives the items back - including every
+            // early return above, which is the whole point: a copy left behind
+            // when a hand stops being driven is worse than the vanilla weapon.
+            if (!_droveWeapons)
+                VrSkinnedWeapon.Release(Mission.Current?.MainAgent);
+        }
+
+        private static void TickCore()
         {
             if (!Enabled || _broken)
                 return;
@@ -122,7 +182,15 @@ namespace BannerlordVR.VR
                 if (NativeMethods.bvr_get_input_state(out BvrInputState input) != (int)BvrStatus.Ok)
                     return;
 
+                BvrInputState physicalInput = input;
+                VrGrip.Read(ref input, battle: true);
                 DescribeSkeletonOnce(skeleton);
+
+                // TEST 384: the idle hold, before ANYTHING reads the bones - while
+                // held, the engine has stopped animating and the skeleton still
+                // carries our last pose, so the reference pose goes back first.
+                VrBodyFreeze.Idle(agent, entity, skeleton);
+                VrBodyFreeze.Cloth(agent, entity);
 
                 // Before anything is written this frame, so it sees the bones as
                 // the animation left them. See VrArmSeam for what it is asking.
@@ -165,6 +233,10 @@ namespace BannerlordVR.VR
                 // been resolved and checked.
                 VrBodyHide.Tick(agent, visuals, entity, skeleton);
 
+                // TEST 328/328b: before any write, so the bones are the ones the
+                // engine hung the holsters from.
+                VrHolsterView.Learn(agent, visuals, skeleton);
+
                 // MOUNTED IS POSED LIKE ANYTHING ELSE NOW.
                 //
                 // It was not, for a long time, on the reasoning that posing bones
@@ -205,7 +277,116 @@ namespace BannerlordVR.VR
                 if (!VrHandSlots.Resolve(agent, skeleton, out VrHandSlot main, out VrHandSlot off))
                     return;
 
+                // TEST 351: the engine's own finger0, before anything is written.
+                VrFingers.BeforeWrites(skeleton, main, off);
+
+                // TEST 512: at a machine, the animated hands are its handles.
+                VrSiege.Learn(agent, entity, skeleton, main, off);
+
                 MatrixFrame agentGlobal = entity.GetGlobalFrame();
+
+                // PAUSED: HOLD THE LAST POSE.
+                //
+                // AfterMissionTick runs every frame, paused or not, but the engine
+                // stops animating the skeleton while paused - so every pass below
+                // stacks this frame's correction on its own last output, and the
+                // arms "explode into weird artifacts" until the game ticks again
+                // (user, 2026-10-02; the arm solve's own stretch guard names the
+                // same thing). Nothing is written: the bones keep the last pose
+                // the game drew, and the weapons are kept on it.
+                if (Paused())
+                {
+                    _posed[0] = _posedLast[0];
+                    _posed[1] = _posedLast[1];
+                    DriveWeapons(agent, visuals, skeleton, agentGlobal, main, off);
+                    return;
+                }
+
+                // TEST 290. The arm rules use the entity's axes; the hand targets
+                // come through the view's anchor. On a horse those may face apart,
+                // which would read as twisted elbows. Measured, every ~5 s.
+                if (agent.HasMount && ++_mountYawTick >= 450)
+                {
+                    _mountYawTick = 0;
+                    Vec3 ef = agentGlobal.rotation.f, af = VrCameraDriver.Anchor.rotation.f;
+                    float yaw = (float)(Math.Atan2(ef.x * af.y - ef.y * af.x, ef.x * af.x + ef.y * af.y)
+                                        * 180.0 / Math.PI);
+                    VrLog.Info(string.Format(
+                        "TEST 290 mounted: the view's anchor is turned {0:F0} deg from the rider's "
+                        + "entity (the arm rules' frame); pitch f.z entity {1:F2} anchor {2:F2}.",
+                        yaw, ef.z / Math.Max(1e-4f, ef.Length), af.z / Math.Max(1e-4f, af.Length)));
+                }
+
+                // TEST 252: nothing of the body plays the attack animation.
+                // Snapshots the whole skeleton when the attack action appears and
+                // holds it there until it ends; the arms, hands and chest are
+                // written after this by the poses that are the player's own, so
+                // they stay theirs. See VrBodyFreeze.
+                //
+                // TEST 266: NOW ALSO WHEN THE BODY IS DRAWN. This used to run only
+                // while the body was hidden, on the reasoning that a visible body
+                // would keep travelling with the agent (the attack step, every
+                // footfall) while a camera that was NOT held would visibly
+                // separate from it - true when this was written, because the
+                // camera's own hold (VrCameraDriver) was ALSO restricted to a
+                // hidden body at the time (TEST 259). TEST 266 lifted that
+                // restriction on the camera side FIRST, on the belief that the
+                // skeleton freeze already covered a visible body - a session log
+                // (TEST 262/263) proved that false: with the body visible, this
+                // line's own VrBodyHide.Hiding gate meant VrBodyFreeze.Apply was
+                // never even called, so the camera held still while the real
+                // skeleton kept animating underneath it - worse than before, not
+                // better. Both sides now agree: melee_freeze_body freezes the
+                // whole skeleton and the camera's own hold covers it, visible or
+                // not. The cost (VrBodyFreeze's own header: the legs stop cycling
+                // for the length of an attack, so a full-body player's crouch and
+                // lean briefly hold too) is the same trade melee_freeze_body has
+                // always made; it simply used to only be paid with a hidden body.
+                //
+                // STILL NOT WHEN ONLY THE LEGS ANIMATE. That mode already holds
+                // everything above the legs, so the freeze has nothing left to
+                // hide - and it would freeze the legs, the one thing meant to move.
+                bool frozen = !VrBodyIk.HoldsUpperBody && VrBodyFreeze.Apply(agent, skeleton);
+
+                // TEST 234's chest pin, RESTORED (TEST 250).
+                //
+                // It was dropped from this method when VrWeaponHands was recovered
+                // from a decompile (commit cf1c4a7), so body_pin = 1 has been
+                // doing nothing since: the chest and shoulders have been following
+                // every animation - the walk's rock, and the lean of an attack
+                // that the player is not watching. It goes where its own header
+                // says it goes: before the arm solve, with the entitial frames
+                // rebuilt behind it, because the solve reads the shoulder from
+                // those frames. See VrUpperBody.
+                bool pinned = VrUpperBody.Pin(visuals, skeleton);
+
+                // TEST 253: the full body. It runs after the freeze and the pin -
+                // so it has the last word on the bones it owns - and before the
+                // rebuild, because the arm solve below reads the shoulder from the
+                // rebuilt entitial frames. It moves the root itself (the pelvis is
+                // the root), so what the restore puts back is OUR pelvis, offset
+                // and all, not the animation's.
+                MatrixFrame rootWanted = rootPlaced;
+
+                // TEST 295c: with a shield up, the upright pelvis instead of the
+                // stance's turned and pushed one. On foot only, so the rider's
+                // root lift (TEST 206) never meets it.
+                if (pinned && VrUpperBody.HasUprightRoot)
+                    rootWanted = VrUpperBody.UprightRoot;
+
+                bool body = VrBodyIk.Apply(visuals, skeleton, frozen, ref rootWanted);
+
+                if (frozen || pinned || body)
+                {
+                    if (RestoreRoot && root >= 0)
+                        skeleton.SetBoneLocalFrame(root, rootWanted);
+
+                    skeleton.UpdateEntitialFramesFromLocalFrames();
+                }
+
+                // TEST 295: the head's move from standing the chest upright, for
+                // the camera's next frame.
+                VrUpperBody.MeasureHeadShift(skeleton, agentGlobal);
 
                 // The automatic pass is started HERE rather than on a timer, on the
                 // first frame there is actually something to watch. Begun any
@@ -225,8 +406,19 @@ namespace BannerlordVR.VR
                 // tracking while the other one samples, which is what makes a
                 // mission-start pass on one hand invisible instead of a two-second
                 // freeze of both.
+                // TEST 309: what each hand holds and how much it weighs, before
+                // VrTwoHand reads the off hand's (trailed) target.
+                VrWeight.BeginTick(agent, main, off);
+
+                // TEST 304: the off-hand trigger takes hold of a two-handed weapon
+                // or lets go, before either hand is driven.
+                VrTwoHand.Tick(agent, input, main, off, skeleton);
+
                 bool posed = Drive(agent, visuals, input, skeleton, agentGlobal, main);
                 posed |= Drive(agent, visuals, input, skeleton, agentGlobal, off);
+
+                _posedLast[0] = _posed[0];
+                _posedLast[1] = _posed[1];
 
                 if (!posed)
                     return;
@@ -235,8 +427,13 @@ namespace BannerlordVR.VR
                 // composes every bone down from where the rider actually is
                 // instead of from the root's static rest height. See the capture
                 // above and TEST 206.
+                //
+                // rootWanted, not rootPlaced: the arms were solved against it, and
+                // putting the animation's root back here moved the whole body out
+                // from under them (TEST 295c's upright pelvis; the body IK's pelvis
+                // too). It IS rootPlaced whenever nothing overrides it.
                 if (RestoreRoot && root >= 0)
-                    skeleton.SetBoneLocalFrame(root, rootPlaced);
+                    skeleton.SetBoneLocalFrame(root, rootWanted);
 
                 // Once, after both hands are set. The entitial frames are what the
                 // renderer and the attached meshes read, and recomputing them per
@@ -248,7 +445,19 @@ namespace BannerlordVR.VR
                 for (int i = 0; i < _pendingCount; i++)
                     VrArmSeam.AfterWrite(skeleton, _pendingBone[i], _pendingWanted[i]);
 
+                // The weapons, now that the bones are this frame's: TEST 228's
+                // own entity is placed from the hand bone, and a hand that was
+                // not posed this tick has its item given back.
+                DriveWeapons(agent, visuals, skeleton, agentGlobal, main, off);
+
+                // TEST 480: finger0 only now - the weapons above were placed from
+                // the animation's finger0, so no grip or tuned pose moves.
+                VrFingers.AfterWeapons(skeleton, physicalInput, main, off);
+                VrHandMesh.Tick(entity, skeleton, main, off);
+
                 TraceAlignment(agent, skeleton, agentGlobal);
+                VrBodyIk.ProbeFit(agent, visuals, skeleton);
+                VrBodyIk.ProbeJitter(agent, visuals, skeleton);
 
                 if (!_loggedDriving)
                 {
@@ -311,6 +520,38 @@ namespace BannerlordVR.VR
 
             return _root;
         }
+        /// <summary>The game is paused: the engine's own flag, or the mission
+        /// clock standing still for a quarter second (a pause the flag does not
+        /// see; one frame without a mission tick is not a pause).</summary>
+        internal static bool Paused()
+        {
+            Mission mission = Mission.Current;
+            if (mission == null)
+                return false;
+
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            float time = mission.CurrentTime;
+            if (time != _missionTime)
+            {
+                _missionTime = time;
+                _missionTimeMovedAt = now;
+            }
+
+            bool paused = MBCommon.IsPaused
+                          || now - _missionTimeMovedAt > System.Diagnostics.Stopwatch.Frequency / 4;
+
+            if (paused && !_loggedPause)
+            {
+                _loggedPause = true;
+                VrLog.Info("Paused: the arms hold their last pose (" + (MBCommon.IsPaused
+                    ? "the engine's pause flag" : "the mission clock stopped") + "). Solving on a "
+                    + "skeleton the game no longer animates stacks every frame on the last and "
+                    + "shreds the arms.");
+            }
+
+            return paused;
+        }
+
         /// <summary>Said once per mission, so "the arms stopped following me on the
         /// horse" is a decision in the log rather than a mystery.</summary>
         private static void MountedOnce()
@@ -517,18 +758,39 @@ namespace BannerlordVR.VR
                 ObserveBinding(agent, slot, animatedBone);
             }
 
-            world = world.TransformToParent(grip);
+            MatrixFrame controller = world;
+            world = Calibrated(world, grip, slot.Role);
 
-            // The slider offset, in the BODY's frame rather than the controller's.
-            //
-            // Applied through the anchor's rotation, which is the character's
-            // heading, so "up" is up and "forward" is the way they are facing
-            // however the player happens to be holding the controller. That is
-            // what makes a slider labelled Z mean anything - see
-            // VrHandCalibration.BodyOffset.
-            Vec3 bodyOffset = VrHandCalibration.BodyOffset(slot.Role);
-            if (bodyOffset.LengthSquared > 1e-8f)
-                world.origin += VrCameraDriver.Anchor.rotation.TransformToParent(bodyOffset);
+            // TEST 309: the hand trails the controller by what it holds - before
+            // the two-hand steer, so the frame VrTwoHand latches is the one the
+            // weapon is drawn from.
+            VrWeight.Follow(slot.Role, ref world);
+
+            // TEST 304: a weapon held in both hands. The main hand turns so the
+            // blade runs through the off hand; the off fist goes onto the shaft.
+            if (slot.Role == HandRole.Main)
+                VrTwoHand.AdjustMain(ref world);
+            else
+                VrTwoHand.AdjustOff(ref world, controller);
+
+            // TEST 375: the right hand on a two-handed crossbow stays where it took the stock.
+            VrCrossbow.AdjustHand(slot.Role, ref world);
+
+            // TEST 465: at full draw the string hand stays where the string stopped.
+            VrBow.AdjustHand(slot.Controller, ref world);
+
+            // TEST 473b: the hand on the tiller stays on its handle.
+            VrHelm.AdjustHand(slot.Controller, ref world);
+
+            // TEST 511/512: a hand on a ladder or a siege machine stays on it.
+            VrLadder.AdjustHand(slot.Controller, ref world);
+            VrSiege.AdjustHand(slot.Controller, ref world);
+
+            // TEST 316/317: an enemy's shield or body stops the weapon - the hand
+            // you see stays with it while the controller carries on. The off fist
+            // on a two-handed shaft follows the corrected weapon.
+            if (VrCollide.Resolve(slot.Role, ref world) && slot.Role == HandRole.Main)
+                VrTwoHand.Redrawn(world);
 
             // world -> agent entity. Entitial space is where the arm is solved, and
             // it is also the space SetBoneLocalFrame's parent walk starts from.
@@ -569,9 +831,15 @@ namespace BannerlordVR.VR
             // does, reached through a solved shoulder and elbow instead of leaving
             // them wherever the animation had them. If it declines, nothing has
             // been written and the original one-bone path runs unchanged.
+            // TEST 290: with a bow out, the string arm and the bow arm take the
+            // archer's elbows. VrBow's StringController is null otherwise.
+            VrHand? stringCtl = VrBow.StringController;
+            ArmRole role = stringCtl == null ? ArmRole.None
+                         : slot.Controller == stringCtl.Value ? ArmRole.String : ArmRole.Bow;
+
             VrArmChain chain;
             bool solved = VrArmBones.TryChainForHand(agent, visuals, skeleton, slot.Bone, out chain)
-                          && VrArmIk.Solve(skeleton, chain, inAgent);
+                          && VrArmIk.Solve(skeleton, chain, inAgent, role);
 
             if (!solved)
             {
@@ -602,11 +870,13 @@ namespace BannerlordVR.VR
                 _pendingCount++;
             }
 
-            // And the thing the player can actually see. The bone write above only
-            // moves the skinned hand; the weapon is a separate entity that has to
-            // be placed itself - see VrWeaponEntity for why the bone was never
-            // going to carry it.
-            VrWeaponEntity.Drive(agent, slot, world);
+            // The thing the player can actually see is placed in DriveWeapons,
+            // after the entitial rebuild - the hand bone the copy is taken from
+            // only reads this frame's pose once that has run. All that happens
+            // here is remembering the hand as posed, and the frame the entity
+            // drive would use if the skinning declines.
+            _posed[(int)slot.Role] = true;
+            _posedWorld[(int)slot.Role] = world;
             return true;
         }
 
@@ -698,6 +968,72 @@ namespace BannerlordVR.VR
         /// Routed through the SAME anchor the eyes use. Any other route and the
         /// hands sit at an angle to the view that changes as you turn.
         /// </summary>
+        /// <summary>The controller times the calibrated grip, plus the slider
+        /// offset in the BODY's frame rather than the controller's - applied
+        /// through the anchor's rotation, which is the character's heading, so
+        /// "up" is up and "forward" is the way they are facing however the
+        /// controller is held. That is what makes a slider labelled Z mean
+        /// anything - see VrHandCalibration.BodyOffset.</summary>
+        private static MatrixFrame Calibrated(MatrixFrame controller, MatrixFrame grip, HandRole role)
+        {
+            MatrixFrame world = controller.TransformToParent(grip);
+
+            Vec3 bodyOffset = VrHandCalibration.BodyOffset(role);
+            if (bodyOffset.LengthSquared > 1e-8f)
+                world.origin += VrCameraDriver.Anchor.rotation.TransformToParent(bodyOffset);
+
+            return world;
+        }
+
+        /// <summary>TEST 452: "circles with the hand jump, it feels like it skips",
+        /// body IK on or off. The controllers were synced on the render thread at
+        /// present and read here from whichever buffer it wrote last; the threads
+        /// run in parallel, so a game frame could get the last one's sample again
+        /// and the next jump two. Now located once per game frame on this thread.
+        /// hand_latch = 0 goes back; hand_lead_frames is how far ahead of this
+        /// moment (display periods) - a game frame is drawn a frame after it poses.</summary>
+        internal static void LatchInput()
+        {
+            if (HandLatch)
+                NativeMethods.bvr_latch_input(HandLeadFrames);
+        }
+
+        private static readonly bool HandLatch = VrConfig.Bool("hand_latch", true);
+        private static readonly float HandLeadFrames =
+            Math.Max(0f, Math.Min(3f, VrConfig.Float("hand_lead_frames", 1f)));
+
+        /// <summary>TEST 318: where this controller's hand is drawn - the calibrated
+        /// palm the arm is driven to - for the body zones (holsters, the quiver).
+        /// The raw grip pose sits wherever each runtime puts it; the per-controller
+        /// grip calibration is what puts the hand in the same place on every
+        /// headset, so a zone measured from the raw pose moved with the headset.
+        /// The raw pose while the hand has no grip yet.</summary>
+        internal static Vec3 HandPoint(VrHand controller, BvrHandState state)
+        {
+            MatrixFrame world = VrCameraDriver.StageToHand(state.GripOrientation, state.GripPosition);
+            HandRole role = controller == VrHandSlots.MainController ? HandRole.Main : HandRole.Off;
+
+            return VrHandCalibration.TryGrip(role, out MatrixFrame grip)
+                ? Calibrated(world, grip, role).origin
+                : world.origin;
+        }
+
+        /// <summary>Where a posed hand is driven this tick, before the arm solve
+        /// (TEST 304 reads the off hand's ahead of its own pass).</summary>
+        internal static bool TryTarget(BvrInputState input, VrHandSlot slot, out MatrixFrame world)
+        {
+            if (!slot.Valid || !TryController(input, slot, out world)
+                || !VrHandCalibration.TryGrip(slot.Role, out MatrixFrame grip))
+            {
+                world = MatrixFrame.Identity;
+                return false;
+            }
+
+            world = Calibrated(world, grip, slot.Role);
+            VrWeight.Follow(slot.Role, ref world);
+            return true;
+        }
+
         private static bool TryController(BvrInputState input, VrHandSlot slot, out MatrixFrame world)
         {
             world = MatrixFrame.Identity;
@@ -742,17 +1078,141 @@ namespace BannerlordVR.VR
             }
         }
 
+        /// <summary>
+        /// Places each held item's visual, after the skeleton rebuild.
+        ///
+        /// The item is drawn on an entity of our own (VrSkinnedWeapon), placed
+        /// from the CARRIER hand's bone; when that declines, the engine's own
+        /// entity is driven instead (VrWeaponEntity, in the frame the hand was
+        /// posed to). A hand that was not posed this tick - no controller, or
+        /// sampling for calibration - has its item given back, because a copy
+        /// left on the last pose while the animation takes the hand over is
+        /// worse than the vanilla weapon. That is TEST 228's rule.
+        /// </summary>
+        private static void DriveWeapons(Agent agent, MBAgentVisuals visuals, Skeleton skeleton,
+                                         MatrixFrame agentGlobal, VrHandSlot main, VrHandSlot off)
+        {
+            _droveWeapons = true;
+
+            // A bow is a main-hand ITEM carried on the off (left) hand - TEST 231.
+            DriveOneWeapon(agent, visuals, skeleton, agentGlobal, main,
+                           main.Carrier == HandRole.Off ? off : main);
+            DriveOneWeapon(agent, visuals, skeleton, agentGlobal, off, off);
+        }
+
+        private static void DriveOneWeapon(Agent agent, MBAgentVisuals visuals, Skeleton skeleton,
+                                           MatrixFrame agentGlobal, VrHandSlot slot,
+                                           VrHandSlot carrier)
+        {
+            if (!slot.Valid || !carrier.Valid || carrier.Bone < 0 || !_posed[(int)carrier.Role])
+            {
+                VrSkinnedWeapon.Drop(agent, slot.Role);
+                return;
+            }
+
+            // The item bone, not the hand: TEST 230 - the item bone is the one
+            // the authored grip was measured against, and it is also the one the
+            // animation's fingers move. weapon_skinned_steady freezes its offset
+            // against the wrist instead of following it.
+            sbyte itemBone = carrier.Bone;
+            if (VrArmBones.TryChainForHand(agent, visuals, skeleton, carrier.Bone,
+                                           out VrArmChain chain)
+                && chain.Valid && chain.Item >= 0)
+                itemBone = chain.Item;
+
+            MatrixFrame itemWorld = agentGlobal.TransformToParent(
+                skeleton.GetBoneEntitialFrameWithIndex(itemBone));
+            MatrixFrame handWorld = agentGlobal.TransformToParent(
+                skeleton.GetBoneEntitialFrameWithIndex(carrier.Bone));
+
+            if (!VrSkinnedWeapon.Drive(agent, slot, handWorld, itemWorld))
+                VrWeaponEntity.Drive(agent, slot, _posedWorld[(int)slot.Role]);
+        }
+
+        /// <summary>
+        /// TEST 209/211: the pre-display seam, run by VrLateWeapon. The engine
+        /// rebuilds the agent's renderer data after our tick and before the
+        /// frame is drawn, and that pass is what puts a weapon back on the
+        /// animated hand - so the last write has to be downstream of it. Writing
+        /// from here, then asking the engine to rebuild its renderer data, is
+        /// what made the write stick (TEST 209: 0.000 m, both hands). Does
+        /// nothing unless weapon_seam = predisplay.
+        /// </summary>
+        public static void LateWeaponPass()
+        {
+            if (!LateSeam || !Enabled || _broken || !VrMotionHands.ShouldPose)
+                return;
+
+            try
+            {
+                Agent agent = Mission.Current?.MainAgent;
+                if (agent == null || !agent.IsActive() || !VrCameraDriver.HasPose)
+                    return;
+
+                MBAgentVisuals visuals = agent.AgentVisuals;
+                Skeleton skeleton = visuals?.GetSkeleton();
+                VrHandSlot main;
+                VrHandSlot off;
+                if (visuals == null || skeleton == null
+                    || !VrHandSlots.Resolve(agent, skeleton, out main, out off))
+                    return;
+
+                GameEntity entity = visuals.GetEntity();
+                if (entity != null)
+                {
+                    MatrixFrame agentGlobal = entity.GetGlobalFrame();
+                    VrWeaponAttach.DriveAll(agent, visuals, skeleton, entity, agentGlobal, main);
+                }
+
+                // TEST 662: the finger copies swap in the same rebuild as the weapons.
+                if (ShowsFingersLate)
+                    VrHandMesh.LateShow();
+
+                if (RefreshRenderer)
+                    visuals.LazyUpdateAgentRendererData();
+
+                VrWeaponEntity.ReapplyLast(agent, main);
+                VrWeaponEntity.ReapplyLast(agent, off);
+                VrWeaponEntity.CheckAfterRefresh(agent, main);
+                VrWeaponEntity.CheckAfterRefresh(agent, off);
+                LogSeamOnce();
+            }
+            catch (Exception ex)
+            {
+                _broken = true;
+                VrLog.Error("The pre-display weapon pass failed; weapons go back to the "
+                            + "game's own animation. Nothing else is affected.", ex);
+            }
+        }
+
+        private static void LogSeamOnce()
+        {
+            if (_loggedSeam)
+                return;
+
+            _loggedSeam = true;
+            VrLog.Info("Weapons are being written at the PRE-DISPLAY seam, after the renderer "
+                       + "data is built, rather than at AfterMissionTick. weapon_seam = "
+                       + "aftertick goes back.");
+        }
+
         public static void Reset()
         {
             _loggedDriving = false;
             _loggedMounted = false;
+            _loggedSeam = false;
             _pendingCount = 0;
             _haveRoot = false;
             _root = -1;
             VrArmSeam.Reset();
             VrArmBones.Reset();
             VrArmIk.Reset();
+            VrFingers.Reset();
+            VrHandMesh.Reset();
             VrHandSlots.Reset();
+            VrSkinnedWeapon.Reset();
+            VrWeight.Reset();
+            VrCollide.Reset();
         }
     }
 }

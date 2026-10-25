@@ -55,6 +55,14 @@ namespace BannerlordVR.VR
         /// every build before TEST 179 did.</summary>
         private static readonly bool Enabled = VrConfig.Bool("mission_camera_head", true);
 
+        /// <summary>
+        /// Give the native mission the HEADSET's field of view rather than the
+        /// game's. 0 goes back to 65 / CameraViewAngle, which is what the engine
+        /// itself passes and what every build before this one passed.
+        /// </summary>
+        private static readonly bool HeadsetCone =
+            VrConfig.Bool("mission_camera_fov", true);
+
         private static bool _loggedFirst;
         private static bool _broken;
 
@@ -101,12 +109,45 @@ namespace BannerlordVR.VR
                 if (followed != null && blend > 0f)
                     attenuation += (frame.origin - attenuation) * blend;
 
+                // THE CONE, NOT JUST THE DIRECTION.
+                //
+                // zoomFactor is the ONLY field of view this call carries, and the
+                // engine's own site passes 65f / CameraViewAngle - so a zoom of 1
+                // means "a 65 degree view". Handing the mission the head's
+                // DIRECTION while still handing it the game's 65-to-80 degree
+                // ANGLE points a cone at the right place and then makes it less
+                // than two thirds as wide as the 123 degrees actually rendered.
+                // Everything past about 40 degrees off centre is outside it, at
+                // both edges, which is the shape of "a bit of missing world at
+                // the left and right of the FOV".
+                //
+                // It is also why the band does not answer to the head. The
+                // direction follows the head every frame; the WIDTH comes from
+                // CameraViewAngle, which is the game's own zoom and moves for the
+                // stick, the scroll wheel and nothing else.
+                //
+                // So the cone is the headset's. EyeProjectionTarget is the same
+                // frustum the eye cameras are given, guard band and all, so the
+                // mission is now asked about exactly what gets drawn.
                 float viewAngle = screen.CameraViewAngle;
+
+                if (HeadsetCone)
+                {
+                    VrCameraDriver.EyeProjectionTarget(0, out float hfovRad, out float _);
+                    float hfovDeg = hfovRad * 57.2957795f;
+
+                    // Guarded rather than trusted: the eye frustum reads zero for
+                    // the first frames of a mission, and a zoom built from that is
+                    // a cone of nothing.
+                    if (hfovDeg > 20f && hfovDeg < 200f)
+                        viewAngle = hfovDeg;
+                }
+
                 float zoom = viewAngle > 1e-3f ? 65f / viewAngle : 1f;
 
                 mission.SetCameraFrame(ref frame, zoom, ref attenuation);
 
-                Measure(game, frame);
+                Measure(game, frame, viewAngle);
 
                 if (!_loggedFirst)
                 {
@@ -132,8 +173,43 @@ namespace BannerlordVR.VR
         /// throughout means the mission never had a wrong camera and the missing
         /// world has to be looked for elsewhere.
         /// </summary>
-        private static void Measure(MatrixFrame game, MatrixFrame ours)
+        private static void Measure(MatrixFrame game, MatrixFrame ours, float coneDeg)
         {
+            _coneDeg = coneDeg;
+
+            // DOES THE MISSION'S CAMERA ACTUALLY FOLLOW THE HEAD?
+            //
+            // Asked directly, because it is the one question three rounds of
+            // reasoning could not settle from the source. "ours" is read back
+            // from the engine camera AFTER AimAtEye, so if that write is landing
+            // this is the head's own direction and the angle below is ~0. If
+            // something between here and the engine puts the game's camera back,
+            // this is the tens of degrees the head is away from the stick - and
+            // that is "the culling does not move with my head", measured instead
+            // of inferred.
+            if (VrCameraDriver.HasPose)
+            {
+                Vec3 h = VrCameraDriver.HeadFrame.rotation.f;
+                Vec3 o = ours.rotation.u;
+                float lh = h.Length;
+                float lo = o.Length;
+
+                if (lh > 1e-4f && lo > 1e-4f)
+                {
+                    // The camera looks down -u and the head frame forward is f, so
+                    // the two agree when u points AGAINST f.
+                    float ch = -(h.x * o.x + h.y * o.y + h.z * o.z) / (lh * lo);
+                    if (ch > 1f) ch = 1f;
+                    if (ch < -1f) ch = -1f;
+
+                    float hDeg = (float)Math.Acos(ch) * 57.2957795f;
+
+                    _headSamples++;
+                    _headSum += hDeg;
+                    if (hDeg > _headMax) _headMax = hDeg;
+                }
+            }
+
             // Both are camera frames, which look down -u (the convention line at
             // startup measured it), so the angle between the u axes is the angle
             // between the view directions.
@@ -170,12 +246,36 @@ namespace BannerlordVR.VR
                 _writes, _samples > 0 ? _divSum / _samples : 0f, _divMax, _notDriving,
                 _divMaxNotDriving));
 
+            // THE LINE THAT ANSWERS "THE CULLING DOES NOT MOVE WITH MY HEAD".
+            //
+            // Near zero: the mission's camera IS the head's, the cone below is
+            // what decides the edges, and a band means the cone is too narrow.
+            // Tens of degrees: the write is not landing, the mission is still
+            // being culled from the stick, and the cone is the wrong suspect.
+            // One run separates them.
+            VrLog.Info(string.Format(
+                "Mission camera vs HEAD: {0:F1} deg on average, {1:F1} deg at worst, over {2} "
+                + "sample(s); cone handed to the mission {3:F1} deg against the headset's own "
+                + "field of view. Near zero means the mission is culled from the head and any "
+                + "missing world at the edges is the cone's width; tens of degrees means the "
+                + "camera write is not landing and the mission is still culled from the stick.",
+                _headSamples > 0 ? _headSum / _headSamples : 0f, _headMax, _headSamples,
+                _coneDeg));
+
             _writes = 0;
             _samples = 0;
             _notDriving = 0;
             _divSum = 0f;
             _divMax = 0f;
             _divMaxNotDriving = 0f;
+            _headSamples = 0;
+            _headSum = 0f;
+            _headMax = 0f;
         }
+
+        private static int _headSamples;
+        private static float _headSum;
+        private static float _headMax;
+        private static float _coneDeg;
     }
 }

@@ -88,6 +88,31 @@ namespace BannerlordVR.VR
         private static float _idleSeconds = float.MaxValue;
         private static bool _loggedFirst;
         private static bool _broken;
+        private static bool _groundGripWasDown;
+        private static int _flyHoldFrames;
+
+        /// <summary>The left stick flies the deployment camera (or just let go).
+        /// The held LTrigger hides the mouse, and with it hidden the camera turns
+        /// by mouse motion, so nothing may move the cursor meanwhile.</summary>
+        internal static bool DeploymentFlying => _flyHoldFrames > 0;
+
+        /// <summary>Pre-battle a physical trigger is held: the camera rises (right)
+        /// or sinks (left). MissionScreen reads the bumpers for that only while the
+        /// cursor is off every widget, so VrLaser parks it meanwhile.</summary>
+        internal static bool DeploymentLift => _liftFrames > 0;
+        private static int _liftFrames;
+        private static bool _groundGripSelectedTroop;
+
+        /// <summary>The right grip's press began on a widget (a left click) or on
+        /// the ground (RT), held for the whole squeeze. OrderTroopPlacer resets a
+        /// line the first frame RT is up, and a swipe toward the screen edge
+        /// crosses where the palette's widgets sit on the head panel.</summary>
+        private static bool _gripOnUi;
+        private static bool _gripFacing;
+
+        /// <summary>A right-grip line is being drawn on the ground; VrLaser keeps
+        /// the cursor on the ground until it is let go.</summary>
+        internal static bool GroundDragging { get; private set; }
 
         /// <summary>True when the controllers are tracking and the pad is on, so
         /// the game should be told a controller is connected.</summary>
@@ -117,24 +142,21 @@ namespace BannerlordVR.VR
         private static readonly bool FlyDeployment =
             VrConfig.Bool("deployment_stick_fly", true);
 
-        private static bool InDeployment()
-        {
-            try
-            {
-                Mission m = Mission.Current;
-                return m != null && m.Mode == TaleWorlds.Core.MissionMode.Deployment;
-            }
-            catch
-            {
-                return false;
-            }
-        }
+        /// <summary>Deployment, and the free camera after death, which flies the
+        /// deployment way and so reads the stick only under the trigger too
+        /// (TEST 397, FreeCameraFlightPatch).</summary>
+        private static bool InDeployment() => VrMissionPhase.FlyLikeDeployment;
 
         private static bool InMenu()
         {
             try
             {
-                return Mission.Current == null || VrMissionPhase.UiWantsScreen;
+                // UiMenuOpen rather than UiWantsScreen: inside a mission the flat
+                // panel stays off even with the escape menu up, so asking about
+                // the panel answered "no menu" for every menu opened in a battle
+                // - which cost held directions their repeat exactly where a long
+                // list is hardest to walk. See VrMissionPhase.UiMenuOpen.
+                return Mission.Current == null || VrMissionPhase.UiMenuOpen;
             }
             catch
             {
@@ -178,11 +200,19 @@ namespace BannerlordVR.VR
                 // reporting would otherwise leave the modifier stuck down, and
                 // the right stick would stay a D-pad with no way to release it.
                 _lThumbDown = false;
+                _lRestDown = false;
 
                 _tracked = false;
 
                 if (NativeMethods.bvr_get_input_state(out BvrInputState input) != (int)BvrStatus.Ok)
+                {
+                    EncyclopediaHold(false, 0f);
                     return;
+                }
+
+                // The thumbrest chord's modifier, read before either hand like L3 is.
+                _lRestDown = DpadThumbrest && input.Left.IsActive != 0
+                             && (NativeMethods.bvr_get_finger_touch() & VrFingerRig.TouchThumbrest) != 0;
 
                 bool anyInput = false;
 
@@ -206,6 +236,17 @@ namespace BannerlordVR.VR
                     if (!suppressed)
                         anyInput |= Hand(input.Right, left: false);
                 }
+                else
+                {
+                    _groundGripWasDown = false;
+                    _groundGripSelectedTroop = false;
+                    GroundDragging = false;
+                }
+
+                // TEST 443: the left stick held in recentres.
+                RecentreHold(Math.Max(dt, 0f));
+
+                EncyclopediaHold(Down[(int)InputKey.ControllerRUp] && !VrInputManager.PanelOpen, dt);
 
                 // THE DEPLOYMENT CAMERA FLIES WITHOUT HOLDING ANYTHING.
                 //
@@ -224,12 +265,18 @@ namespace BannerlordVR.VR
                 // it means the one phase where the player is flying a camera
                 // around a battlefield is the one phase the stick appears dead.
                 //
-                // Reporting the trigger as held for the whole of deployment makes
-                // the stick fly the camera outright. The cost is the selection
-                // function that shared the stick, and during deployment there is
-                // nothing else the trigger does - no combat to swing at.
-                if (FlyDeployment && InDeployment())
+                // The formation screen hides its mouse whenever this trigger is
+                // held, so claim it only while the left stick is actually flying.
+                if (FlyDeployment && InDeployment() && input.Left.IsActive != 0 &&
+                    (Math.Abs(input.Left.ThumbstickX) >= Deadzone ||
+                     Math.Abs(input.Left.ThumbstickY) >= Deadzone))
+                {
                     Set(InputKey.ControllerLTrigger, true);
+                    // ponytail: frame count, not seconds; ~0.15 s at 60 fps.
+                    _flyHoldFrames = 10;
+                }
+                else if (_flyHoldFrames > 0)
+                    _flyHoldFrames--;
 
                 // Held directions step a menu more than once. See ApplyRepeat.
                 ApplyRepeat(Math.Max(dt, 0f));
@@ -277,7 +324,8 @@ namespace BannerlordVR.VR
             if (left)
                 _lThumbDown = thumbDown;
 
-            if (thumbDown)
+            // TEST 374: the main stick held in slides a two-handed grip - not R3.
+            if (thumbDown && !VrTwoHand.ThumbOwned(left))
             {
                 Set(left ? InputKey.ControllerLThumb : InputKey.ControllerRThumb, true);
                 used = true;
@@ -294,7 +342,10 @@ namespace BannerlordVR.VR
             // The right stick was chosen over the left deliberately: the left one
             // is movement, and a chord that also walked you somewhere while you
             // pressed it would be its own problem.
-            bool dpad = !left && DpadChord && _lThumbDown;
+            //
+            // dpad_thumbrest (VR panel): the left thumb RESTING on the Quest
+            // thumbrest is the modifier too - no click to hold.
+            bool dpad = !left && DpadModifier;
 
             // THE POINTER BORROWS A STICK TOO.
             //
@@ -311,14 +362,49 @@ namespace BannerlordVR.VR
             // none after it, which is the difference between a twitch and a mode.
             bool pointer = VrStickMouse.OwnsStick(left);
 
+            // TEST 277: on the stereo map table the left stick pans the map in the
+            // direction you face (VrMapStereo.SteerPan), and nothing else hears it.
+            if (left && VrMapStereo.StickPans)
+            {
+                pointer = true;
+                used |= stick.x != 0f || stick.y != 0f;
+            }
+
             InputKey stickKey = left ? InputKey.ControllerLStick : InputKey.ControllerRStick;
+
+            // The pad's analog answer for this stick. The physical stick is what
+            // the digital directions, the D-pad chord and the stick mouse all read
+            // (above and below); the ROOM-SCALE contribution is added to the
+            // ANALOG ONLY. That matters: physically walking must move the
+            // character without also pressing ControllerLStickUp in a menu, or
+            // joining the D-pad chord as a fifth direction.
+            Vec2 analog = stick;
+
+            // TEST 653: "the pre-battle (siege) camera snaps". MissionScreen turns the
+            // deployment camera at dt/0.0009 per unit of CameraAxisX while the mouse
+            // shows, but with the mouse HIDDEN - which the left-stick fly does - an
+            // axis past 0.9 switches it to dt/0.00045: twice as fast, ~9 deg a frame
+            // (log: 7-9 deg/frame, all while flying). The right stick stays under that
+            // threshold pre-battle, so a turn keeps one speed whether you fly or not.
+            if (!left && VrMissionPhase.Deploying)
+            {
+                const float NoBoost = 0.89f;
+                analog = new Vec2(Math.Max(-NoBoost, Math.Min(NoBoost, analog.x)),
+                                  Math.Max(-NoBoost, Math.Min(NoBoost, analog.y)));
+            }
+
+            // TEST 296b: room scale no longer rides the left stick. ControlTick
+            // zeroes any axis under 0.2 and the input path had a second deadzone
+            // above that, so a slow real step came out as stop-go pulses. It is
+            // added to MovementInputVector after ControlTick instead
+            // (MovementInputPatch), with no deadzone in the way.
 
             // The analog axis is suppressed for the duration. It is the camera on
             // the right stick, and swinging the view while picking a direction
             // out of a menu is exactly what the chord exists to avoid.
-            if (!dpad && !pointer && (stick.x != 0f || stick.y != 0f))
+            if (!dpad && !pointer && (analog.x != 0f || analog.y != 0f))
             {
-                Analog[(int)stickKey] = stick;
+                Analog[(int)stickKey] = analog;
                 used = true;
             }
 
@@ -361,27 +447,107 @@ namespace BannerlordVR.VR
             // Triggers keep their analog value: Bannerlord reads a trigger through
             // the same GetKeyState as a stick, so throwing the travel away here
             // would turn a squeeze into an on-off switch further down.
+            // TEST 271: in a fight the trigger is a holster or nothing - the
+            // vanilla Attack / Defend keys stay off unless VrHolster allows them.
             InputKey triggerKey = left ? InputKey.ControllerLTrigger : InputKey.ControllerRTrigger;
+            // Pre-battle no trigger reaches the game: LTrigger hides the formation
+            // screen's mouse (the left stick's fly claims it below), and RTrigger
+            // is the right grip's ground click.
+            bool triggerToGame = !VrMissionPhase.Deploying && VrHolster.TriggerKeyAllowed(left);
             if (h.Trigger > 0.01f)
             {
-                Analog[(int)triggerKey] = new Vec2(h.Trigger, 0f);
+                if (triggerToGame)
+                    Analog[(int)triggerKey] = new Vec2(h.Trigger, 0f);
                 used = true;
             }
-            Set(triggerKey, h.Trigger >= TriggerThreshold);
+            Set(triggerKey, triggerToGame && h.Trigger >= TriggerThreshold);
 
-            // THE TRIGGERS CLICK, but only where there is a pointer to click
-            // with. A trigger during play is a swing or a shot, and binding it
-            // to a mouse button there would fire both.
-            if (VrStickMouse.Active && h.Trigger >= TriggerThreshold)
+            // Outside deployment the trigger clicks the stick pointer. During
+            // deployment it only aims the laser; the right grip clicks.
+            // TEST 525: while the laser is on the interface the trigger only picks
+            // the pointing hand (VrLaser); A is the click, below.
+            if (VrLaser.Active)
+            {
+                if (h.Trigger >= TriggerThreshold)
+                    used = true;
+            }
+            else if (!VrMissionPhase.Deploying && VrStickMouse.Active && h.Trigger >= TriggerThreshold)
             {
                 Set(left ? InputKey.RightMouseButton : InputKey.LeftMouseButton, true);
                 used = true;
             }
 
-            // Grip -> bumper. A grip is a squeeze and a bumper is a click, so this
-            // one really is a threshold and not an axis.
-            Set(left ? InputKey.ControllerLBumper : InputKey.ControllerRBumper,
-                h.Grip >= GripThreshold);
+            // Grip -> bumper outside deployment. During deployment the right
+            // grip clicks hand UI or selects a troop under the world ray.
+            // TEST 373: the hand on a crossbow's stock - its trigger (this "grip",
+            // under controls_swap_trigger_grip) shoots it, and never switches weapons.
+            // TEST 512: likewise the main trigger piloting a ballista or mangonel.
+            bool grip = h.Grip >= GripThreshold;
+
+            // Pre-battle the PHYSICAL triggers raise and lower the camera, on land
+            // and at sea: vanilla's gamepad deployment reads RB up and LB down.
+            // Not while a line is drawn: a hard squeeze of the grip half-pulls the
+            // trigger on the same hand.
+            bool lift = VrMissionPhase.Deploying && !GroundDragging
+                        && NativeMethods.PhysicalTrigger(h) >= TriggerThreshold;
+            if (VrMissionPhase.Deploying)
+            {
+                Set(left ? InputKey.ControllerLBumper : InputKey.ControllerRBumper, lift);
+                if (lift)
+                    _liftFrames = 3;
+                else if (!left && _liftFrames > 0)
+                    _liftFrames--;
+            }
+
+            if (!left && VrMissionPhase.Deploying)
+            {
+                // The PHYSICAL grip, under controls_swap_trigger_grip too.
+                grip = NativeMethods.PhysicalGrip(h) >= GripThreshold;
+                if (grip && !_groundGripWasDown)
+                {
+                    _groundGripSelectedTroop = false;
+                    _gripOnUi = VrLaser.Active;
+                    _gripFacing = !_gripOnUi && VrLaser.GroundActive && VrLaser.FacingArmed();
+                    if (VrLaser.GroundActive && !VrLaser.Active && !_gripFacing)
+                    {
+                        try { _groundGripSelectedTroop = VrLaser.TrySelectGroundFormation(); }
+                        catch (Exception ex) { VrLog.Error("Ground formation selection failed.", ex); }
+                    }
+                }
+                // Facing set open: the release faces the selection where the laser
+                // points, as a mouse click on the ground does.
+                if (!grip && _groundGripWasDown && _gripFacing)
+                {
+                    try { VrLaser.FaceAtLaser(); }
+                    catch (Exception ex) { VrLog.Error("Facing order by the laser failed.", ex); }
+                }
+                if (!grip)
+                {
+                    _groundGripSelectedTroop = false;
+                    _gripFacing = false;
+                }
+                _groundGripWasDown = grip;
+                // On a widget the grip is the left click. On the ground it is
+                // the right trigger: OrderTroopPlacer takes either, but a left
+                // click is captured by whatever widget sits under the cursor and
+                // the trigger is not, so dragging a line never stalls at a panel.
+                bool click = grip && !_groundGripSelectedTroop;
+                Set(InputKey.LeftMouseButton, click && _gripOnUi);
+                GroundDragging = click && !_gripOnUi && !_gripFacing;
+                Set(InputKey.ControllerRTrigger, GroundDragging);
+            }
+            else
+            {
+                if (!left)
+                {
+                    _groundGripWasDown = false;
+                    _groundGripSelectedTroop = false;
+                    GroundDragging = false;
+                }
+                if (!VrMissionPhase.Deploying)
+                    Set(left ? InputKey.ControllerLBumper : InputKey.ControllerRBumper,
+                        grip && !VrCrossbow.TriggerOwned(left) && !VrSiege.TriggerOwned(left));
+            }
             if (h.Grip >= GripThreshold)
                 used = true;
 
@@ -399,7 +565,9 @@ namespace BannerlordVR.VR
             }
             else
             {
-                Set(InputKey.ControllerRDown, primary);    // A
+                // Pre-battle A is the vanilla pad's A; the right grip is the laser's click.
+                Set(!VrMissionPhase.Deploying && VrLaser.Active
+                    ? InputKey.LeftMouseButton : InputKey.ControllerRDown, primary);
                 Set(InputKey.ControllerRRight, secondary); // B
             }
 
@@ -441,14 +609,78 @@ namespace BannerlordVR.VR
         /// <summary>True while the chord is borrowing the right stick. The stick
         /// mouse asks, because a pointer that slid across the screen while the
         /// player was picking a direction would fight the thing it is for.</summary>
-        public static bool DpadActive => DpadChord && _lThumbDown && Active;
+        public static bool DpadActive => DpadModifier && Active;
+
+        private static bool DpadModifier => (DpadChord && _lThumbDown) || _lRestDown;
 
         /// <summary>0 gives the right stick back and drops the D-pad chord.</summary>
         private static readonly bool DpadChord = VrConfig.Bool("dpad_chord", true);
 
+        /// <summary>1: the left thumbrest touched is the D-pad modifier too (Quest
+        /// Touch). Off by default - a resting thumb would take the camera stick.
+        /// The VR panel sets it.</summary>
+        internal static bool DpadThumbrest = VrConfig.Bool("dpad_thumbrest", false);
+        private static bool _lRestDown;
+
         /// <summary>The left stick pressed in, from the frame's own sample. The
         /// left hand is read first, so the right hand can rely on it.</summary>
         private static bool _lThumbDown;
+
+        /// <summary>
+        /// TEST 443: holding the left stick in for recenter_hold_seconds (3) is the
+        /// F10 key - "add shortcut to recenter using controllers, maybe pressing and
+        /// holding left stick for 3 sec". Once per hold, with a buzz on the left
+        /// controller. The stick click still reaches the game as L3, so a short
+        /// press is unchanged. A hold that pushes the right stick is the D-pad chord,
+        /// not a recentre, and is void until the stick is let go; so is a left stick
+        /// a two-handed grip is using (TEST 374). 0 turns it off.
+        /// </summary>
+        private static void RecentreHold(float dt)
+        {
+            if (RecentreHoldSeconds <= 0f || !_lThumbDown || VrTwoHand.ThumbOwned(true))
+            {
+                _recentreHeld = 0f;
+                _recentreDone = false;
+                return;
+            }
+
+            if (Math.Abs(_rStickX) >= DigitalThreshold || Math.Abs(_rStickY) >= DigitalThreshold)
+                _recentreDone = true;   // the D-pad chord: void until released
+            if (_recentreDone)
+                return;
+
+            _recentreHeld += dt;
+            if (_recentreHeld < RecentreHoldSeconds)
+                return;
+
+            _recentreDone = true;
+            VrCameraDriver.RequestRecentre(measureHeight: true);
+            NativeMethods.bvr_trigger_haptic((int)VrHand.Left, 0.6f, 0.08f);
+            VrLog.Info("TEST 443: left stick held " + RecentreHoldSeconds.ToString("F1")
+                       + " s - recentred, as F10.");
+        }
+
+        private static readonly float RecentreHoldSeconds = VrConfig.Float("recenter_hold_seconds", 3f);
+        private static float _recentreHeld;
+        private static bool _recentreDone;
+
+        private static float _encyclopediaHeld;
+
+        private static void EncyclopediaHold(bool held, float dt)
+        {
+            if (!held)
+            {
+                _encyclopediaHeld = 0f;
+                return;
+            }
+
+            if (_encyclopediaHeld >= 0.6f)
+                return;
+
+            _encyclopediaHeld += Math.Max(dt, 0f);
+            if (_encyclopediaHeld >= 0.6f)
+                Set(InputKey.N, true); // Send the keyboard encyclopedia shortcut once per hold.
+        }
 
         private static bool _loggedDpad;
 

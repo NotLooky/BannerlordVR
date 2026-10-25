@@ -30,7 +30,6 @@ module\                         SubModule.xml, deployed verbatim
 tests\BannerlordVR.MathTests\   console app, exit 0/1 - coordinate maths
 tools\deploy.ps1                stages artifacts, purges anything else from the module
 tools\package-release.ps1       builds the release zip
-config\BannerlordVR.cfg         the research journal; NOT what ships (see below)
 build\                          staging output (gitignored)
 ```
 
@@ -158,14 +157,8 @@ what a bare fault offset can never tell you.
 
 ## Where the knowledge lives
 
-Not in `docs/`. The two places that are kept current are:
-
-- **`config/BannerlordVR.cfg`** — a research journal as much as a config file.
-  Every experiment is recorded next to the key it set, with its result. It is
-  *not* what ships to users, and nothing derived from it ships either - the
-  built-in defaults in the source are the tested configuration.
-- **The commit messages.** They are written to be read later and carry the
-  reasoning that never made it into a comment.
+Not in `docs/`. The comments next to the code, and the built-in defaults in
+the source, which are the tested configuration.
 
 ## Cutting a release
 

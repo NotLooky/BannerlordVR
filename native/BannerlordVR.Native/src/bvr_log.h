@@ -12,6 +12,10 @@ void log_close();
 /* printf-style. Never throws, never allocates on the failure path. */
 void logf(const char* level, const char* fmt, ...);
 
+/* Push whatever is buffered to disk now. Called by the crash handler, which is
+   the one place that cannot wait for the next timed flush. */
+void log_flush();
+
 } // namespace bvr
 
 #define BVR_INFO(...)  ::bvr::logf("INFO ", __VA_ARGS__)

@@ -55,9 +55,6 @@ namespace BannerlordVR.Patches
         [HarmonyPrefix]
         private static void Prefix(ref float dt)
         {
-            // Engaged, not Enabled: full AFR requires the freeze and switches it
-            // on for itself. Reading the config flag here would leave that mode
-            // rendering two eyes a tick apart and calling it a pair.
             if (_broken || !VrSyncSequential.Engaged)
                 return;
 

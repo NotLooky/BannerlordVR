@@ -4,8 +4,10 @@
 #include "bvr_config.h"
 #include "stereo_dup.h"
 #include "stereo_perf.h"
+#include "xr_context.h"
 
 #include <MinHook.h>
+#include <intrin.h>
 
 #include <cmath>
 #include <atomic>
@@ -55,6 +57,75 @@ bool desktop_vsync_wanted()
     return cached != 0;
 }
 
+/* TEST 792: TEXTURE LOD BIAS. Preset K reads "clean but soft", and Performance
+   looked sharper than Quality with the same model - so what the engine sets as
+   each sampler's MipLODBias per DLSS mode is logged here, and mip_bias_offset
+   adds to it (negative = textures a mip sharper; the usual cure for a soft DLSS
+   image). Comparison (shadow) samplers and our own are left alone. Samplers are
+   immutable: the offset reaches only those made after the first Present. */
+using PFN_CreateSamplerState = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const D3D11_SAMPLER_DESC*,
+                                                           ID3D11SamplerState**);
+PFN_CreateSamplerState g_originalCreateSampler = nullptr;
+std::atomic<int>       g_samplersSeen{ 0 };
+std::mutex             g_samplerBiasLock;
+float                  g_samplerBiases[16] = {};
+int                    g_samplerBiasCount = 0;
+
+HRESULT STDMETHODCALLTYPE hooked_create_sampler_state(ID3D11Device* device,
+                                                      const D3D11_SAMPLER_DESC* desc,
+                                                      ID3D11SamplerState** out)
+{
+    if (desc == nullptr)
+        return g_originalCreateSampler(device, desc, out);
+
+    static const float offset = config_float("mip_bias_offset", 0.0f);
+    HMODULE caller = nullptr, self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(_ReturnAddress()), &caller);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&hooked_create_sampler_state), &self);
+    const bool ours = caller != nullptr && caller == self;
+    const bool comparison = D3D11_DECODE_IS_COMPARISON_FILTER(desc->Filter) != 0;
+
+    D3D11_SAMPLER_DESC d = *desc;
+    if (offset != 0.0f && !ours && !comparison)
+        d.MipLODBias = (std::max)(-16.0f, (std::min)(15.99f, d.MipLODBias + offset));
+    const HRESULT hr = g_originalCreateSampler(device, &d, out);
+
+    if (ours)
+        return hr;
+    const int n = ++g_samplersSeen;
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> lock(g_samplerBiasLock);
+        bool known = false;
+        for (int i = 0; i < g_samplerBiasCount; ++i)
+            known = known || fabsf(g_samplerBiases[i] - desc->MipLODBias) < 1e-4f;
+        if (!known && g_samplerBiasCount < 16)
+            g_samplerBiases[g_samplerBiasCount++] = desc->MipLODBias;
+        fresh = !known;
+    }
+    if (n <= 24 || fresh)
+        BVR_INFO("Sampler #%d (TEST 792): engine MipLODBias %.3f%s, filter 0x%X, aniso %u, "
+                 "LOD %.1f-%.1f%s -> created with %.3f (mip_bias_offset %.2f).",
+                 n, desc->MipLODBias, fresh ? " (NEW value)" : "", static_cast<unsigned>(desc->Filter),
+                 desc->MaxAnisotropy, desc->MinLOD, desc->MaxLOD, comparison ? ", comparison" : "",
+                 d.MipLODBias, offset);
+    return hr;
+}
+
+void install_sampler_hook(ID3D11Device* device)
+{
+    /* ID3D11Device vtable slot 23: CreateSamplerState. */
+    void** vtable = *reinterpret_cast<void***>(device);
+    if (vtable_hook(vtable, 23, reinterpret_cast<void*>(&hooked_create_sampler_state),
+                    reinterpret_cast<void**>(&g_originalCreateSampler)))
+        BVR_INFO("ID3D11Device::CreateSamplerState vtable-hooked (TEST 792, mip_bias_offset %.2f).",
+                 config_float("mip_bias_offset", 0.0f));
+    else
+        BVR_WARN("TEST 792: could not hook CreateSamplerState; mip_bias_offset does nothing.");
+}
+
 void capture_device(IDXGISwapChain* swapChain)
 {
     if (g_device != nullptr || swapChain == nullptr)
@@ -70,6 +141,7 @@ void capture_device(IDXGISwapChain* swapChain)
 
     g_device = device; /* keep the reference GetDevice gave us */
     g_device->GetImmediateContext(&g_context);
+    install_sampler_hook(g_device);
 
     /* ID3D11DeviceContext is NOT thread safe, and we touch the engine's immediate
        context from inside the Present hook while rgl is driving its own rendering
@@ -235,9 +307,8 @@ HRESULT STDMETHODCALLTYPE hooked_present(IDXGISwapChain* swapChain, UINT syncInt
        The headset is the display now, and the window is a courtesy. Presenting
        it with no wait costs a tear nobody is looking at.
      *
-       Both reference VR injections on this machine do exactly this - Witcher 3
-       VR forces the interval to 0 whenever its session is running, under
-       disable_desktop_vsync. desktop_vsync = 1 restores the engine's own
+       Other VR injections do exactly this, forcing the interval to 0
+       whenever their session is running. desktop_vsync = 1 restores the engine's own
        interval for comparison. */
     UINT effective = syncInterval;
 
@@ -302,6 +373,26 @@ struct CaptureState
 CaptureState     g_capture;
 ID3D11Texture2D* g_eyeTextures[2] = { nullptr, nullptr };
 
+/* The interface's own render target (TEST 299), captured the same way and kept
+   in its OWN slot. g_capture.width/height mean "eye size" in a dozen places in
+   this file - the depth search, the survey, the aspect checks - so borrowing
+   them for a texture that is neither eye-sized nor an eye would quietly poison
+   all of it. One texture, one size, no reallocation watch. */
+struct UiCaptureState
+{
+    std::atomic<bool> armed{false};
+    uint32_t width = 0;
+    uint32_t height = 0;
+    ID3D11Texture2D* texture = nullptr;
+};
+
+UiCaptureState   g_uiCapture;
+ID3D11Texture2D* g_uiTexture = nullptr;
+
+/* TEST 531: the map bar's own target, a second slot of the same kind. */
+UiCaptureState   g_handCapture;
+ID3D11Texture2D* g_handTexture = nullptr;
+
 HRESULT STDMETHODCALLTYPE hooked_create_texture2d(
     ID3D11Device* device,
     const D3D11_TEXTURE2D_DESC* desc,
@@ -310,8 +401,78 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture2d(
 {
     const HRESULT hr = g_originalCreateTexture2D(device, desc, initialData, outTexture);
 
+    /* TEST 602: the black banners - does an engine texture fail to be created? */
+    if (FAILED(hr) && desc != nullptr)
+    {
+        static std::atomic<int> failures{0};
+        if (failures.fetch_add(1, std::memory_order_relaxed) < 20)
+            BVR_WARN("CreateTexture2D FAILED (TEST 602): hr 0x%08X, %ux%u fmt %d mips %u arr %u bind 0x%X "
+                     "usage %d misc 0x%X samples %u.", static_cast<unsigned>(hr), desc->Width, desc->Height,
+                     static_cast<int>(desc->Format), desc->MipLevels, desc->ArraySize, desc->BindFlags,
+                     static_cast<int>(desc->Usage), desc->MiscFlags, desc->SampleDesc.Count);
+    }
+
     if (FAILED(hr) || outTexture == nullptr || *outTexture == nullptr || desc == nullptr)
         return hr;
+
+    /* TEST 817: WHO SIZES THE POST CHAIN A PIXEL OFF? With the eye at 2380 wide the
+       engine's post targets (R11G11B10) came out 2381 - DLSS's output read into them
+       and back is the crop blur. The first few such creations log the engine stack. */
+    {
+        uint32_t ew = 0, eh = 0;
+        static std::atomic<int> s_logged{0};
+        if (desc->Format == DXGI_FORMAT_R11G11B10_FLOAT && (desc->BindFlags & D3D11_BIND_RENDER_TARGET) &&
+            xr_recommended_size(&ew, &eh) &&
+            (desc->Width != ew || desc->Height != eh) &&
+            abs(static_cast<int>(desc->Width) - static_cast<int>(ew)) <= 3 &&
+            abs(static_cast<int>(desc->Height) - static_cast<int>(eh)) <= 3 &&
+            s_logged.fetch_add(1, std::memory_order_relaxed) < 6)
+        {
+            void* frames[16] = {};
+            const USHORT n = RtlCaptureStackBackTrace(1, 16, frames, nullptr);
+            char line[1024];
+            int at = snprintf(line, sizeof(line), "Post target %ux%u vs eye %ux%u (TEST 817), stack:",
+                              desc->Width, desc->Height, ew, eh);
+            for (USHORT i = 0; i < n && at > 0 && at < static_cast<int>(sizeof(line)) - 48; ++i)
+            {
+                HMODULE mod = nullptr;
+                char name[MAX_PATH] = "?";
+                if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                       static_cast<LPCSTR>(frames[i]), &mod) && mod != nullptr)
+                {
+                    GetModuleFileNameA(mod, name, MAX_PATH);
+                    const char* base = strrchr(name, '\\');
+                    at += snprintf(line + at, sizeof(line) - at, " %s+0x%llX", base ? base + 1 : name,
+                                   static_cast<unsigned long long>(static_cast<const char*>(frames[i]) -
+                                                                   reinterpret_cast<const char*>(mod)));
+                }
+                else
+                    at += snprintf(line + at, sizeof(line) - at, " %p", frames[i]);
+            }
+            BVR_INFO("%s", line);
+        }
+    }
+
+    /* The UI target first, and outside the eye capture's arming: the two windows
+       are opened independently and the interface target is created long after
+       the eyes are. Same size, render-target bind, first one wins. */
+    if (g_uiCapture.armed.load(std::memory_order_acquire) &&
+        g_uiCapture.texture == nullptr &&
+        (desc->BindFlags & D3D11_BIND_RENDER_TARGET) != 0 &&
+        desc->Width == g_uiCapture.width && desc->Height == g_uiCapture.height)
+    {
+        g_uiCapture.texture = *outTexture;
+        (*outTexture)->AddRef();
+    }
+    else if (g_handCapture.armed.load(std::memory_order_acquire) &&
+             g_handCapture.texture == nullptr &&
+             (desc->BindFlags & D3D11_BIND_RENDER_TARGET) != 0 &&
+             desc->Width == g_handCapture.width && desc->Height == g_handCapture.height)
+    {
+        g_handCapture.texture = *outTexture;
+        (*outTexture)->AddRef();
+    }
 
     if (!g_capture.armed.load(std::memory_order_acquire))
         return hr;
@@ -416,7 +577,7 @@ HRESULT STDMETHODCALLTYPE hooked_create_texture2d(
 
 
 // ---------------------------------------------------------------------------
-// Eye depth capture (AFW)
+// Eye depth capture (DR)
 // ---------------------------------------------------------------------------
 
 using PFN_OMSetRenderTargets = void (STDMETHODCALLTYPE*)(
@@ -579,7 +740,7 @@ void depth_census_tick()
            session debugging the wrong thing. Kept, because "how many scene depths
            does rgl have" is worth knowing; demoted, because the answer is no
            longer alarming. */
-        BVR_INFO("AFW depth census: the buffer we settled on was bound %u time(s) "
+        BVR_INFO("DR depth census: the buffer we settled on was bound %u time(s) "
                  "this second and a DIFFERENT one of identical size and format %u "
                  "time(s) - rgl keeps one scene depth per eye and alternates. "
                  "Expected under AFR, and handled: the warp is given whichever was "
@@ -588,7 +749,7 @@ void depth_census_tick()
     }
     else
     {
-        BVR_INFO("AFW depth census: the buffer we hold was bound %u time(s) this "
+        BVR_INFO("DR depth census: the buffer we hold was bound %u time(s) this "
                  "second and no same-sized alternative was ever seen, so it is "
                  "the only scene depth there is and freezing on it is correct.",
                  g_depthHeldBinds);
@@ -904,7 +1065,7 @@ void note_render_targets(ID3D11DeviceContext* context,
             return;
         }
 
-        BVR_INFO("AFW: a LARGER scene depth appeared - %ux%u replaces %ux%u. The "
+        BVR_INFO("DR: a LARGER scene depth appeared - %ux%u replaces %ux%u. The "
                  "first eye-shaped depth of a frame is not always the scene's.",
                  incoming.Width, incoming.Height, held.Width, held.Height);
 
@@ -920,7 +1081,7 @@ void note_render_targets(ID3D11DeviceContext* context,
         g_loggedDepth = true;
 
         const D3D11_TEXTURE2D_DESC& d = incoming;
-        BVR_INFO("AFW: eye depth buffer found by its binding: %ux%u fmt %d "
+        BVR_INFO("DR: eye depth buffer found by its binding: %ux%u fmt %d "
                  "bind 0x%X samples %u (%.0f%% of the eye in each axis).",
                  d.Width, d.Height, static_cast<int>(d.Format),
                  d.BindFlags, d.SampleDesc.Count,
@@ -931,8 +1092,8 @@ void note_render_targets(ID3D11DeviceContext* context,
 
         if ((d.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0)
         {
-            BVR_WARN("AFW: that depth buffer has no SHADER_RESOURCE bind flag, so "
-                     "it cannot be sampled and the warp cannot run. AFW will stay "
+            BVR_WARN("DR: that depth buffer has no SHADER_RESOURCE bind flag, so "
+                     "it cannot be sampled and the warp cannot run. DR will stay "
                      "off; AFR is unaffected.");
         }
     }
@@ -1031,7 +1192,7 @@ void STDMETHODCALLTYPE hooked_om_set_render_targets(
        around each re-issued draw) are not the engine choosing a target: the
        depth watch would count the twin depth buffers as rgl's, and the window
        clear has nothing to find in them. stereo_in_dup() is never true outside
-       native stereo, so AFR and AFW take exactly the path they always did. */
+       native stereo, so AFR and DR take exactly the path they always did. */
     if (stereo_in_dup())
     {
         g_originalOMSetRT(context, count, rtvs, dsv);
@@ -1093,13 +1254,13 @@ bool install_depth_hook()
 
     if (!a || !b)
     {
-        BVR_ERR("AFW: could not hook OMSetRenderTargets; the eye depth buffer "
-                "cannot be found and AFW will stay off.");
+        BVR_ERR("DR: could not hook OMSetRenderTargets; the eye depth buffer "
+                "cannot be found and DR will stay off.");
         return false;
     }
 
     g_depthHookInstalled.store(true, std::memory_order_release);
-    BVR_INFO("AFW: OMSetRenderTargets vtable-hooked; watching for the depth bound "
+    BVR_INFO("DR: OMSetRenderTargets vtable-hooked; watching for the depth bound "
              "with the eye target.");
     return true;
 }
@@ -1329,6 +1490,113 @@ ID3D11Texture2D* eye_texture(int32_t eye)
     return (eye >= 0 && eye <= 1) ? g_eyeTextures[eye] : nullptr;
 }
 
+/* --- the interface's render target (TEST 299) ---------------------------- */
+
+bool arm_ui_capture(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0)
+        return false;
+
+    if (!install_texture_hook())
+        return false;
+
+    release_ui_texture();
+
+    g_uiCapture.width = width;
+    g_uiCapture.height = height;
+
+    g_uiCapture.armed.store(true, std::memory_order_release);
+    BVR_INFO("UI target capture armed for a %ux%u render target.", width, height);
+    return true;
+}
+
+int32_t finish_ui_capture()
+{
+    if (g_uiTexture != nullptr)
+        return BVR_OK;
+
+    if (g_uiCapture.texture == nullptr)
+        return BVR_SESSION_NOT_READY;
+
+    g_uiTexture = g_uiCapture.texture;      /* transfer the AddRef */
+    g_uiCapture.texture = nullptr;
+
+    /* Disarmed once taken. Unlike the eyes there is nothing to watch for here:
+       the interface target is ours, created once, and rgl never resizes it. */
+    g_uiCapture.armed.store(false, std::memory_order_release);
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    g_uiTexture->GetDesc(&desc);
+    BVR_INFO("UI target captured: %p, %ux%u, format %d, bind 0x%X.",
+             static_cast<void*>(g_uiTexture), desc.Width, desc.Height,
+             static_cast<int>(desc.Format), desc.BindFlags);
+    return BVR_OK;
+}
+
+ID3D11Texture2D* ui_texture()
+{
+    return g_uiTexture;
+}
+
+void release_ui_texture()
+{
+    g_uiCapture.armed.store(false, std::memory_order_release);
+
+    if (g_uiCapture.texture != nullptr)
+    {
+        g_uiCapture.texture->Release();
+        g_uiCapture.texture = nullptr;
+    }
+
+    if (g_uiTexture != nullptr)
+    {
+        g_uiTexture->Release();
+        g_uiTexture = nullptr;
+    }
+}
+
+/* --- the map bar's own render target (TEST 531) -------------------------- */
+
+bool arm_hand_capture(uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0 || !install_texture_hook())
+        return false;
+
+    g_handCapture.armed.store(false, std::memory_order_release);
+    if (g_handCapture.texture != nullptr) { g_handCapture.texture->Release(); g_handCapture.texture = nullptr; }
+    if (g_handTexture != nullptr)         { g_handTexture->Release();         g_handTexture = nullptr; }
+
+    g_handCapture.width = width;
+    g_handCapture.height = height;
+    g_handCapture.armed.store(true, std::memory_order_release);
+    BVR_INFO("Hand UI target capture armed for a %ux%u render target (TEST 531).", width, height);
+    return true;
+}
+
+int32_t finish_hand_capture()
+{
+    if (g_handTexture != nullptr)
+        return BVR_OK;
+    if (g_handCapture.texture == nullptr)
+        return BVR_SESSION_NOT_READY;
+
+    g_handTexture = g_handCapture.texture;      /* transfer the AddRef */
+    g_handCapture.texture = nullptr;
+    g_handCapture.armed.store(false, std::memory_order_release);
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    g_handTexture->GetDesc(&desc);
+    BVR_INFO("Hand UI target captured: %p, %ux%u, format %d, bind 0x%X (TEST 531).",
+             static_cast<void*>(g_handTexture), desc.Width, desc.Height,
+             static_cast<int>(desc.Format), desc.BindFlags);
+    return BVR_OK;
+}
+
+ID3D11Texture2D* hand_texture()
+{
+    return g_handTexture;
+}
+
 void arm_backbuffer_clear(ID3D11Texture2D* backbuffer)
 {
     g_clearTarget.store(backbuffer, std::memory_order_release);
@@ -1363,7 +1631,7 @@ void arm_depth_capture()
 
         D3D11_TEXTURE2D_DESC d = {};
         g_eyeDepth->GetDesc(&d);
-        BVR_INFO("AFW: depth choice settled on %ux%u after %d frames of looking "
+        BVR_INFO("DR: depth choice settled on %ux%u after %d frames of looking "
                  "for a larger one. The watch is now off and costs nothing.",
                  d.Width, d.Height, g_depthStableFrames);
         return;
@@ -1380,8 +1648,8 @@ void arm_depth_capture()
     if (g_eyeDepth == nullptr && ++g_depthArmedFrames > 240)
     {
         g_depthGaveUp = true;
-        BVR_WARN("AFW: no depth buffer was ever bound alongside an eye-sized "
-                 "render target in %d frames of looking. AFW cannot run and the "
+        BVR_WARN("DR: no depth buffer was ever bound alongside an eye-sized "
+                 "render target in %d frames of looking. DR cannot run and the "
                  "watch is being switched off so it stops costing anything. The "
                  "survey above shows what WAS bound.", g_depthArmedFrames);
         return;
@@ -1419,7 +1687,7 @@ void depth_reject_current(const char* why)
     g_depthArmedFrames  = 0;
     g_loggedDepth       = false;
 
-    BVR_WARN("AFW: the %ux%u fmt %d depth target is not the scene's - %s. It is "
+    BVR_WARN("DR: the %ux%u fmt %d depth target is not the scene's - %s. It is "
              "blacklisted and the search continues; rgl binds more than one "
              "eye-sized depth per frame and they cannot be told apart by size.",
              d.Width, d.Height, static_cast<int>(d.Format), why);
@@ -1457,7 +1725,7 @@ void depth_rearm(const char* why)
     g_depthArmedFrames  = 0;
     g_loggedDepth       = false;
 
-    BVR_INFO("AFW: depth search re-opened - %s. The buffer we were holding %s "
+    BVR_INFO("DR: depth search re-opened - %s. The buffer we were holding %s "
              "and would have gone on being read after the engine stopped "
              "writing to it.", why,
              had ? "has been dropped" : "was already gone");
@@ -1482,7 +1750,7 @@ ID3D11Texture2D* eye_depth_texture()
 
        The census measured it exactly: 810 binds of the held buffer against 810
        of a same-sized different one, a perfect alternation. It reads zero while
-       a single eye is rendered - pinned AFW - which is why this went unseen: the
+       a single eye is rendered - pinned DR - which is why this went unseen: the
        fault needs both eyes rendering to exist at all.
 
        Submitting the wrong eye's depth to the compositor makes its positional

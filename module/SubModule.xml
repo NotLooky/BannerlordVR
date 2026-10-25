@@ -2,7 +2,16 @@
 <Module>
   <Name value="Bannerlord VR" />
   <Id value="BannerlordVR" />
-  <Version value="v0.1.0" />
+  <!-- NUMBERS ONLY, after a single letter prefix: v0.1.0, optionally v0.1.0.0.
+       The launcher parses this with TaleWorlds' ApplicationVersion, which
+       int.Parses each dot-separated field. A prerelease suffix - v0.1.0-alpha.1
+       - throws, and the launcher reports it as "Module ../../Modules/
+       BannerlordVR can't be loaded, there are some errors. Input string was not
+       in a correct format." The mod then does not load at all.
+
+       So the alpha number lives in the git tag, the zip name and the CHANGELOG,
+       never here. -->
+  <Version value="v0.2.7" />
   <SingleplayerModule value="true" />
 
   <!-- Deliberately false. The camera and input hooks are indistinguishable from

@@ -21,3 +21,6 @@ tools/__pycache__/
 # technique notes on other VR mods. They stay on disk; they are not published.
 docs/engine-re-findings.md
 docs/reference-vr-mods.md
+
+# NVIDIA DLSS runtime: 56 MB binary, staged locally (see native/thirdparty/dlss/README.md)
+native/thirdparty/dlss/*.dll

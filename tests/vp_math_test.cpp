@@ -33,7 +33,48 @@ namespace bvr {
 ID3D11Device* engine_device() { return nullptr; }
 bool present_hook_ready() { return false; }
 bool vtable_hook(void**, int, void*, void**) { return false; }
+
+/* The source also contains renderer hooks. They are outside this math test;
+   fail immediately if a tested math path ever starts depending on one. */
+ID3D11DeviceContext* engine_context() { abort(); }
+uint32_t present_thread_id() { abort(); }
+uint64_t present_count() { abort(); }
+ID3D11Texture2D* eye_texture(int) { abort(); }
+void frame_map_install(ID3D11Device*, ID3D11DeviceContext*) { abort(); }
+void frame_map_present(ID3D11DeviceContext*) { abort(); }
+bool frame_map_capturing() { abort(); }
+void frame_map_draw(ID3D11DeviceContext*, const char*, const char*) { abort(); }
+void frame_map_compute(ID3D11DeviceContext*, const char*, const char*) { abort(); }
+void frame_map_clear_dsv(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, float, UINT) { abort(); }
+void frame_map_cb_upload(ID3D11Resource*, const void*, UINT, UINT, const char*) { abort(); }
+void frame_map_map(ID3D11Resource*, UINT, D3D11_MAP) { abort(); }
+void frame_map_update(ID3D11Resource*, UINT, const D3D11_BOX*, const void*) { abort(); }
+void late_latch_note_upload(const void*, UINT) { abort(); }
+bool stereo_active() { abort(); }
+void stereo_on_cb_upload(ID3D11Resource*, const void*, UINT) { abort(); }
+void stereo_on_update(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT) { abort(); }
+ID3D11Resource* stereo_readback_map(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT,
+    D3D11_MAPPED_SUBRESOURCE*, HRESULT (__stdcall*)(ID3D11DeviceContext*, ID3D11Resource*, UINT,
+    D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*), HRESULT*) { abort(); }
+bool stereo_begin(ID3D11DeviceContext*, StereoOp&, bool) { abort(); }
+void stereo_bind(ID3D11DeviceContext*, StereoOp&) { abort(); }
+void stereo_end(ID3D11DeviceContext*, StereoOp&) { abort(); }
+void stereo_clear_dsv(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, float, UINT8) { abort(); }
+bool stereo_in_dup() { abort(); }
+void stereo_frame_boundary() { abort(); }
+int64_t stereo_perf_map_begin(D3D11_MAP) { abort(); }
+void stereo_perf_map_end(int64_t, ID3D11Resource*) { abort(); }
+void frame_map_clear_rtv(ID3D11DeviceContext*, ID3D11RenderTargetView*, const float[4]) { abort(); }
+void stereo_clear_rtv(ID3D11DeviceContext*, ID3D11RenderTargetView*, const float[4]) { abort(); }
+void xr_note_vp_published(const float[3]) { abort(); }
+bool ui_ss_substitute(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11RenderTargetView**,
+                      ID3D11DepthStencilView**) { abort(); }
+void ui_ss_after_bind(ID3D11DeviceContext*, bool) { abort(); }
+const D3D11_VIEWPORT* ui_ss_viewports(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*, D3D11_VIEWPORT*) { abort(); }
+const D3D11_RECT* ui_ss_scissors(ID3D11DeviceContext*, UINT, const D3D11_RECT*, D3D11_RECT*) { abort(); }
+ID3D11RenderTargetView* ui_ss_clear_twin(ID3D11RenderTargetView*) { abort(); }
 } // namespace bvr
+bool ngx_hook_install() { abort(); }
 
 namespace {
 
@@ -216,7 +257,7 @@ void run_case(const char* name, int handed, bool reversed, bool expandFov,
     bvr::g_cfg.expand = expandFov;
 
     Mat4 got;
-    check(bvr::build_replacement(vp, f, pub, got), "build_replacement() succeeds");
+    check(bvr::build_replacement(vp, f, pub, got, true, false), "build_replacement() succeeds");
 
     /* --- what it SHOULD be -------------------------------------------- */
     /* Built the honest way: the eye's own view matrix times a projection with

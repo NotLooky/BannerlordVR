@@ -1,6 +1,7 @@
 #include "late_latch.h"
 
 #include "bvr_config.h"
+#include "perf_options.h"
 #include "bvr_log.h"
 #include "d3d_hooks.h"
 #include "vp_patch.h"
@@ -20,19 +21,31 @@
 namespace bvr {
 namespace {
 
-/* See late_latch.h for where these come from. */
-constexpr uintptr_t kRvaBuilder       = 0x28C210;
-constexpr uintptr_t kRvaSceneViewVtbl = 0xB03360;
+/* See late_latch.h for where these come from.
 
-/* THE SCENE CAMERA IS NAMED BY ITS CALLER, NOT ITS CLASS (TEST 167, run 2).
+   THE SCENE CAMERA IS NAMED BY ITS CALLER, NOT ITS CLASS (TEST 167, run 2).
    The object the builder receives is a plain render-view struct - its first
    qword is flags, not a vptr (0x38006BA3B0001) - so no vtable can match it.
    What identifies the scene exactly is the call site: the return address
    +0x3656F0 is inside sub_180365120, called by rglScene_view::render, and the
    frame built there sat 0.06 m from the published engine camera on every
-   report while every other caller was hundreds of metres away. */
-constexpr uintptr_t kRvaSceneCallerRet = 0x3656F0;
-constexpr size_t    kOffFrame         = 0xF0;     /* 4 x float4 */
+   report while every other caller was hundreds of metres away.
+
+   ONE ROW PER GAME BUILD (TEST 550). The 1.5.5 beta moved the code: the builder
+   is the only match of kSig, at +0x270D40, and the scene call returns at
+   +0x34A9F0 - inside sub_18034A420 (called by rglScene_view::render, vf28) at
+   +0x5D0, the same offset as +0x3656F0 in sub_180365120; its sibling
+   sub_180349B40 is 0x8E0 long like sub_180364840 was. The builder still reads
+   the frame at view+0xF0 and inverts it into +0x18080. A row is used only if
+   the live DLL has kSig at its builder AND a call to that builder right
+   before its scene return address, so a build matching neither refuses. */
+struct EngineBuild { uintptr_t builder, sceneRet, sceneVtbl; const char* name; };
+const EngineBuild kBuilds[] = {
+    { 0x28C210, 0x3656F0, 0xB03360, "stable (pre-1.5.5)" },
+    { 0x270D40, 0x34A9F0, 0xB05060, "1.5.5 beta" },
+};
+const EngineBuild* g_build = nullptr;
+constexpr size_t   kOffFrame = 0xF0;     /* 4 x float4 */
 
 /* The builder's first 19 bytes: mov r11,rsp / push rbp / push rbx /
    lea rbp,[r11-298h] / sub rsp,388h. A game update that moves or rewrites the
@@ -246,8 +259,26 @@ bool finite_m3(const M3& a)
 constexpr float kLatchEyeRadius = 0.2f;   /* metres: frame must sit at a published eye */
 constexpr float kLatchMaxDeg    = 10.0f;  /* anything larger is a mismatch, not latency */
 
-std::atomic<uint64_t> g_latched{0};
+std::atomic<uint64_t> g_latched{0}, g_fromOlder{0};
 std::atomic<uint64_t> g_skipNoPub{0}, g_skipFar{0}, g_skipBase{0}, g_skipBig{0}, g_skipNoPose{0};
+
+/* THE FRAME BEING BUILT MAY BE A TICK OLDER THAN THE NEWEST PUBLICATION (TEST 396).
+ *
+   The builder runs on its own thread (not the render thread), and its phase
+   against the game tick can slip by a frame and STAY slipped (2026-10-05,
+   07:06:37 to the end of the battle). The frame then sits a tick of travel
+   behind the published eyes - 175 mm at a gallop, so nearly the same distance
+   from both - and nearest-eye was a coin flip: about half the builds were filed
+   as eye 1, the eye-0 capture found no pairing, fell back to the slot (the next
+   frame's pose) and the head floated ("pairing: 81 matched, 369 fell back";
+   "frame 176.1 mm from eye 0, 172.9 from eye 1"; the base check 0.01 -> 2 deg).
+   So the last few publications are kept, each with the used pose read beside it,
+   and the frame is paired with the one it was built from BY CONTENT - the
+   smallest base check, like TEST 178 - which also gives W from the right tick. */
+struct PubSnap { VpFrame pub, other; BvrEyeView used[2]; };
+constexpr int kSnaps = 3;
+PubSnap g_snaps[kSnaps] = {};   /* newest first; under g_lock */
+int     g_snapCount = 0;
 std::atomic<uint64_t> g_baseSumUdeg{0}, g_baseMaxUdeg{0}, g_latchSumUdeg{0}, g_latchMaxUdeg{0};
 std::atomic<bool>     g_latchLogged{false};
 
@@ -261,7 +292,7 @@ void atomic_max(std::atomic<uint64_t>& a, uint64_t v)
  *
    The builder runs a frame ahead of the capture: frame N is captured only after
    frame N+1 has been built. Under AFR the next build is the other eye, so one
-   slot per eye still holds the right one. Under AFW every build is eye 0, the
+   slot per eye still holds the right one. Under DR every build is eye 0, the
    slot holds frame N+1's pose when frame N is captured, and the label is a
    frame too new - the world lagging every turn. TEST 176's FIFO fixed that only
    while the pipeline depth held still; a mode switch moved it and the float
@@ -280,6 +311,7 @@ struct LatchBuild
     BvrQuat  fresh;     /* the stage orientation those rows were set to */
     uint32_t eye;
     uint64_t seq;       /* 0 = empty */
+    float    pubPos[3]; /* TEST 620: the publication's eye camera position - its identity */
 };
 
 constexpr int kBuildRing = 8;
@@ -290,10 +322,11 @@ uint64_t   g_buildSeq = 0;
    taken it yet. Both guarded by g_lock, like the ring. */
 LatchBuild g_drawn = {};
 bool       g_drawnTaken = true;
+bool       g_drawnPeeked = true;   /* TEST 620: the interface's own, apart from DR's */
 
 std::atomic<uint64_t> g_pairMatched{0}, g_pairFallback{0};
 
-void record_build(const float* f, uint32_t eye, const BvrQuat& fresh)
+void record_build(const float* f, uint32_t eye, const BvrQuat& fresh, const float* pubPos)
 {
     SpinGuard guard;
     LatchBuild& b = g_builds[g_buildSeq % kBuildRing];
@@ -303,6 +336,7 @@ void record_build(const float* f, uint32_t eye, const BvrQuat& fresh)
     b.fresh = fresh;
     b.eye   = eye;
     b.seq   = ++g_buildSeq;
+    memcpy(b.pubPos, pubPos, sizeof(b.pubPos));
 }
 
 void apply_latch(void* view)
@@ -324,26 +358,67 @@ void apply_latch(void* view)
         return;
     }
 
-    /* Which eye is this frame? The published eye whose position it sits at. */
+    /* A new publication goes in front, with the used pose read beside it now -
+       the first read is the one nearest the tick that published it. */
+    PubSnap snaps[kSnaps];
+    int nsnaps = 0;
+    {
+        SpinGuard guard;
+        if (g_snapCount == 0 ||
+            memcmp(g_snaps[0].pub.eyeCamera, pub.eyeCamera, sizeof(pub.eyeCamera)) != 0)
+        {
+            memmove(g_snaps + 1, g_snaps, sizeof(PubSnap) * (kSnaps - 1));
+            g_snaps[0] = PubSnap{ pub, other, { used[0], used[1] } };
+            if (g_snapCount < kSnaps)
+                ++g_snapCount;
+        }
+        nsnaps = g_snapCount;
+        memcpy(snaps, g_snaps, sizeof(PubSnap) * nsnaps);
+    }
+
+    /* For each publication: which eye is this frame (the one whose position it
+       sits at), and how far is it from that eye seen through the publication's W.
+       The publication it was built from reads ~0.01 deg; a tick away reads a
+       tick of head and horse turn. W comes from the publication's own eye: world
+       frame and the stage pose it was built from came out of the same managed
+       tick. eyeCamera rows are right, up, FORWARD, so the z column is the
+       negated forward. */
     const float* pos = f + 12;
-    const float dPub[3]   = { pos[0] - pub.eyeCamera[12],   pos[1] - pub.eyeCamera[13],   pos[2] - pub.eyeCamera[14] };
-    const float dOther[3] = { pos[0] - other.eyeCamera[12], pos[1] - other.eyeCamera[13], pos[2] - other.eyeCamera[14] };
-    const float lp = len3f(dPub), lo = len3f(dOther);
-    const int   eye = (lp <= lo) ? pub.eye : other.eye;
-    if ((lp <= lo ? lp : lo) > kLatchEyeRadius)
+    const M3 engine = m3_from_cols(f + 0, f + 4, f + 8, 1.0f);   /* rows are x, y, z already */
+    int   best = -1, eye = 0;
+    float baseDeg = 1e30f, dist = 0.0f;
+    M3    W = {};
+    for (int s = 0; s < nsnaps; ++s)
+    {
+        const PubSnap& p = snaps[s];
+        const float dPub[3]   = { pos[0] - p.pub.eyeCamera[12],   pos[1] - p.pub.eyeCamera[13],   pos[2] - p.pub.eyeCamera[14] };
+        const float dOther[3] = { pos[0] - p.other.eyeCamera[12], pos[1] - p.other.eyeCamera[13], pos[2] - p.other.eyeCamera[14] };
+        const float lp = len3f(dPub), lo = len3f(dOther);
+        const int   e  = (lp <= lo) ? p.pub.eye : p.other.eye;
+
+        const M3 worldPub = m3_from_cols(p.pub.eyeCamera + 0, p.pub.eyeCamera + 4, p.pub.eyeCamera + 8, -1.0f);
+        const M3 w = m3_mul_bt(worldPub, m3_from_quat(p.used[p.pub.eye].orientation));
+        const float d = m3_angle_deg(engine, m3_mul(w, m3_from_quat(p.used[e].orientation)));
+        if (d < baseDeg)
+        {
+            baseDeg = d;
+            best = s;
+            eye = e;
+            W = w;
+            dist = lp <= lo ? lp : lo;
+        }
+    }
+    if (best < 0)
+    {
+        g_skipNoPose.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (dist > kLatchEyeRadius)
     {
         g_skipFar.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    /* W from the newest publication's own eye: world frame and the stage pose it
-       was built from came out of the same managed tick. eyeCamera rows are
-       right, up, FORWARD, so the z column is the negated forward. */
-    const M3 worldPub = m3_from_cols(pub.eyeCamera + 0, pub.eyeCamera + 4, pub.eyeCamera + 8, -1.0f);
-    const M3 W = m3_mul_bt(worldPub, m3_from_quat(used[pub.eye].orientation));
-
-    const M3 engine = m3_from_cols(f + 0, f + 4, f + 8, 1.0f);   /* rows are x, y, z already */
-    const M3 base   = m3_mul(W, m3_from_quat(used[eye].orientation));
     const M3 target = m3_mul(W, m3_from_quat(fresh[eye].orientation));
     if (!finite_m3(W) || !finite_m3(target))
     {
@@ -354,7 +429,6 @@ void apply_latch(void* view)
     /* Base check: the frame the engine is about to build from must BE the used
        pose seen through W, up to the latency between them. If it is not, W or the
        axis mapping is wrong, and writing would be damage. */
-    const float baseDeg = m3_angle_deg(engine, base);
     const float latchDeg = m3_angle_deg(engine, target);
     if (!(baseDeg < kLatchMaxDeg))
     {
@@ -375,10 +449,12 @@ void apply_latch(void* view)
         f[k * 4 + 3] = 0.0f;
     }
 
-    record_build(f, static_cast<uint32_t>(eye), fresh[eye].orientation);
+    record_build(f, static_cast<uint32_t>(eye), fresh[eye].orientation, snaps[best].pub.eyeCamera + 12);
     xr_set_latched_orientation(static_cast<uint32_t>(eye), fresh[eye].orientation);
 
     g_latched.fetch_add(1, std::memory_order_relaxed);
+    if (best > 0)
+        g_fromOlder.fetch_add(1, std::memory_order_relaxed);
     const uint64_t bu = static_cast<uint64_t>(baseDeg * 1e6f);
     const uint64_t lu = static_cast<uint64_t>(latchDeg * 1e6f);
     g_baseSumUdeg.fetch_add(bu, std::memory_order_relaxed);
@@ -393,19 +469,19 @@ void apply_latch(void* view)
 
 uintptr_t detour(void* a, void* b, void* c, void* d)
 {
-    g_calls.fetch_add(1, std::memory_order_relaxed);
+    const bool inspect = probe_on() || perf_diagnostics();
+    if (inspect) g_calls.fetch_add(1, std::memory_order_relaxed);
 
     /* rglScene_view only: loading screens, tableaus, texture and video views run
        the same builder with cameras that are none of our business. The vtable is
        the class, exactly, with no heuristic about where the camera points. */
     if (a != nullptr)
     {
-        const uintptr_t vtbl = *reinterpret_cast<const uintptr_t*>(a);
         const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
-        note_vtable(a, vtbl, ret);
-        if (ret - g_base == kRvaSceneCallerRet)
+        if (inspect) note_vtable(a, *reinterpret_cast<const uintptr_t*>(a), ret);
+        if (ret - g_base == g_build->sceneRet)
         {
-            note_scene_call(a, ret);   /* the engine's frame, before we touch it */
+            if (inspect) note_scene_call(a, ret);   /* diagnostic only; pairing is separate */
             if (latch_on())
                 apply_latch(a);
         }
@@ -425,6 +501,7 @@ void report()
     int ncallers = 0;
     bool haveFrame = false;
     uint64_t frameAt = 0;
+    if (probe_on() || perf_diagnostics())
     {
         SpinGuard guard;
         memcpy(frame, g_lastFrame, sizeof(frame));
@@ -447,11 +524,14 @@ void report()
         if (!n) { g_baseSumUdeg.store(0); g_latchSumUdeg.store(0); }
         BVR_INFO("Late latch: %llu frame(s) latched in ~5 s; rotation applied mean %.3f / "
                  "max %.3f deg; engine-vs-used check mean %.3f / max %.3f deg; %llu capture(s) "
-                 "labelled with the latched pose. Skipped: %llu no publication, %llu no pose, "
+                 "labelled with the latched pose; %llu built from an older publication "
+                 "(TEST 396: the builder a tick behind the game). Skipped: %llu no "
+                 "publication, %llu no pose, "
                  "%llu not at an eye, %llu base check failed, %llu rotation too large.",
                  static_cast<unsigned long long>(n), latchMean,
                  g_latchMaxUdeg.exchange(0) / 1e6, baseMean, g_baseMaxUdeg.exchange(0) / 1e6,
                  static_cast<unsigned long long>(xr_latched_captures()),
+                 static_cast<unsigned long long>(g_fromOlder.exchange(0)),
                  static_cast<unsigned long long>(g_skipNoPub.exchange(0)),
                  static_cast<unsigned long long>(g_skipNoPose.exchange(0)),
                  static_cast<unsigned long long>(g_skipFar.exchange(0)),
@@ -462,7 +542,7 @@ void report()
         const uint64_t fellBack = g_pairFallback.exchange(0);
         if (matched != 0 || fellBack != 0)
         {
-            BVR_INFO("Late latch pairing (AFW): %llu capture(s) labelled with the build "
+            BVR_INFO("Late latch pairing (DR): %llu capture(s) labelled with the build "
                      "they were drawn from, %llu fell back to the newest build. Fallbacks "
                      "should be ~0; a steady stream means the frame's camera upload was "
                      "not matched to a build.",
@@ -470,6 +550,8 @@ void report()
                      static_cast<unsigned long long>(fellBack));
         }
     }
+
+    if (!probe_on() && !perf_diagnostics()) return;
 
     BVR_INFO("Late latch probe: %llu matrix build(s) in ~5 s, %llu of them the scene "
              "view, at most %llu scene build(s) in one frame. Present thread %lu.",
@@ -620,17 +702,34 @@ void late_latch_install()
     }
     g_base = reinterpret_cast<uintptr_t>(mod);
 
-    void* target = reinterpret_cast<void*>(g_base + kRvaBuilder);
-    if (memcmp(target, kSig, sizeof(kSig)) != 0)
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_base);
+    const auto* nt  = reinterpret_cast<const IMAGE_NT_HEADERS*>(g_base + dos->e_lfanew);
+    const uintptr_t imageSize = nt->OptionalHeader.SizeOfImage;
+    for (const EngineBuild& b : kBuilds)
     {
-        const uint8_t* t = static_cast<const uint8_t*>(target);
-        BVR_WARN("Late latch REFUSED: the view matrix builder at TaleWorlds.Native.dll+0x%llX "
-                 "does not match its signature (found %02X %02X %02X %02X %02X %02X ...). The game "
-                 "has probably been updated; the offsets in late_latch.cpp must be re-derived "
-                 "with tools/native_xref.py before this can run. Nothing was hooked.",
-                 static_cast<unsigned long long>(kRvaBuilder), t[0], t[1], t[2], t[3], t[4], t[5]);
+        if (b.builder + sizeof(kSig) > imageSize || b.sceneRet > imageSize || b.sceneRet < 5)
+            continue;
+        const uint8_t* call = reinterpret_cast<const uint8_t*>(g_base + b.sceneRet - 5);
+        int32_t rel = 0;
+        memcpy(&rel, call + 1, sizeof(rel));
+        if (memcmp(reinterpret_cast<const void*>(g_base + b.builder), kSig, sizeof(kSig)) == 0 &&
+            call[0] == 0xE8 && b.sceneRet + static_cast<intptr_t>(rel) == b.builder)
+        {
+            g_build = &b;
+            break;
+        }
+    }
+    if (g_build == nullptr)
+    {
+        BVR_WARN("Late latch REFUSED: no known game build matches TaleWorlds.Native.dll (the "
+                 "view matrix builder's signature and its scene call site were checked for %u "
+                 "build(s)). The game has probably been updated; add a row to kBuilds in "
+                 "late_latch.cpp, re-derived with tools/native_xref.py. Nothing was hooked.",
+                 static_cast<unsigned>(sizeof(kBuilds) / sizeof(kBuilds[0])));
         return;
     }
+
+    void* target = reinterpret_cast<void*>(g_base + g_build->builder);
 
     void* tramp = nullptr;
     if (MH_CreateHook(target, reinterpret_cast<void*>(&detour), &tramp) != MH_OK ||
@@ -642,11 +741,13 @@ void late_latch_install()
 
     g_orig = reinterpret_cast<PFN_Builder>(tramp);
     g_hooked = true;
-    BVR_INFO("Late latch %s: hooked the view matrix builder TaleWorlds.Native.dll+0x%llX "
-             "(signature verified). rglScene_view vtable expected at +0x%llX.",
-             latch_on() ? "ARMED" : "probe (read-only)",
-             static_cast<unsigned long long>(kRvaBuilder),
-             static_cast<unsigned long long>(kRvaSceneViewVtbl));
+    BVR_INFO("Late latch %s: game build %s - hooked the view matrix builder "
+             "TaleWorlds.Native.dll+0x%llX, scene call returns at +0x%llX (signature and call "
+             "site verified). rglScene_view vtable expected at +0x%llX.",
+             latch_on() ? "ARMED" : "probe (read-only)", g_build->name,
+             static_cast<unsigned long long>(g_build->builder),
+             static_cast<unsigned long long>(g_build->sceneRet),
+             static_cast<unsigned long long>(g_build->sceneVtbl));
 }
 
 void late_latch_frame_boundary()
@@ -712,7 +813,21 @@ void late_latch_note_upload(const void* data, unsigned int bytes)
     {
         g_drawn = g_builds[best];
         g_drawnTaken = false;
+        g_drawnPeeked = false;
     }
+}
+
+bool late_latch_drawn_camera(float outPos[3])
+{
+    if (!latch_on() || outPos == nullptr)
+        return false;
+
+    SpinGuard guard;
+    if (g_drawnPeeked || g_drawn.seq == 0)
+        return false;
+    g_drawnPeeked = true;
+    memcpy(outPos, g_drawn.pubPos, sizeof(g_drawn.pubPos));
+    return true;
 }
 
 bool late_latch_drawn_orientation(unsigned int eye, float outXyzw[4])

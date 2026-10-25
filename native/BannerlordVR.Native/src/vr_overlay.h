@@ -85,7 +85,132 @@ struct OverlaySettings
        are not cleared on read - the panel and the managed side each hold the
        same answer and either may change it. */
     int32_t hideBody = 1;
+
+    /* Hands only (TEST 299): only has an effect while hideBody is on - keeps
+       the hand mesh(es) drawn alongside the weapon instead of hiding
+       everything but the weapon. Two-way, like hideBody. */
+    int32_t handsOnly = 0;
+
     int32_t motionHands = 0;
+
+    /* Physical collision combat: the mod's own hits, blocks and arrow blocks.
+       On by default; off leaves the hands and weapons posed and the game's own
+       trigger attacks in charge. Two-way, like the two above. */
+    int32_t physicalCombat = 1;
+
+    /* The full-body IK (TEST 253-257): the pelvis and torso follow the player,
+       the legs are solved to the game's own gait, and body_anim decides how
+       much animation is left. Off reverts to the normal animated body.
+       Two-way, like the toggles above. */
+    int32_t bodyIk = 1;
+
+    /* Motion-control combat (TEST 245-252): swings drive the game's attack
+       direction, a raised hand is the guard, the blade lands the damage. On by
+       default; off is the game's own trigger-and-stick combat with every
+       animation playing. Two-way, like the toggles above. */
+    int32_t motionMelee = 1;
+
+    /* Friendly fire (TEST 261): whether a physical swing can land on friends
+       and neutrals. Off by default - the vanilla single-player rule. Two-way,
+       like the toggles above; the managed side refuses it on missions that
+       forbid friendly fire. */
+    int32_t friendlyFire = 0;
+
+    /* Which controller the grip is saved for; index into kControllers in
+       vr_overlay.cpp. Two-way, like the toggles above. */
+    int32_t gripController = 0;
+
+    /* Body holsters (TEST 271). Two-way, like the toggles above. */
+    int32_t holster = 1;
+
+    /* The campaign map in VR (map_stereo). Two-way. */
+    int32_t mapVr = 0;
+
+    /* The VR tab (TEST 293). Two-way offsets; recenter is a one-shot. */
+    float   headUp = 0.0f;
+    float   headForward = 0.0f;
+    float   bodyTurnDeg = 90.0f;
+    int32_t recenter = 0;
+
+    /* Your height (TEST 356). playerHeight two-way (0 = the game's size),
+       heightMeasure a one-shot like recenter, bodyScale push-only. */
+    float   playerHeight = 0.0f;
+    int32_t heightMeasure = 0;
+    float   bodyScale = 1.0f;
+
+    /* The wrist HUD's width in metres (TEST 377e). Two-way; the panel applies it. */
+    float   wristHudWidth = 0.12f;
+
+    /* Foveated rendering (TEST 427): 0 off, 1 wide, 2 balanced, 3 narrow.
+       Two-way; the panel applies it. */
+    int32_t vrs = 0;
+
+    /* Eye-tracked foveation (TEST 428): the centre follows the gaze. Two-way. */
+    int32_t vrsEye = 1;
+
+    /* The head camera's height in the saddle (TEST 442). Two-way. */
+    float   headUpMounted = 0.10f;
+
+    /* Your body (TEST 450 / 447). Two-way. */
+    float   armScale = 1.0f;
+    float   bodyWeight = 0.25f;
+
+    /* Battle HUD extras (TEST 462). Two-way. */
+    int32_t hudHitMarker = 0;
+    int32_t hudPrompts = 0;
+
+    /* Five-finger hands (TEST 485). Two-way. */
+    int32_t handFingers = 1;
+
+    /* The campaign map's hand palette width in metres (TEST 527). Two-way; the
+       panel applies it. */
+    float   mapHandUiWidth = 0.15f;
+
+    /* The left thumbrest is a D-pad modifier too. Two-way. */
+    int32_t dpadThumbrest = 0;
+
+    /* TEST 620: battle markers / campaign labels size under the split. Two-way. */
+    float   uiWorldScaleBattle = 1.0f;
+    float   uiWorldScaleMap = 1.0f;
+
+    /* TEST 645: the weapon is solid against your own shield. Two-way. */
+    int32_t ownShieldBash = 1;
+
+    /* TEST 648: pre-battle formation markers size. Two-way. */
+    float   uiWorldScaleDeploy = 0.30f;
+
+    /* TEST 711: new-screen re-centre on/off and its turn-away angle. Two-way. */
+    int32_t uiRecenterNewScreen = 1;
+    float   uiRecenterAngle = 75.0f;
+
+    /* fov_true_vertical: render only the lens's own up/down. Two-way. */
+    int32_t fovTrueVertical = 0;
+
+    /* TEST 750: the Calibration tool. See BvrOverlayState. */
+    int32_t toolMode = 0;
+    int32_t toolHand = 0;
+    int32_t toolLive = -1;
+    int32_t toolCommand = 0;
+    float   toolValue[6] = {};
+    char    toolLabel[128] = {};
+    char    toolStatus[128] = {};
+
+    /* TEST 751: pose profile, the wielded slot and the four slot names. */
+    int32_t toolProfile = 0;
+    int32_t toolWielded = -1;
+    char    toolSlot[4][48] = {};
+
+    /* TEST 770: fov crop tangent multipliers. Two-way. */
+    float   fovCropH = 1.0f;
+    float   fovCropV = 1.0f;
+
+    /* TEST 785: detailed fov crop, per edge. Two-way. */
+    int32_t fovCropDetailed = 0;
+    float   fovCropLeft = 1.0f;
+    float   fovCropRight = 1.0f;
+    float   fovCropUp = 1.0f;
+    float   fovCropDown = 1.0f;
+
 
     /* The keyed interface layer: shown at all, and how big it hangs. */
     int32_t uiShow = 1;
@@ -105,6 +230,27 @@ struct OverlaySettings
 
     /* Sharpening of the submitted eye images, 0..1 (0 = off). */
     float   sharpen = 0.0f;
+    /* TEST 790: 0 CAS, 1 RCAS. */
+    int32_t sharpenMode = 0;
+    /* TEST 797: the cfg's dlss_preset (0 auto, 10-13 J-M, -1 DLSS's own). */
+    int32_t dlssPreset = 0;
+    int32_t gripToggle = 0;
+
+    /* Menu pointer speed, in screen widths per second at full stick. Nothing
+       native reads it - it is a managed setting that happens to need a slider,
+       and the panel is the only slider a player wearing the headset has. */
+    float   stickMouseSpeed = 1.1f;
+
+    /* Applying a resolution change without a restart. resolutionApply is an
+       EVENT and is cleared as it is read, for the same reason tableauProbe is:
+       one click is one rebuild, and a state that stayed set would tear the eye
+       pair down again every time any other setting changed.
+
+       resolutionState comes back the other way - 0 idle, 1 rebuilding, 2 live,
+       3 failed - so the button can report instead of the player guessing
+       whether a black flash meant success. */
+    int32_t resolutionApply = 0;
+    int32_t resolutionState = 0;
 };
 
 /* Called from the managed side through the ABI. */
@@ -115,6 +261,14 @@ bool overlay_visible();
    panel ON the calibration section, and a toggle would close it for anyone who
    already had it open. */
 void overlay_show(bool visible);
+
+/* Mouse-wheel notches from the game thread, added to the panel's next frame. */
+void overlay_scroll(float notches);
+
+/* TEST 378: the laser pointer on the panel, in panel UV (0..1, top-left
+   origin), with its click. onPanel false hands the pointer back to the desktop
+   cursor. Render thread only. */
+void overlay_set_pointer(bool onPanel, float u, float v, bool down);
 
 /* Managed pushes the current truth in; the panel edits its copy. */
 void overlay_set_settings(const OverlaySettings& in);

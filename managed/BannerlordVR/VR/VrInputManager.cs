@@ -180,11 +180,39 @@ namespace BannerlordVR.VR
             _inner.UpdateKeyData(keyData);
 
             // AFTER the inner call, which overwrites the array wholesale.
-            VrGamepad.StampKeyData(keyData);
+            if (!PanelOpen)
+                VrGamepad.StampKeyData(keyData);
         }
+
+        /// <summary>
+        /// The VR panel owns the controls while it is open: the game sees no
+        /// key, no stick, no mouse movement and no wheel, so a click on the panel
+        /// is not also a swing and a stick push is not also a step. End (the
+        /// panel's own key) and F10 (recentre) still get through.
+        /// </summary>
+        private static bool Blocked(InputKey key) =>
+            PanelOpen && key != InputKey.End && key != InputKey.F10;
+
+        /// <summary>This frame's wheel, for the panel - read past the block.</summary>
+        /// <summary>VrMenu.Open's storage. Kept here so the first input frame of
+        /// the game does not run VrMenu's static initialisers early.</summary>
+        internal static bool PanelOpen;
+
+        internal static float PanelScroll() => _installed?._inner.GetMouseDeltaZ() ?? 0f;
+
+        // The game reads the wheel as a running TOTAL and acts on its change, so
+        // zeroing it while the panel is open would land as one big scroll (a
+        // weapon switch) the moment it closed. The total is held still instead,
+        // and whatever turned meanwhile is subtracted from then on.
+        private static float _scrollOffset;
+        private static float _scrollAtOpen;
+        private static bool _scrollHeld;
 
         public Vec2 GetKeyState(InputKey key)
         {
+            if (Blocked(key))
+                return Vec2.Zero;
+
             Vec2 real = _inner.GetKeyState(key);
 
             if (!VrGamepad.TryKeyState(key, out Vec2 vr))
@@ -196,16 +224,17 @@ namespace BannerlordVR.VR
             return (vr.x * vr.x + vr.y * vr.y) > (real.x * real.x + real.y * real.y) ? vr : real;
         }
 
-        public bool IsKeyDown(InputKey key) => _inner.IsKeyDown(key) || VrGamepad.IsDown(key);
+        public bool IsKeyDown(InputKey key) =>
+            !Blocked(key) && (_inner.IsKeyDown(key) || VrGamepad.IsDown(key));
 
         public bool IsKeyDownImmediate(InputKey key) =>
-            _inner.IsKeyDownImmediate(key) || VrGamepad.IsDown(key);
+            !Blocked(key) && (_inner.IsKeyDownImmediate(key) || VrGamepad.IsDown(key));
 
         public bool IsKeyPressed(InputKey key) =>
-            _inner.IsKeyPressed(key) || VrGamepad.IsPressed(key);
+            !Blocked(key) && (_inner.IsKeyPressed(key) || VrGamepad.IsPressed(key));
 
         public bool IsKeyReleased(InputKey key) =>
-            _inner.IsKeyReleased(key) || VrGamepad.IsReleased(key);
+            !Blocked(key) && (_inner.IsKeyReleased(key) || VrGamepad.IsReleased(key));
 
         public bool IsControllerConnected() =>
             _inner.IsControllerConnected() || VrGamepad.Active;
@@ -263,22 +292,41 @@ namespace BannerlordVR.VR
 
         public float GetMousePositionX() => _inner.GetMousePositionX();
         public float GetMousePositionY() => _inner.GetMousePositionY();
-        public float GetMouseScrollValue() => _inner.GetMouseScrollValue();
+        public float GetMouseScrollValue()
+        {
+            float total = _inner.GetMouseScrollValue();
+            if (PanelOpen)
+            {
+                if (!_scrollHeld)
+                {
+                    _scrollHeld = true;
+                    _scrollAtOpen = total;
+                }
+                return _scrollAtOpen - _scrollOffset;
+            }
+
+            if (_scrollHeld)
+            {
+                _scrollHeld = false;
+                _scrollOffset += total - _scrollAtOpen;
+            }
+            return total - _scrollOffset;
+        }
         public bool IsAnyTouchActive() => _inner.IsAnyTouchActive();
         public void PressKey(InputKey key) => _inner.PressKey(key);
         public void ClearKeys() => _inner.ClearKeys();
         public int GetVirtualKeyCode(InputKey key) => _inner.GetVirtualKeyCode(key);
         public void SetClipboardText(string text) => _inner.SetClipboardText(text);
         public string GetClipboardText() => _inner.GetClipboardText();
-        public float GetMouseMoveX() => _inner.GetMouseMoveX();
-        public float GetMouseMoveY() => _inner.GetMouseMoveY();
-        public float GetNormalizedMouseMoveX() => _inner.GetNormalizedMouseMoveX();
-        public float GetNormalizedMouseMoveY() => _inner.GetNormalizedMouseMoveY();
+        public float GetMouseMoveX() => PanelOpen ? 0f : _inner.GetMouseMoveX();
+        public float GetMouseMoveY() => PanelOpen ? 0f : _inner.GetMouseMoveY();
+        public float GetNormalizedMouseMoveX() => PanelOpen ? 0f : _inner.GetNormalizedMouseMoveX();
+        public float GetNormalizedMouseMoveY() => PanelOpen ? 0f : _inner.GetNormalizedMouseMoveY();
         public float GetGyroX() => _inner.GetGyroX();
         public float GetGyroY() => _inner.GetGyroY();
         public float GetGyroZ() => _inner.GetGyroZ();
         public float GetMouseSensitivity() => _inner.GetMouseSensitivity();
-        public float GetMouseDeltaZ() => _inner.GetMouseDeltaZ();
+        public float GetMouseDeltaZ() => PanelOpen ? 0f : _inner.GetMouseDeltaZ();
         public Vec2 GetResolution() => _inner.GetResolution();
         public Vec2 GetDesktopResolution() => _inner.GetDesktopResolution();
         public void SetCursorPosition(int x, int y) => _inner.SetCursorPosition(x, y);

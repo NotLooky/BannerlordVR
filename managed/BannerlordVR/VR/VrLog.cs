@@ -15,6 +15,7 @@ namespace BannerlordVR.VR
     {
         private static readonly object Gate = new object();
         private static string _path;
+        private static StreamWriter _writer;
         private static bool _failed;
 
         public static string Path => _path;
@@ -47,10 +48,17 @@ namespace BannerlordVR.VR
                     // session without any logging at all.
                 }
 
-                File.WriteAllText(_path,
+                // TEST 421: one writer for the session. File.AppendAllText opened,
+                // appended and closed the file on the calling thread for every
+                // line - up to ~60 a second in a battle. AutoFlush keeps the old
+                // crash behaviour: each line is on disk when Write returns.
+                _writer = new StreamWriter(
+                    new FileStream(_path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite),
+                    Encoding.UTF8) { AutoFlush = true };
+                _writer.Write(
                     "=== BannerlordVR log opened " +
                     DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) +
-                    " ===" + Environment.NewLine, Encoding.UTF8);
+                    " ===" + Environment.NewLine);
             }
             catch
             {
@@ -67,16 +75,16 @@ namespace BannerlordVR.VR
 
         private static void Write(string level, string message)
         {
-            if (_failed || _path == null)
+            if (_failed || _writer == null)
                 return;
 
             try
             {
                 lock (Gate)
                 {
-                    File.AppendAllText(_path,
+                    _writer.Write(
                         DateTime.Now.ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture) +
-                        " [" + level + "] " + message + Environment.NewLine, Encoding.UTF8);
+                        " [" + level + "] " + message + Environment.NewLine);
                 }
             }
             catch

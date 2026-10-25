@@ -35,6 +35,7 @@ endif()
 set(BVR_OPENXR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/OpenXR-SDK)
 set(BVR_MINHOOK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/minhook)
 set(BVR_IMGUI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/imgui)
+set(BVR_NVAPI_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/nvapi)
 
 if(EXISTS ${BVR_OPENXR_DIR}/CMakeLists.txt AND EXISTS ${BVR_MINHOOK_DIR}/CMakeLists.txt)
     set(BVR_OPENXR_DEFAULT ON)
@@ -49,9 +50,9 @@ option(BVR_ENABLE_OPENXR "Link the OpenXR loader and build the real session" ${B
 
 # Say which one is being built, every configure, so it is never a surprise.
 if(BVR_ENABLE_OPENXR)
-    message(STATUS "BannerlordVR.Native: building WITH OpenXR (0.2.0-openxr)")
+    message(STATUS "BannerlordVR.Native: building WITH OpenXR (0.2.7-openxr)")
 else()
-    message(STATUS "BannerlordVR.Native: building the STUB (0.2.0-stub)")
+    message(STATUS "BannerlordVR.Native: building the STUB (0.2.7-stub)")
 endif()
 
 # The OpenXR/D3D sources only compile when the submodules are present, so a
@@ -68,16 +69,19 @@ if(BVR_ENABLE_OPENXR)
         src/stereo_dup.cpp
         src/stereo_perf.cpp
         src/vr_sharpen.cpp
+        src/vrs.cpp
         src/vp_patch.cpp
         src/late_latch.cpp
         src/vr_overlay.cpp
         src/xr_context.cpp
-        src/afw_warp.cpp
+        src/depth_reproject.cpp
         src/image_latch.cpp
         src/depth_upscale.cpp
         src/ui_key.cpp
+        src/ui_supersample.cpp
         src/vr_reticle.cpp
         src/xr_input.cpp
+        src/water_spec_aa.cpp
     )
 
     # ImGui, compiled straight into the DLL rather than as a library of its own.
@@ -132,18 +136,43 @@ if(BVR_ENABLE_OPENXR)
         message(FATAL_ERROR "minhook submodule missing at ${BVR_MINHOOK_DIR}")
     endif()
 
+    # Our MinHook patch (~2 GB trampoline search + disp32 overflow refusal): on
+    # VDXR nothing was free within the stock 1 GB of the D3D11 context code, every
+    # draw hook was refused and native stereo showed one eye. Applied here so the
+    # submodule stays on its upstream commit; skipped when already applied.
+    set(BVR_MINHOOK_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/minhook-vdxr-range.patch)
+    execute_process(COMMAND git apply --ignore-whitespace --reverse --check ${BVR_MINHOOK_PATCH}
+                    WORKING_DIRECTORY ${BVR_MINHOOK_DIR} RESULT_VARIABLE bvr_mh_applied
+                    OUTPUT_QUIET ERROR_QUIET)
+    if(NOT bvr_mh_applied EQUAL 0)
+        execute_process(COMMAND git apply --ignore-whitespace ${BVR_MINHOOK_PATCH}
+                        WORKING_DIRECTORY ${BVR_MINHOOK_DIR} RESULT_VARIABLE bvr_mh_rc)
+        if(NOT bvr_mh_rc EQUAL 0)
+            message(FATAL_ERROR "Could not apply ${BVR_MINHOOK_PATCH} to ${BVR_MINHOOK_DIR}")
+        endif()
+    endif()
+
     add_subdirectory(${BVR_OPENXR_DIR} ${CMAKE_BINARY_DIR}/openxr EXCLUDE_FROM_ALL)
     add_subdirectory(${BVR_MINHOOK_DIR} ${CMAKE_BINARY_DIR}/minhook EXCLUDE_FROM_ALL)
 
     target_compile_definitions(BannerlordVR.Native PRIVATE BVR_ENABLE_OPENXR XR_USE_GRAPHICS_API_D3D11 XR_USE_PLATFORM_WIN32)
-    target_link_libraries(BannerlordVR.Native PRIVATE openxr_loader minhook)
+    # NVAPI (TEST 427, NVIDIA VRS): a static lib that loads the driver's own
+    # nvapi64.dll at runtime, so nothing ships beside the DLL and a machine
+    # without an NVIDIA driver still loads it.
+    if(NOT EXISTS ${BVR_NVAPI_DIR}/amd64/nvapi64.lib)
+        message(FATAL_ERROR "nvapi submodule missing at ${BVR_NVAPI_DIR}")
+    endif()
+
+    target_link_libraries(BannerlordVR.Native PRIVATE openxr_loader minhook
+        ${BVR_NVAPI_DIR}/amd64/nvapi64.lib)
 
     # Stated explicitly rather than relying on the dependencies to export usable
     # INTERFACE include dirs - MinHook in particular does not.
     target_include_directories(BannerlordVR.Native PRIVATE
         ${BVR_OPENXR_DIR}/include
         ${BVR_MINHOOK_DIR}/include
-        ${BVR_IMGUI_DIR})
+        ${BVR_IMGUI_DIR}
+        ${BVR_NVAPI_DIR})
 
     # ImGui is third-party and is not held to /W4. Its warnings are not ours to
     # fix and burying our own output under them is the real cost.

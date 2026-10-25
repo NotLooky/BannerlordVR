@@ -32,8 +32,7 @@ the game — so "it just runs normally" is what a missing runtime looks like.
   (Virtual Desktop) or SteamVR.
 - **No log at all** — the module is not loading. Check the launcher's Mods tab,
   and check that `bin\Win64_Shipping_Client\` inside the module folder actually
-  contains `BannerlordVR.dll`, `BannerlordVR.Native.dll` and
-  `openxr_loader.dll`.
+  contains `BannerlordVR.dll` and `BannerlordVR.Native.dll`.
 
 ## Black headset, but the monitor looks fine
 
@@ -69,6 +68,19 @@ GPU has to do. In the `End` panel, in rough order of what it buys you:
 Known, and being worked on. The `End` panel has **UI overlay** width and
 distance and the flat screen's geometry, which can make an unreadable menu
 readable in the meantime.
+
+## Pre-battle formation controls still click with A and trigger
+
+**Unresolved headset report (2026-10-15, after the latest deployed build):**
+the right grip does not click the hand UI, select or move an army group on the
+ground, or otherwise act as the formation click. A and the right trigger still
+click during pre-battle formation.
+
+Expected behavior: right grip clicks the hand UI and selects or places groups
+on the ground; A keeps its normal gamepad action; the trigger only aims the
+laser. The preceding source changes built and deployed, but this behavior was
+not confirmed in the headset. Do not treat the build result as a fix for this
+input issue.
 
 ## My own body is in my face
 

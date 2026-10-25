@@ -1,13 +1,16 @@
 #include "vp_patch.h"
 #include <d3dcompiler.h>
 #include "bvr_config.h"
+#include "perf_options.h"
 #include "bvr_log.h"
 #include "d3d_hooks.h"
 #include "frame_map.h"
 #include "late_latch.h"
 #include "stereo_dup.h"
 #include "stereo_perf.h"
+#include "xr_context.h"
 #include "ngx_hook.h"
+#include "ui_supersample.h"
 
 #include <d3d11_1.h>
 
@@ -334,7 +337,7 @@ Settings g_cfg;
  * vp_census = 1 brings all of them back together, for the next investigation. */
 /* Whether the motion-vector slot gets the previous frame of the SAME eye rather
    than simply the previous frame. See the note in vp_publish. Only AFR
-   alternates, so this is a no-op under AFW and drawstereo. */
+   alternates, so this is a no-op under DR and drawstereo. */
 bool prev_same_eye()
 {
     static bool cached = true;
@@ -371,7 +374,7 @@ bool prev_same_eye()
    why TEST 79's fix cleaned the world up and left the characters alone.
 
    So the two are tied together here rather than left independent, which is the
-   same failure this file has already recorded twice for stereo_mode/afw. The
+   same failure this file has already recorded twice for stereo_mode/depth_reproject. The
    default follows prev_same_eye; vp_reproj_same_eye overrides it explicitly for
    the A/B, because WHICH way they should agree is a measurement, not an
    argument - the upscaler wants one viewpoint, the engine's own history buffer
@@ -455,7 +458,7 @@ const Settings& cfg()
     {
         g_cfgLoaded = true;
         g_cfg.enabled      = config_bool("vp_patch", false);
-        g_cfg.measure      = config_bool("vp_measure", false);
+        g_cfg.measure      = config_bool("vp_measure", true);   /* TEST 540: the only way submitted = rendered */
         g_cfg.scan         = config_bool("vp_scan", true);
         g_cfg.fov          = config_bool("vp_fov", true);
         g_cfg.expand       = config_bool("vp_fov_expand", false);
@@ -880,7 +883,7 @@ std::atomic<uint64_t> g_statReprojHeld{0};
    g_reprojEyeDelta is the largest element difference between the two accounts of
    the previous camera - the per-eye pair and the per-frame one - as a fixed
    point in units of 1e-6. Zero means they agree and vp_reproj_same_eye changes
-   nothing (no alternation: AFW, drawstereo, or a paused engine). A number that
+   nothing (no alternation: DR, drawstereo, or a paused engine). A number that
    grows with the head's speed is the 65 mm baseline plus one frame of motion,
    which is the thing being removed.
 
@@ -1863,7 +1866,7 @@ bool ray_census_on()
 {
     static bool cached = false;
     static bool have = false;
-    if (!have) { have = true; cached = config_bool("vp_ray_census", false); }
+    if (!have) { have = true; cached = perf_diagnostics() && config_bool("vp_ray_census", false); }
     return cached;
 }
 
@@ -2870,7 +2873,7 @@ inline bool ortho_signature(const float* m)
  *
  * That is the whole shape of the complaint, and it explains the measurements
  * that killed the earlier theories. TEST 53's table has shadows moving with the
- * head in AFR WITHOUT DLSS as well as in both AFW columns: the fault is in the
+ * head in AFR WITHOUT DLSS as well as in both DR columns: the fault is in the
  * engine's own render, in every mode, and DLSS's temporal accumulation was only
  * ever smearing it out of sight. TEST 55 then found the crawl in BOTH eyes,
  * which says the same thing from the other end - it was never the warp. Nothing
@@ -5309,14 +5312,6 @@ const void* on_update(ID3D11Resource* resource, const D3D11_BOX* box, const void
 /* Defined further down, beside the draw hooks it inspects. */
 void note_drawing_context(ID3D11DeviceContext* c);
 
-/* NATIVE STEREO'S NON-CONSTANT BUFFER WRITES (TEST 183). One pending write per
-   thread: the engine maps, fills and unmaps a buffer before touching the next.
-   Kept apart from t_mapped so the constant-buffer path is exactly as it was. */
-thread_local ID3D11Resource* t_stereoMapRes = nullptr;
-thread_local UINT            t_stereoMapSub = 0;
-thread_local void*           t_stereoMapData = nullptr;
-thread_local uint32_t        t_stereoMapBytes = 0;
-
 /* A delayed readback in flight (TEST 185): the game's staging texture, and the
    copy of ours that was mapped in its place. */
 thread_local ID3D11Resource* t_rbOrig = nullptr;
@@ -5348,19 +5343,6 @@ HRESULT STDMETHODCALLTYPE hooked_map(ID3D11DeviceContext* c, ID3D11Resource* r, 
         if (frame_map_capturing())
             frame_map_map(r, s, t);
         on_map(r, s, t, m);
-
-        if (stereo_active() && m != nullptr && m->pData != nullptr &&
-            (t == D3D11_MAP_WRITE_DISCARD || t == D3D11_MAP_WRITE ||
-             t == D3D11_MAP_WRITE_NO_OVERWRITE) &&
-            stereo_wants_buffer_write(r))
-        {
-            D3D11_BUFFER_DESC bd = {};
-            static_cast<ID3D11Buffer*>(r)->GetDesc(&bd);
-            t_stereoMapRes = r;
-            t_stereoMapSub = s;
-            t_stereoMapData = m->pData;
-            t_stereoMapBytes = bd.ByteWidth;
-        }
     }
     return hr;
 }
@@ -5375,12 +5357,6 @@ void STDMETHODCALLTYPE hooked_unmap(ID3D11DeviceContext* c, ID3D11Resource* r, U
         t_rbMapped = nullptr;
         g_origUnmap(c, const_cast<ID3D11Resource*>(mapped), s);
         return;
-    }
-    if (t_stereoMapRes != nullptr && r == t_stereoMapRes && s == t_stereoMapSub)
-    {
-        /* Before the real Unmap: the memory is only ours to read until then. */
-        stereo_on_buffer_write(r, t_stereoMapData, t_stereoMapBytes);
-        t_stereoMapRes = nullptr;
     }
     on_unmap(r, s);
     g_origUnmap(c, r, s);
@@ -5920,7 +5896,8 @@ void STDMETHODCALLTYPE tramp_draw_indexed(ID3D11DeviceContext* c, UINT a, UINT b
     }
     StereoOp sop;
     const bool sdup = stereo_begin(c, sop, false);
-    reinterpret_cast<PFN_DrawIndexed>(g_drawTramp[K][V])(c, a, b, d);
+    if (!sop.skip)
+        reinterpret_cast<PFN_DrawIndexed>(g_drawTramp[K][V])(c, a, b, d);
     if (sdup)
     {
         stereo_bind(c, sop);
@@ -5952,7 +5929,8 @@ void STDMETHODCALLTYPE tramp_draw_indexed_instanced(ID3D11DeviceContext* c, UINT
     }
     StereoOp sop;
     const bool sdup = stereo_begin(c, sop, false);
-    reinterpret_cast<PFN_DrawIndexedInstanced>(g_drawTramp[K][V])(c, ipi, ic, sil, bvl, sil2);
+    if (!sop.skip)
+        reinterpret_cast<PFN_DrawIndexedInstanced>(g_drawTramp[K][V])(c, ipi, ic, sil, bvl, sil2);
     if (sdup)
     {
         stereo_bind(c, sop);
@@ -5983,7 +5961,8 @@ void STDMETHODCALLTYPE tramp_draw(ID3D11DeviceContext* c, UINT vc, UINT svl)
     }
     StereoOp sop;
     const bool sdup = stereo_begin(c, sop, false);
-    reinterpret_cast<PFN_Draw>(g_drawTramp[K][V])(c, vc, svl);
+    if (!sop.skip)
+        reinterpret_cast<PFN_Draw>(g_drawTramp[K][V])(c, vc, svl);
     if (sdup)
     {
         stereo_bind(c, sop);
@@ -6015,7 +5994,8 @@ void STDMETHODCALLTYPE tramp_draw_instanced(ID3D11DeviceContext* c, UINT vpi, UI
     }
     StereoOp sop;
     const bool sdup = stereo_begin(c, sop, false);
-    reinterpret_cast<PFN_DrawInstanced>(g_drawTramp[K][V])(c, vpi, ic, svl, sil);
+    if (!sop.skip)
+        reinterpret_cast<PFN_DrawInstanced>(g_drawTramp[K][V])(c, vpi, ic, svl, sil);
     if (sdup)
     {
         stereo_bind(c, sop);
@@ -6034,6 +6014,66 @@ bool draw_target_known(void* target)
         for (int v = 0; v < kDrawVariants; ++v)
             if (g_drawTarget[k][v] == target)
                 return true;
+    return false;
+}
+
+/* Distance in MB from p to the nearest 64 KB-aligned free region, either side -
+   what MinHook needs for a trampoline. Walked only when a hook is refused. */
+uint64_t nearest_free_mb(void* p)
+{
+    const ULONG_PTR origin = reinterpret_cast<ULONG_PTR>(p);
+    uint64_t best = ~0ull;
+    MEMORY_BASIC_INFORMATION mbi;
+    for (ULONG_PTR a = origin; a >= 0x10000 && origin - a < best &&
+                               VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi));
+         a = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) - 1)
+        if (mbi.State == MEM_FREE && mbi.RegionSize >= 0x20000)
+            best = origin - (reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize - 0x10000);
+    for (ULONG_PTR a = origin; a - origin < best &&
+                               VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof(mbi));
+         a = reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize)
+        if (mbi.State == MEM_FREE && mbi.RegionSize >= 0x20000)
+            best = (std::min)(best, uint64_t(reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) - origin));
+    return best >> 20;
+}
+
+/* MH_CreateHook + MH_EnableHook for the scan-driven hooks below, which retry
+   every frame. VDXR run 2026-09-26 17:20: no trampoline memory near the context
+   code ALL session - every draw/target/dispatch hook refused, 0 stereo ops, eye 1
+   flat. A refusal is now reported once per address with MinHook's status, and
+   the next attempt waits 1 s (the search walks up to 2 GB of address space). */
+bool mh_hook(void* target, void* detour, void** tramp, const char* name)
+{
+    struct Refused { void* target; uint64_t retryAt; };
+    static Refused refused[32] = {};
+    static int     refusedCount = 0;
+
+    Refused* r = nullptr;
+    for (int i = 0; i < refusedCount; ++i)
+        if (refused[i].target == target)
+            r = &refused[i];
+    if (r != nullptr && GetTickCount64() < r->retryAt)
+        return false;
+
+    MH_STATUS st = MH_CreateHook(target, detour, tramp);
+    if (st == MH_OK && (st = MH_EnableHook(target)) != MH_OK)
+        MH_RemoveHook(target);      /* else every retry reads ALREADY_CREATED */
+    if (st == MH_OK)
+        return true;
+
+    if (r != nullptr)
+    {
+        r->retryAt = GetTickCount64() + 1000;
+        return false;
+    }
+    if (refusedCount < 32)
+        refused[refusedCount++] = { target, GetTickCount64() + 1000 };
+    BVR_WARN("Inline hook on %s at %p refused by MinHook (status %d%s); nearest free "
+             "64 KB region %llu MB away (MinHook reaches ~2047 MB). Retried every second. "
+             "Until it gets in, native stereo cannot duplicate anything - eye 1 is flat.",
+             name, target, static_cast<int>(st),
+             st == MH_ERROR_MEMORY_ALLOC ? ", no trampoline memory" : "",
+             static_cast<unsigned long long>(nearest_free_mb(target)));
     return false;
 }
 
@@ -6063,11 +6103,8 @@ void inline_hook_draw(int kind, void* target, void* const* detours, const char* 
     void* const detour = detours[v];
 
     void* tramp = nullptr;
-    if (MH_CreateHook(target, detour, &tramp) != MH_OK || MH_EnableHook(target) != MH_OK)
-    {
-        BVR_WARN("Inline hook on %s at %p refused by MinHook.", name, target);
+    if (!mh_hook(target, detour, &tramp, name))
         return;
-    }
 
     g_drawTarget[kind][v] = target;
     g_drawTramp[kind][v] = tramp;
@@ -7150,7 +7187,13 @@ void STDMETHODCALLTYPE tramp_om_set_rt(ID3D11DeviceContext* c, UINT num,
        any other mode. */
     if (!stereo_in_dup())
         note_render_targets(rtvs, num, dsv);
-    reinterpret_cast<PFN_OMSetRenderTargets>(g_rtTramp[V])(c, num, rtvs, dsv);
+
+    /* TEST 591: the window's backbuffer, while armed, is our k x target. */
+    ID3D11RenderTargetView* sub[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    const bool ss = !stereo_in_dup() && ui_ss_substitute(c, num, rtvs, sub, &dsv);
+    reinterpret_cast<PFN_OMSetRenderTargets>(g_rtTramp[V])(c, num, ss ? sub : rtvs, dsv);
+    if (!stereo_in_dup())
+        ui_ss_after_bind(c, ss);
 }
 
 /* THE VARIANT THIS ENGINE ACTUALLY BINDS THROUGH.
@@ -7215,7 +7258,8 @@ void STDMETHODCALLTYPE tramp_dispatch(ID3D11DeviceContext* c, UINT x, UINT y, UI
     }
     StereoOp sop;
     const bool sdup = stereo_begin(c, sop, true);
-    reinterpret_cast<PFN_Dispatch>(g_dispatchTramp[V])(c, x, y, z);
+    if (!sop.skip)
+        reinterpret_cast<PFN_Dispatch>(g_dispatchTramp[V])(c, x, y, z);
     if (sdup)
     {
         stereo_bind(c, sop);
@@ -7403,11 +7447,64 @@ void STDMETHODCALLTYPE tramp_om_set_rt_uav(ID3D11DeviceContext* c, UINT numRtv,
                                            ID3D11UnorderedAccessView* const* uavs,
                                            const UINT* counts)
 {
-    if (numRtv != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL && !stereo_in_dup())
+    const bool binds = numRtv != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL && !stereo_in_dup();
+    if (binds)
         note_render_targets(rtvs, numRtv, dsv);
 
+    /* TEST 591, as in tramp_om_set_rt. */
+    ID3D11RenderTargetView* sub[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    const bool ss = binds && ui_ss_substitute(c, numRtv, rtvs, sub, &dsv);
     reinterpret_cast<PFN_OMSetRenderTargetsAndUAVs>(g_rtUavTramp[V])(
-        c, numRtv, rtvs, dsv, uavStart, numUav, uavs, counts);
+        c, numRtv, ss ? sub : rtvs, dsv, uavStart, numUav, uavs, counts);
+    if (binds)
+        ui_ss_after_bind(c, ss);
+}
+
+/* TEST 591: viewports, scissors and colour clears, scaled / mirrored while the
+   interface is drawn into the dense target (ui_supersample.cpp). */
+using PFN_RSSetViewports = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+using PFN_RSSetScissorRects = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_RECT*);
+using PFN_ClearRTV = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
+
+void* g_vpTramp[kRtVariants] = {};
+void* g_vpTarget[kRtVariants] = {};
+void* g_scTramp[kRtVariants] = {};
+void* g_scTarget[kRtVariants] = {};
+void* g_clearRtvTramp[kRtVariants] = {};
+void* g_clearRtvTarget[kRtVariants] = {};
+
+template <int V>
+void STDMETHODCALLTYPE tramp_rs_viewports(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* vps)
+{
+    D3D11_VIEWPORT scratch[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    reinterpret_cast<PFN_RSSetViewports>(g_vpTramp[V])(c, n, ui_ss_viewports(c, n, vps, scratch));
+}
+
+template <int V>
+void STDMETHODCALLTYPE tramp_rs_scissors(ID3D11DeviceContext* c, UINT n, const D3D11_RECT* rects)
+{
+    D3D11_RECT scratch[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    reinterpret_cast<PFN_RSSetScissorRects>(g_scTramp[V])(c, n, ui_ss_scissors(c, n, rects, scratch));
+}
+
+template <int V>
+void STDMETHODCALLTYPE tramp_clear_rtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* rtv,
+                                       const FLOAT color[4])
+{
+    /* TEST 595: MinHook lets one detour own the implementation. When this one
+       is installed first, the frame map's is refused - and that was the only
+       caller of stereo_clear_rtv: the second eye's copies were never cleared and
+       the map's selection outline left trails in the right eye. So the clear is
+       mirrored here too, exactly as tramp_clear_dsv does for depth. */
+    if (!g_inRedirect)
+    {
+        if (frame_map_capturing())
+            frame_map_clear_rtv(c, rtv, color);
+        stereo_clear_rtv(c, rtv, color);
+    }
+    reinterpret_cast<PFN_ClearRTV>(g_clearRtvTramp[V])(c, rtv, color);
+    if (ID3D11RenderTargetView* twin = ui_ss_clear_twin(rtv))
+        reinterpret_cast<PFN_ClearRTV>(g_clearRtvTramp[V])(c, twin, color);
 }
 
 /* The four draw slots, and the four detours standing ready for each one's
@@ -7463,12 +7560,8 @@ void hook_rt_slot(void* target, void** targets, void** tramps,
             continue;
 
         void* tramp = nullptr;
-        if (MH_CreateHook(target, detours[v], &tramp) != MH_OK ||
-            MH_EnableHook(target) != MH_OK)
-        {
-            BVR_WARN("Inline hook on %s at %p refused by MinHook.", name, target);
+        if (!mh_hook(target, detours[v], &tramp, name))
             return;
-        }
 
         targets[v] = target;
         tramps[v] = tramp;
@@ -7528,6 +7621,24 @@ void scan_draw_slots(void** vtable)
     };
     hook_rt_slot(vtable[53], g_clearDsvTarget, g_clearDsvTramp, clearDetours,
                  "ClearDepthStencilView");
+
+    /* TEST 591: RSSetViewports 44, RSSetScissorRects 45, ClearRenderTargetView
+       50 - the dense interface target's viewport, scissors and clears. */
+    static void* const vpDetours[kRtVariants] = {
+        reinterpret_cast<void*>(&tramp_rs_viewports<0>), reinterpret_cast<void*>(&tramp_rs_viewports<1>),
+        reinterpret_cast<void*>(&tramp_rs_viewports<2>), reinterpret_cast<void*>(&tramp_rs_viewports<3>),
+    };
+    static void* const scDetours[kRtVariants] = {
+        reinterpret_cast<void*>(&tramp_rs_scissors<0>), reinterpret_cast<void*>(&tramp_rs_scissors<1>),
+        reinterpret_cast<void*>(&tramp_rs_scissors<2>), reinterpret_cast<void*>(&tramp_rs_scissors<3>),
+    };
+    static void* const clearRtvDetours[kRtVariants] = {
+        reinterpret_cast<void*>(&tramp_clear_rtv<0>), reinterpret_cast<void*>(&tramp_clear_rtv<1>),
+        reinterpret_cast<void*>(&tramp_clear_rtv<2>), reinterpret_cast<void*>(&tramp_clear_rtv<3>),
+    };
+    hook_rt_slot(vtable[44], g_vpTarget, g_vpTramp, vpDetours, "RSSetViewports");
+    hook_rt_slot(vtable[45], g_scTarget, g_scTramp, scDetours, "RSSetScissorRects");
+    hook_rt_slot(vtable[50], g_clearRtvTarget, g_clearRtvTramp, clearRtvDetours, "ClearRenderTargetView");
 
     /* Dispatch, slot 41. If the deferred lighting is compute, nothing else here
        can see it - which is what a black character on a correctly lit sky looks
@@ -8281,7 +8392,7 @@ bool vp_blit_second_eye(ID3D11DeviceContext* ctx, ID3D11Texture2D* dst)
         /* AN EXPLICIT FORMAT, BECAUSE THE DESTINATION IS TYPELESS.
          *
            The eye staging textures are created in the TYPELESS member of their
-           family so AFW's compute shader can take an unordered-access view of
+           family so DR's compute shader can take an unordered-access view of
            them - a typed UAV is not allowed on B8G8R8A8_UNORM. A null view
            description cannot infer a format from a typeless resource, so the
            first attempt failed here even after the render-target bind flag was
@@ -8650,6 +8761,9 @@ void vp_publish(const VpFrame& frame)
     g_pub[next].stampMs = GetTickCount64();
 
     g_pubIndex.store(next, std::memory_order_release);
+
+    if (frame.valid)
+        xr_note_vp_published(frame.eyeCamera + 12);
 }
 
 void vp_frame_boundary()

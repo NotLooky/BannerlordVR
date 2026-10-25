@@ -1,0 +1,38 @@
+diff --git a/src/buffer.c b/src/buffer.c
+index 940df65..eec0900 100644
+--- a/src/buffer.c
++++ b/src/buffer.c
+@@ -32,8 +32,10 @@
+ // Size of each memory block. (= page size of VirtualAlloc)
+ #define MEMORY_BLOCK_SIZE 0x1000
+ 
+-// Max range for seeking a memory block. (= 1024MB)
+-#define MAX_MEMORY_RANGE 0x40000000
++// Max range for seeking a memory block. (BannerlordVR: ~2 GB, was 1024MB -
++// VDXR runs had nothing free within 1 GB of the D3D11 context code; a rel32
++// JMP still reaches the relay, and trampoline.c refuses a disp32 overflow.)
++#define MAX_MEMORY_RANGE 0x7FF00000
+ 
+ // Memory protection flags to check the executable address.
+ #define PAGE_EXECUTE_FLAGS \
+diff --git a/src/trampoline.c b/src/trampoline.c
+index cf8ce05..5566f7d 100644
+--- a/src/trampoline.c
++++ b/src/trampoline.c
+@@ -162,8 +162,14 @@ BOOL CreateTrampolineFunction(PTRAMPOLINE ct)
+ 
+             // Relative address is stored at (instruction length - immediate value length - 4).
+             pRelAddr = (PUINT32)(instBuf + hs.len - ((hs.flags & 0x3C) >> 2) - 4);
+-            *pRelAddr
+-                = (UINT32)((pOldInst + hs.len + (INT32)hs.disp.disp32) - (pNewInst + hs.len));
++            {
++                // BannerlordVR: buffer.c searches up to ~2 GB from the target, so
++                // the operand can land out of disp32 reach - refuse, never wrap.
++                LONG_PTR rel = (LONG_PTR)((pOldInst + hs.len + (INT32)hs.disp.disp32) - (pNewInst + hs.len));
++                if (rel != (INT32)rel)
++                    return FALSE;
++                *pRelAddr = (UINT32)rel;
++            }
+ 
+             // Complete the function if JMP (FF /4).
+             if (hs.opcode == 0xFF && hs.modrm_reg == 4)

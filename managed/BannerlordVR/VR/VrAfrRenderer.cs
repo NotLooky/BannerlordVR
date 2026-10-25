@@ -50,7 +50,7 @@ namespace BannerlordVR.VR
         /// needing to know a second mode exists.
         /// </summary>
         /// <summary>
-        /// True in AFR and in AFW. Both render one eye per frame through the
+        /// True in AFR and in DR. Both render one eye per frame through the
         /// engine's own view and differ only in what the native capture does with
         /// the eye that was not drawn, so everything this class owns is shared.
         /// </summary>
@@ -131,6 +131,74 @@ namespace BannerlordVR.VR
             }
         }
 
+        /// <summary>
+        /// Points the engine's scene view back at the window so the eye targets
+        /// can be released, and forgets that it was ever retargeted.
+        ///
+        /// THE FIRST STEP OF A LIVE RESCALE, and the reason the rest of it is
+        /// safe. The engine renders on its own thread; at the instant the player
+        /// clicks Apply there may be a frame in flight with the eye target bound,
+        /// and releasing a texture out from under rgl mid-frame is the shape of
+        /// every crash this repo has recorded around view surgery. Unbinding
+        /// first, then waiting out the frames in flight before anything is
+        /// released, is what turns that into an ordinary reallocation.
+        ///
+        /// Nothing here creates or destroys a SceneView. All three shipping modes
+        /// render through the engine's OWN view (VrRenderMode.UsesAfrPipeline), so
+        /// this is SetRenderTarget on a view that stays live throughout - the same
+        /// call a mode stand-down already makes mid-session.
+        /// </summary>
+        public static void UnbindForRescale()
+        {
+            // NOT ReleaseEngineView. That calls SetRenderTarget(null), and the
+            // decompile shows why it has never once worked:
+            //
+            //     public void SetRenderTarget(Texture texture)
+            //     { ...IView.SetRenderTarget(base.Pointer, texture.Pointer); }
+            //
+            // It dereferences the argument unconditionally, so null is always a
+            // NullReferenceException - caught and logged as "could not hand the
+            // engine's view back to the screen", every single time, since the
+            // method was written. The log has been saying so and nobody read it.
+            //
+            // There is no way to say "no target" through this API, so the view
+            // simply keeps pointing at the old texture until the rebind gives it
+            // the new one. That is survivable, and it is what every successful
+            // rescale so far has actually done - but it means the quiesce is
+            // carrying the whole weight, so it is not shortened.
+            _retargeted = false;
+            _bound = false;
+            _boundScene = null;
+            _engineView = null;
+
+            // So the rebind re-applies it rather than deciding the view already
+            // has the scale it wants. The new view has the engine's default.
+            _appliedScale = -1.0f;
+
+            VrLog.Info("Rescale: AFR has let go of the engine's scene view. The view "
+                       + "still points at the old eye texture - the engine offers no "
+                       + "way to unset a render target - so nothing is released until "
+                       + "the frames in flight have drained.");
+        }
+
+        /// <summary>
+        /// Points it at the new eye target once the rescale has built one.
+        ///
+        /// Deliberately goes through OnSceneRenderingStarted rather than repeating
+        /// what it does: that method is the one place that knows the whole binding
+        /// - the render target, the auto depth target, the camera mode's extra
+        /// work and the resolution scale - and a second copy of it here would be
+        /// one refactor away from disagreeing with it.
+        /// </summary>
+        public static bool RebindAfterRescale(MissionScreen screen)
+        {
+            if (screen == null || !VrStereoRenderer.TexturesReady)
+                return false;
+
+            OnSceneRenderingStarted(screen);
+            return _retargeted;
+        }
+
         private static void ReleaseEngineView()
         {
             if (_engineView == null || !_retargeted)
@@ -158,7 +226,6 @@ namespace BannerlordVR.VR
 
             VrVpPatch.StandDown();
             NativeMethods.bvr_set_afr_eye(-1);
-            NativeMethods.bvr_set_full_afr(0);
             NativeMethods.bvr_set_draw_stereo(0);
             NativeMethods.bvr_set_sim_generation(-1);
 
@@ -224,6 +291,22 @@ namespace BannerlordVR.VR
         /// and a wrong FOV is a far smaller problem than an empty world.</summary>
         private static readonly bool EngineFov = VrConfig.Bool("afr_engine_fov", false);
 
+        /// <summary>
+        /// TEST 397: pose FIRST, projection after it, pose again. 0 is the old
+        /// projection-first order.
+        ///
+        /// rgl fits the frustum it culls with when the projection is SET, from the
+        /// frame the camera holds at that moment - the engine itself always goes
+        /// Frame, then SetFovVertical (UpdateCamera, UpdateMapCamera). Projection
+        /// first fitted it on the engine's own camera every frame and LookAt then
+        /// moved only the render: deployment, the dead camera and the mount
+        /// animations culled from the stick, and only TEST 180's bearing write,
+        /// which changes the engine's frame itself, ever moved it. The second
+        /// pose keeps the pose the last word in case the projection moves it,
+        /// which TEST 95 suspected and TEST 96 never fully ruled out.
+        /// </summary>
+        public static readonly bool CullRefit = VrConfig.Bool("cull_refit", true);
+
         private static SceneView _engineView;
         private static Scene _boundScene;
         private static int _eye;
@@ -231,10 +314,10 @@ namespace BannerlordVR.VR
         /// <summary>
         /// Whether the engine's camera swaps eyes between frames.
         ///
-        /// WHY PURE AFW STOPS DOING IT
+        /// WHY PURE DR STOPS DOING IT
         ///
         /// AFR has to alternate: it has no other way to obtain the second eye.
-        /// AFW does - it builds the second eye from the first - so alternating
+        /// DR does - it builds the second eye from the first - so alternating
         /// buys it only one thing, the previous real render used to fill
         /// disocclusions, and charges a large price for it.
         ///
@@ -271,7 +354,7 @@ namespace BannerlordVR.VR
         ///
         /// We cannot tell rgl anything of the kind; its motion vectors and its
         /// previous-view matrix are its own. What we can do is remove the cause,
-        /// which is available to AFW and to nothing else.
+        /// which is available to DR and to nothing else.
         ///
         /// WHAT IT COSTS
         ///
@@ -282,41 +365,6 @@ namespace BannerlordVR.VR
         /// is substituting a real held render while the head is still, and with
         /// a pinned eye there would never be one to substitute.
         /// </summary>
-        /// <summary>
-        /// The second draw supplies the other eye out of the SAME engine frame,
-        /// so the engine has no reason to alternate at all.
-        ///
-        /// This is what the first run through the headset was missing. The
-        /// duplicate always holds the eye the engine did not draw, so with the
-        /// engine still swapping sides every frame the raw eye swapped with it -
-        /// reported exactly as "left eye is raw, then it switched to right eye
-        /// raw". Nothing was wrong with the image; the two halves were simply
-        /// trading places at frame rate.
-        ///
-        /// Pinning the engine to eye 0 settles it: the engine draws the left eye
-        /// every frame and the duplicate is always the right. Both come from one
-        /// engine frame, which is the whole point - no alternation, no held eye,
-        /// no stale partner, and no need to freeze the simulation between two
-        /// renders because there is only one.
-        /// </summary>
-        /// <summary>
-        /// Whether draw-duplication stereo is BUILT AND ALLOWED. Separate from
-        /// the mode for the same reason AFR and AFW are: this says the path
-        /// exists, the mode says it is the one running.
-        ///</summary>
-        private static readonly bool DrawStereoAllowed = VrConfig.Bool("vp_second_draw", true);
-
-        /// <summary>
-        /// True only while draw-duplication stereo is the SELECTED MODE.
-        ///
-        /// It used to read the config key directly, which meant enabling the
-        /// experiment changed what AFR did. AFR, AFW and the hybrid must behave
-        /// identically whether or not this path exists, and a mode check is what
-        /// guarantees that.
-        /// </summary>
-        private static bool SecondDrawStereo =>
-            DrawStereoAllowed && VrRenderMode.DrawStereoActive;
-
         /// <summary>
         /// Whether native stereo is BUILT AND ALLOWED - the same separation the
         /// other paths keep: this says the code exists, the mode says it runs.
@@ -336,13 +384,13 @@ namespace BannerlordVR.VR
         {
             get
             {
-                if (SecondDrawStereo || NativeStereoActive)
+                if (NativeStereoActive)
                     return false;
 
-                if (VrRenderMode.Active != VrRenderMode.Mode.Afw)
+                if (VrRenderMode.Active != VrRenderMode.Mode.DepthReproject)
                     return true;
 
-                if (!PinAfwEye)
+                if (!PinSourceEye)
                     return true;
 
                 // Pinning is only safe while the warp can actually deliver the
@@ -363,7 +411,7 @@ namespace BannerlordVR.VR
                 // each eye every other frame. Real stereo at half the rate
                 // beats no stereo at full rate, and the pin returns on its own
                 // the moment the warp is live.
-                return NativeMethods.bvr_afw_ready() == 0;
+                return NativeMethods.bvr_depth_reproject_ready() == 0;
             }
         }
 
@@ -377,7 +425,7 @@ namespace BannerlordVR.VR
         /// any more - and that is what disocclusions were being filled from.
         ///
         /// The fallback it falls back TO was written for the first frame or two
-        /// of a mission, and it was tuned for that: afw_gap_fill_px searches 96
+        /// of a mission, and it was tuned for that: dr_gap_fill_px searches 96
         /// pixels, deliberately reduced from the old cap on the grounds that
         /// "this path only ever runs on the first frame or two". Pinning makes
         /// it the permanent path, and the holes it now has to fill are as wide
@@ -400,7 +448,7 @@ namespace BannerlordVR.VR
         /// vectors we do not have. Trading a subtle artifact on some objects for
         /// a blatant one on all of them is not a step towards it.
         /// </summary>
-        private static readonly bool PinAfwEye = VrConfig.Bool("afw_pin_source_eye", false);
+        private static readonly bool PinSourceEye = VrConfig.Bool("dr_pin_source_eye", false);
 
         private static bool _loggedPin;
         private static bool _logged;
@@ -550,7 +598,6 @@ namespace BannerlordVR.VR
                 _boundScene = null;
                 VrVpPatch.StandDown();
                 NativeMethods.bvr_set_afr_eye(-1);
-                NativeMethods.bvr_set_full_afr(0);
                 NativeMethods.bvr_set_draw_stereo(0);
             NativeMethods.bvr_set_draw_stereo(0);
                 NativeMethods.bvr_set_draw_stereo(0);
@@ -614,24 +661,11 @@ namespace BannerlordVR.VR
                                    + "a second time. Nothing alternates, nothing is "
                                    + "held, nothing is warped.");
                     }
-                    else if (!_loggedPin && SecondDrawStereo)
-                    {
-                        _loggedPin = true;
-                        VrLog.Info("Single-frame stereo: the engine camera is PINNED to "
-                                   + "the left eye and the right comes from the "
-                                   + "duplicated draws of the SAME frame. Nothing "
-                                   + "alternates any more - no held eye, no stale "
-                                   + "partner, and no reason to freeze the simulation "
-                                   + "between two renders, because there is only one. "
-                                   + "The right eye is still raw: no tonemap, no "
-                                   + "upscale, no post. vp_second_draw = 0 restores the "
-                                   + "ordinary alternation.");
-                    }
                     else if (!_loggedPin)
                     {
                         _loggedPin = true;
-                        VrLog.Info("AFW: the engine camera is PINNED to the left eye "
-                                   + "instead of swapping sides every frame. AFW builds "
+                        VrLog.Info("DR: the engine camera is PINNED to the left eye "
+                                   + "instead of swapping sides every frame. DR builds "
                                    + "the second eye rather than waiting for it, so the "
                                    + "swap bought only the previous real render used to "
                                    + "fill disocclusions - and charged a 65 mm camera "
@@ -640,7 +674,7 @@ namespace BannerlordVR.VR
                                    + "near, thin, high-contrast geometry. The left eye "
                                    + "is now always a real render and the right always "
                                    + "synthesised; disocclusions fall back to stretched "
-                                   + "background. afw_pin_source_eye = 0 restores the "
+                                   + "background. dr_pin_source_eye = 0 restores the "
                                    + "swap.");
                     }
                 }
@@ -698,8 +732,11 @@ namespace BannerlordVR.VR
                         // So the projection is written FIRST and the pose LAST,
                         // which makes the pose the final word before the frame is
                         // published. Same two calls, same frame, opposite order.
-                        HoldEngineFov(combat, _eye);
-                        VrCameraDriver.AimAtEye(combat, _eye);
+                        //
+                        // TEST 397 keeps the pose last and puts it first as well:
+                        // the projection is where the engine fits its culling
+                        // frustum. See CullRefit and AimEngineCamera.
+                        AimAndFit(combat);
                         break;
                     }
 
@@ -745,21 +782,9 @@ namespace BannerlordVR.VR
                 // hook reads it afterwards to decide which eye it just captured.
                 NativeMethods.bvr_set_afr_eye(_eye);
 
-                // ...and whether this frame is one HALF of a pair rather than a
-                // whole one. In full AFR the Present that follows captures its
-                // eye and hands the begun XR frame back instead of ending it, so
-                // the next render draws the other eye from the same locate and
-                // the same world. Published every frame rather than latched at
-                // the mode switch: the mode can change between a deferred frame
-                // and the partner that was meant to complete it, and the native
-                // side has to be told before that partner is drawn, not after.
-                NativeMethods.bvr_set_full_afr(
-                    VrRenderMode.RendersPairPerDisplayFrame(VrRenderMode.Active) ? 1 : 0);
-
-                // ...and whether the native duplication path should run at all.
-                // OFF for every mode but its own, which is what keeps AFR and AFW
-                // behaving exactly as they did before this path was written.
-                NativeMethods.bvr_set_draw_stereo(SecondDrawStereo ? 1 : 0);
+                // Draw-duplication stereo was removed as a mode. Its native path
+                // is still compiled, so it is held off explicitly every frame.
+                NativeMethods.bvr_set_draw_stereo(0);
 
                 // ...and whether the whole pipeline should run twice. Off for
                 // every other mode, so selecting it is the only thing that can
@@ -772,10 +797,10 @@ namespace BannerlordVR.VR
                 // the native side put every eye up the moment it arrives.
                 VrSyncSequential.PublishGeneration();
 
-                // AFW's geometry, and whether it should run at all. Also before
+                // DR's geometry, and whether it should run at all. Also before
                 // the render, because the warp reads it during the Present that
                 // follows.
-                VrAfw.Publish();
+                VrDepthReproject.Publish();
 
                 if (!_logged)
                 {
@@ -789,7 +814,6 @@ namespace BannerlordVR.VR
                 _retargeted = false;
                 VrVpPatch.StandDown();
                 NativeMethods.bvr_set_afr_eye(-1);
-                NativeMethods.bvr_set_full_afr(0);
                 NativeMethods.bvr_set_draw_stereo(0);
             NativeMethods.bvr_set_draw_stereo(0);
             }
@@ -840,9 +864,14 @@ namespace BannerlordVR.VR
             if (combat == null)
                 return;
 
-            // Projection first, pose last - see the note at the other call site.
-            HoldEngineFov(combat, _eye);
-            VrCameraDriver.AimAtEye(combat, _eye);
+            // Pose, projection, pose - see CullRefit. This is the seam that runs
+            // in every phase VR owns, deployment and the dead camera included.
+            AimAndFit(combat, probe: true);
+
+            // TEST 446: a finished view is a new eye; the late latch and the second
+            // eye pair with the publication, so it goes out again.
+            if (VrCameraDriver.ViewFinish.LengthSquared > 0f)
+                VrVpPatch.Publish(screen, _eye);
 
             // Re-asserted every frame, for the same reason the pose is: the engine
             // rebuilds its view state around this point in the frame, and a binding
@@ -873,6 +902,103 @@ namespace BannerlordVR.VR
 
         private static int _lateAims;
         private static int _lateAimTick;
+
+        /// <summary>
+        /// The pose/projection pair both write sites share. With CullRefit the
+        /// projection lands while the camera is ON the eye, so the frustum the
+        /// engine culls with is fitted there rather than on its own camera.
+        /// </summary>
+        private static void AimAndFit(Camera combat, bool probe = false)
+        {
+            if (!CullRefit)
+            {
+                HoldEngineFov(combat, _eye, refit: false);
+                VrCameraDriver.AimAtEye(combat, _eye);
+                return;
+            }
+
+            VrCameraDriver.AimAtEye(combat, _eye);
+
+            MatrixFrame eye = VrCameraDriver.EyeFrame(_eye);
+            bool gated = probe && HeadFarFromEngine(eye.rotation.f);
+            Vec3 headPoint = eye.origin + eye.rotation.f * 10f;
+            bool before = gated && combat.EnclosesPoint(headPoint);
+
+            HoldEngineFov(combat, _eye, refit: true);
+
+            if (probe)
+                MeasureRefit(combat, eye, gated, before, gated && combat.EnclosesPoint(headPoint));
+
+            VrCameraDriver.AimAtEye(combat, _eye);
+        }
+
+        // TEST 397 instrument. Only frames where the engine's own camera looks
+        // >= 60 deg away from the head say anything: below half the field of view
+        // the head's point is inside a stale frustum too (the TEST 179 lesson -
+        // an instrument in a phase with no signal finds nothing).
+        private static int _refitGated, _refitBefore, _refitAfter, _refitFrames, _refitTick;
+        private static float _refitMoveSum, _refitMoveMax, _refitTurnMax;
+
+        private static bool HeadFarFromEngine(Vec3 headForward)
+        {
+            if (!VrGameCamera.TryGetCameraFrame(out MatrixFrame engine))
+                return false;
+
+            Vec3 engineForward = -engine.rotation.u;
+            float lu = engineForward.Length, lf = headForward.Length;
+            if (lu <= 1e-4f || lf <= 1e-4f)
+                return false;
+
+            // cos 60 deg
+            return Vec3.DotProduct(engineForward, headForward) / (lu * lf) <= 0.5f;
+        }
+
+        private static void MeasureRefit(Camera combat, MatrixFrame eye, bool gated, bool before, bool after)
+        {
+            try
+            {
+                if (gated)
+                {
+                    _refitGated++;
+                    if (before) _refitBefore++;
+                    if (after) _refitAfter++;
+                }
+
+                // Did the projection move the pose? TEST 95's question, read back
+                // before the second LookAt puts it right again.
+                MatrixFrame got = combat.Frame;
+                float moved = (got.origin - eye.origin).Length;
+                float c = Vec3.DotProduct(-got.rotation.u, eye.rotation.f);
+                float turned = (float)Math.Acos(Math.Max(-1f, Math.Min(1f, c))) * 57.2957795f;
+                _refitMoveSum += moved;
+                if (moved > _refitMoveMax) _refitMoveMax = moved;
+                if (turned > _refitTurnMax) _refitTurnMax = turned;
+                _refitFrames++;
+            }
+            catch
+            {
+                // An instrument that cannot read the camera goes quiet.
+            }
+
+            if (++_refitTick < 450)
+                return;
+
+            VrLog.Info(string.Format(
+                "TEST 397 culling refit: {0} frame(s) with the head >= 60 deg off the engine's "
+                + "camera; the head's point was inside the camera's frustum in {1} of them before "
+                + "the refit and {2} after. The projection moved the pose {3:F1} mm on average, "
+                + "{4:F1} mm / {5:F2} deg at worst, over {6} frame(s). Reading: before ~0 and after "
+                + "~all = the frustum was stale and the refit fixed it; before ~all = EnclosesPoint "
+                + "reads the live frame and only the headset can judge; a moved pose is what the "
+                + "second LookAt is for.",
+                _refitGated, _refitBefore, _refitAfter,
+                _refitFrames > 0 ? _refitMoveSum / _refitFrames * 1000f : 0f,
+                _refitMoveMax * 1000f, _refitTurnMax, _refitFrames));
+
+            _refitTick = 0;
+            _refitGated = 0; _refitBefore = 0; _refitAfter = 0; _refitFrames = 0;
+            _refitMoveSum = 0f; _refitMoveMax = 0f; _refitTurnMax = 0f;
+        }
 
         /// <summary>
         /// Points the retargeted scene view at a camera, and says so the first time.
@@ -944,7 +1070,7 @@ namespace BannerlordVR.VR
         // the fov RENDERED. Passing the eye is what makes the asymmetric path obey
         // it; the symmetric path below obeys it a different way, by making both
         // eyes identical so there is nothing left to disagree about.
-        private static void HoldEngineFov(Camera combat, int eye)
+        private static void HoldEngineFov(Camera combat, int eye, bool refit)
         {
             if (!EngineFov)
                 return;
@@ -954,7 +1080,16 @@ namespace BannerlordVR.VR
             float haveFov = combat.HorizontalFov;
             float haveAspect = combat.GetAspectRatio();
 
-            if (Math.Abs(haveFov - wantFov) > 0.005f || Math.Abs(haveAspect - wantAspect) > 0.005f)
+            bool differs = Math.Abs(haveFov - wantFov) > 0.005f || Math.Abs(haveAspect - wantAspect) > 0.005f;
+
+            // A refit writes even when the projection already matches: the write is
+            // what fits the culling frustum to the pose (TEST 397). Today the
+            // engine's window aspect always differs from ours, so this only stops
+            // culling going back to the stick if the two ever happen to agree.
+            if (refit && !differs)
+                VrCameraDriver.ApplyEyeProjectionTo(combat, eye);
+
+            if (differs)
             {
                 VrCameraDriver.ApplyEyeProjectionTo(combat, eye);
                 _fovCorrections++;
@@ -1036,7 +1171,6 @@ namespace BannerlordVR.VR
             try
             {
                 NativeMethods.bvr_set_afr_eye(-1);
-                NativeMethods.bvr_set_full_afr(0);
                 NativeMethods.bvr_set_draw_stereo(0);
             NativeMethods.bvr_set_draw_stereo(0);
             }

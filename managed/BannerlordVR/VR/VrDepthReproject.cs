@@ -4,7 +4,7 @@ using BannerlordVR.Interop;
 namespace BannerlordVR.VR
 {
     /// <summary>
-    /// AFW - Alternate Frame Warping. The game-side half; the warp itself is a
+    /// DR - Depth Reprojection. The game-side half; the warp itself is a
     /// compute shader in the native layer.
     ///
     /// WHAT IT CHANGES, IN ONE SENTENCE
@@ -22,7 +22,7 @@ namespace BannerlordVR.VR
     /// correction for the turn, pairing eyes by simulation tick, then holding
     /// the camera still across a pair.
     ///
-    /// AFW deletes the second moment instead of correcting it. Both eyes come
+    /// DR deletes the second moment instead of correcting it. Both eyes come
     /// from one render of one frame. They cannot disagree about where anything
     /// is, because there is only one of everything.
     ///
@@ -37,31 +37,31 @@ namespace BannerlordVR.VR
     /// genuinely absent from the source. With a 63 mm baseline those slivers are
     /// narrow. Where the reprojection cannot find a source pixel it takes the
     /// one straight ahead, so the failure looks like a slightly soft edge rather
-    /// than a hole - see the shader note in afw_warp.cpp.
+    /// than a hole - see the shader note in depth_reproject.cpp.
     /// </summary>
-    public static class VrAfw
+    public static class VrDepthReproject
     {
         /// <summary>
-        /// Whether AFW may be offered. Read once: the native layer has to
-        /// allocate its hold textures differently for AFW - typeless, with an
+        /// Whether DR may be offered. Read once: the native layer has to
+        /// allocate its hold textures differently for DR - typeless, with an
         /// unordered-access view - and they are allocated long before anyone
         /// touches the menu.
         /// </summary>
-        public static bool Available { get; } = VrConfig.Bool("afw", true);
+        public static bool Available { get; } = VrConfig.Bool("depth_reproject", true);
 
-        /// <summary>Whether the warp runs at all - true for AFW and for the
-        /// hybrid, which is AFW with a held real eye substituted while the head
+        /// <summary>Whether the warp runs at all - true for DR and for the
+        /// hybrid, which is DR with a held real eye substituted while the head
         /// is still.</summary>
         public static bool Enabled =>
-            Available && VrRenderMode.Active == VrRenderMode.Mode.Afw;
+            Available && VrRenderMode.Active == VrRenderMode.Mode.DepthReproject;
 
         /// <summary>
-        /// The value handed to bvr_set_afw: 0 AFR, 1 AFW, 2 hybrid.
+        /// The value handed to bvr_set_depth_reproject: 0 AFR, 1 DR, 2 hybrid.
         ///
         /// One int rather than two calls, because the native side has to apply
         /// both halves of the answer between one frame and the next. Two
         /// separate setters could be observed half-applied, and the half that
-        /// renders is AFW running with the hybrid's decision about whether the
+        /// renders is DR running with the hybrid's decision about whether the
         /// head is still.
         /// </summary>
         private static int NativeMode
@@ -71,7 +71,7 @@ namespace BannerlordVR.VR
                 if (!Enabled)
                     return 0;
 
-                // 1 is plain AFW. The hybrid was mode 2 and is gone; the native
+                // 1 is plain DR. The hybrid was mode 2 and is gone; the native
                 // side still understands the value, nothing selects it now.
                 return 1;
             }
@@ -99,22 +99,22 @@ namespace BannerlordVR.VR
 
             try
             {
-                // Published in EVERY mode, not only when AFW is running. The
+                // Published in EVERY mode, not only when DR is running. The
                 // reticle places itself using the same focal length and
                 // baseline, and it is drawn in AFR too - so withholding the
-                // geometry when AFW is off would leave the crosshair stuck at
+                // geometry when DR is off would leave the crosshair stuck at
                 // infinity and refusing to fuse.
                 if (!Geometry(out float focalPx, out float baseline,
                               out float zNear, out float zFar))
                     return;
 
-                NativeMethods.bvr_set_afw(NativeMode, focalPx, baseline, zNear, zFar);
+                NativeMethods.bvr_set_depth_reproject(NativeMode, focalPx, baseline, zNear, zFar);
                 _published = Enabled;
             }
             catch (Exception ex)
             {
                 _failed = true;
-                VrLog.Error("Could not publish AFW geometry; the mode stays off and "
+                VrLog.Error("Could not publish DR geometry; the mode stays off and "
                             + "AFR is unaffected.", ex);
             }
         }
@@ -166,7 +166,7 @@ namespace BannerlordVR.VR
                 if (!_warnedGeometry)
                 {
                     _warnedGeometry = true;
-                    VrLog.Warn("AFW: the two eye frames are at the same place, so there "
+                    VrLog.Warn("DR: the two eye frames are at the same place, so there "
                                + "is no baseline to reproject across. Staying on AFR.");
                 }
                 return false;

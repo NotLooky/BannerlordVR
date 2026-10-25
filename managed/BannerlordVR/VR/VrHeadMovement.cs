@@ -90,6 +90,10 @@ namespace BannerlordVR.VR
                 if (agent.HasMount && !WhileMounted)
                     return value;
 
+                // TEST 510: on a ladder the stick is the engine's, unturned.
+                if (VrLadder.Gated(agent))
+                    return value;
+
                 if (!VrCameraDriver.HasPose)
                     return value;
 
@@ -168,16 +172,25 @@ namespace BannerlordVR.VR
         /// movement went back to following the mouse. The feature disabled
         /// itself the moment its sibling started working.
         ///
-        /// The agent's own FRAME is the honest reference. MovementInputVector is
-        /// an agent-local vector, so the frame it is local TO is the thing to
-        /// measure against - and unlike the look direction, nothing in this mod
-        /// writes it. That the two used to agree is why the old version worked;
-        /// that they no longer do is why it stopped.
+        /// The agent's own FRAME replaced it - but that version never ran (its
+        /// setter patch was inlined away; see MovementInputPatch), so it was never
+        /// tested either.
+        ///
+        /// TEST 291c: the LOOK, measured. With the look held on the body (TEST
+        /// 291b) and the camera bearing still on the head, the player walked along
+        /// the body: the engine applies the input along the look. And while head
+        /// aim writes the look to the head, the delta is zero and this does nothing,
+        /// which is correct - movement already follows the head then.
         /// </summary>
         private static float ReferenceYaw(Agent agent)
         {
-            Mat3 flat = VrMath.YawOnly(agent.Frame.rotation);
-            return (float)Math.Atan2(flat.f.x, flat.f.y);
+            Vec3 look = agent.LookDirection;
+            if (look.x * look.x + look.y * look.y < 1e-6f)
+            {
+                Mat3 flat = VrMath.YawOnly(agent.Frame.rotation);
+                return (float)Math.Atan2(flat.f.x, flat.f.y);
+            }
+            return (float)Math.Atan2(look.x, look.y);
         }
 
         /// <summary>
@@ -199,9 +212,9 @@ namespace BannerlordVR.VR
 
             VrLog.Info(string.Format(
                 "Head move: view {0:F1} deg | agent frame {1:F1} | look {2:F1} | "
-                + "correcting by {3:F1}. The reference in use is the agent frame; "
+                + "correcting by {3:F1}. The reference in use is the look (TEST 291c); "
                 + "if movement still does not follow the head, the one to try is "
-                + "the look column.",
+                + "the agent frame column.",
                 Deg(view), Deg(ReferenceYaw(agent)),
                 Deg((float)Math.Atan2(look.x, look.y)), Deg(used)));
         }

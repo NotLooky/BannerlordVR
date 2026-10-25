@@ -334,7 +334,7 @@ bool ensure_output(ID3D11Device* device, uint32_t eye, const D3D11_TEXTURE2D_DES
     /* The SAME description as the source, so the CopyResource that follows into
        the swapchain is the identical operation it was before this module
        existed - same size, same format, same family. Only the bind flags differ,
-       and only by dropping the unordered access AFW would have asked for. */
+       and only by dropping the unordered access DR would have asked for. */
     D3D11_TEXTURE2D_DESC desc = model;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;

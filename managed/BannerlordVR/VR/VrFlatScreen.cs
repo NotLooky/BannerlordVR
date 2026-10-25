@@ -1,6 +1,11 @@
 using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using BannerlordVR.Interop;
+using TaleWorlds.CampaignSystem;
+using TaleWorlds.Engine.GauntletUI;
 using TaleWorlds.MountAndBlade;
+using TaleWorlds.ScreenSystem;
 
 namespace BannerlordVR.VR
 {
@@ -82,6 +87,102 @@ namespace BannerlordVR.VR
             }
         }
 
+        /// <summary>
+        /// TEST 592: every new screen opens in front of the head. The flat screen
+        /// and the pinned interface were each placed once and then stayed in the
+        /// room, so a town menu, the inventory or the battle results could come up
+        /// off to the side or behind. A new screen is a change of the top screen,
+        /// of the campaign's open game menu, or of the topmost focus layer (a
+        /// popup, a conversation, the results); each drops both pins and native
+        /// places them again ahead of where the head looks now.
+        /// </summary>
+        internal static bool RecenterScreens = VrConfig.Bool("ui_recenter_new_screen", true);
+
+        /// <summary>TEST 710/711: a new screen re-centres only when the head is turned
+        /// more than this many degrees left or right of it. The VR panel's slider.</summary>
+        internal static float RecenterAngle = VrConfig.Float("ui_recenter_angle", 75f);
+
+        private static string _screenKey;
+        private static bool _recenterBroken;
+
+        /// <summary>TEST 593: focus layers already seen on this screen and menu. In
+        /// the smithy the focus flips between the crafting layer and its 3D weapon
+        /// view as the pointer crosses the middle - 30 re-placements a minute. Only a
+        /// focus layer this screen has not shown yet (a popup, the results) counts.</summary>
+        private static readonly HashSet<string> SeenFocus = new HashSet<string>();
+
+        /// <summary>TEST 740: the limit native last got. Native also applies it to the
+        /// screens it re-shows by itself (leaving a battle, a menu over the world, the
+        /// VR panel), so it is pushed from the start and on every change; 180 when
+        /// recentring is off means "never turned far enough".</summary>
+        private static float _pushedLimit = -1f;
+
+        private static void RecenterOnNewScreen()
+        {
+            if (_recenterBroken || !Enabled)
+                return;
+
+            try
+            {
+                float limit = RecenterScreens ? RecenterAngle : 180f;
+                if (limit != _pushedLimit)
+                {
+                    _pushedLimit = limit;
+                    NativeMethods.bvr_repin_flat_screen_if_turned(limit);
+                }
+                if (!RecenterScreens)
+                    return;
+
+                string key = ScreenKey(out string focus, out bool settlement);
+                bool newScreen = key != _screenKey;
+                bool first = _screenKey == null;
+                if (newScreen)
+                {
+                    _screenKey = key;
+                    SeenFocus.Clear();
+                }
+                // TEST 625: a popup over a town's menus (recruit) is the same page.
+                bool newFocus = SeenFocus.Add(focus) && !newScreen && focus != "-" && !settlement;
+                if (first || (!newScreen && !newFocus))
+                    return;
+
+                // TEST 710: only if the head has turned well away from the screen.
+                NativeMethods.bvr_repin_flat_screen_if_turned(RecenterAngle);
+                VrLog.Info("Screen (TEST 592/710): now " + key + " focus " + focus + " - re-pinned if the head is turned away.");
+            }
+            catch (Exception ex)
+            {
+                _recenterBroken = true;
+                VrLog.Error("Screen recentring failed; screens stay where they were placed.", ex);
+            }
+        }
+
+        // ponytail: one small string a frame; compare fields if it ever shows in a profile.
+        private static string ScreenKey(out string focus, out bool settlement)
+        {
+            ScreenBase top = ScreenManager.TopScreen;
+            focus = "-";
+            List<ScreenLayer> layers = ScreenManager.SortedLayers;
+            for (int i = layers.Count - 1; i >= 0; i--)
+            {
+                if (layers[i] is GauntletLayer g && g.IsFocusLayer && g.IsActive && !g.IsFinalized)
+                {
+                    focus = g.Name;
+                    break;
+                }
+            }
+            string menu = Campaign.Current?.CurrentMenuContext?.GameMenu?.StringId ?? "-";
+
+            // TEST 625: a settlement's menus (town, tavern/backstreet, arena, wait)
+            // are one page - keyed on the settlement, not the menu.
+            string place = menu != "-" ? TaleWorlds.CampaignSystem.Party.MobileParty.MainParty?.CurrentSettlement?.StringId : null;
+            settlement = place != null;
+            if (settlement)
+                menu = "settlement " + place;
+            return (top == null ? "-" : top.GetType().Name + "#" + RuntimeHelpers.GetHashCode(top))
+                   + " menu " + menu;
+        }
+
         /// <summary>Called once per frame from the application tick, which is the
         /// only place that keeps running when there is no mission at all - which
         /// is precisely the case this exists to handle.</summary>
@@ -90,10 +191,15 @@ namespace BannerlordVR.VR
             if (_failed)
                 return;
 
-            // VrOwnsCamera rather than "is there a mission", so deployment counts
-            // as a menu: VR is not driving that camera, the game is, and the
-            // headset should be showing the game's own view of it rather than a
-            // stereo rendering of a camera nobody is anchored to.
+            RecenterOnNewScreen();
+
+            // VrOwnsCamera rather than "is there a mission" - which for a
+            // mission are now the same answer, deployment included. They were
+            // not: deployment used to drop to the flat screen on the reasoning
+            // that the game owned that camera. It still owns it, and the stereo
+            // path renders it anyway, because standing the renderer down after
+            // the scene view has been bound to the eye texture leaves the window
+            // showing a frozen frame rather than the game. See VrMissionPhase.
             //
             // With the flat screen off the native side must be held on the stereo
             // path, so this still publishes - it just always publishes 1.

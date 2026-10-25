@@ -66,10 +66,13 @@ namespace BannerlordVR.Patches
         private static int _callsAtLastReport;
         private static int _reports;
 
-        private static void Postfix(MissionScreen __instance)
+        private static void Postfix(MissionScreen __instance, float __0)
         {
             if (!VrSystem.IsActive)
                 return;
+
+            // TEST 410: the coming mission tick runs on this dt (VrCameraDriver.WalkLead).
+            VrCameraDriver.FrameDt = __0;
 
             VrBreadcrumb.Set(VrBreadcrumb.CameraPatch);
 

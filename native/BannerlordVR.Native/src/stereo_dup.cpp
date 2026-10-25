@@ -1,15 +1,21 @@
 #include "stereo_dup.h"
+#include "water_spec_aa.h"
 
 #include <windows.h>
 #include <d3d11shader.h>
+#include <d3dcompiler.h>
 
 #include "bvr_config.h"
 #include "bvr_log.h"
 #include "d3d_hooks.h"
 #include "frame_map.h"
 #include "stereo_perf.h"
+#include "perf_options.h"
+#include "stereo_srv_runs.h"
 #include "vp_patch.h"
+#include "vrs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <initializer_list>
 #include <intrin.h>
@@ -55,6 +61,27 @@ thread_local int  t_ignore = 0;
 
 uint64_t g_frame = 0;                 /* render thread only */
 
+/* TEST 425: which eye the ENGINE draws this frame - +1 the left, -1 the right,
+   0 not known yet. Set from the main view's own right axis against the
+   published eyes, the same test that picks the side of the eye offset. */
+std::atomic<int>   g_drawnSide{ 0 };
+std::atomic<float> g_maskNasalTan{ 0.0f };
+std::atomic<float> g_maskEyeAspect{ 0.0f };
+/* The runtime eye's up and down half-angle tangents (positive), for the top
+   and bottom cut; and the VR panel's guard (degrees, -1 = the cfg's) and
+   top/bottom switch (-1 = the cfg's). */
+/* The eye's render size (its scene depth) and output size: a viewport shaped
+   like the eye must also BE one of them. With a near-square eye (Quest 3 at
+   3540x3536) the aspect alone matched square shadow maps, and the scissor/VRS
+   cost the right eye its torch shadows. */
+std::atomic<uint32_t> g_maskRenderW{ 0 }, g_maskRenderH{ 0 }, g_maskOutW{ 0 }, g_maskOutH{ 0 };
+std::atomic<uint64_t> g_cMasked{0}, g_cMaskEngineScissor{0}, g_cMaskShape{0};
+/* The scissor-enabled copy of an engine rasterizer state, held by that state;
+   and a mark on a state the engine already scissors itself.
+   {9B2E4F61-3C7A-4D85-A1B6-5E8F0C2D7A93} {9B2E4F62-3C7A-4D85-A1B6-5E8F0C2D7A93} */
+const GUID kScissorClone = { 0x9b2e4f61, 0x3c7a, 0x4d85, { 0xa1, 0xb6, 0x5e, 0x8f, 0x0c, 0x2d, 0x7a, 0x93 } };
+const GUID kScissorOwn   = { 0x9b2e4f62, 0x3c7a, 0x4d85, { 0xa1, 0xb6, 0x5e, 0x8f, 0x0c, 0x2d, 0x7a, 0x93 } };
+
 std::atomic<uint64_t> g_cOps{0}, g_cTainted{0}, g_cDup{0};
 std::atomic<uint64_t> g_cTwins{0}, g_twinBytes{0};
 std::atomic<uint64_t> g_cCbUpload{0}, g_cCbCamera{0}, g_cCbLight{0};
@@ -62,8 +89,25 @@ std::atomic<uint64_t> g_cTwinFail{0}, g_cRefused{0}, g_cSync{0}, g_cReadback{0};
 std::atomic<uint64_t> g_cUnknownDecl{0}, g_cSwapOverflow{0}, g_cCbFull{0};
 std::atomic<uint64_t> g_cCpuMirror{0};
 std::atomic<uint64_t> g_cCbMain1760{0}, g_cCbMain128{0}, g_cCbMain224{0}, g_cCbFar{0};
-std::atomic<uint64_t> g_cOffsetFallback{0}, g_cLightShared{0}, g_cReadSync{0};
+std::atomic<uint64_t> g_cOffsetFallback{0}, g_cLightShared{0}, g_cReadSync{0}, g_cVtShared{0};
+std::atomic<uint64_t> g_cIndirect{0}, g_cCbMainRel{0};   /* TEST 340 */
 std::atomic<uint64_t> g_syncBytes{0};
+/* TIMED ON ONE FRAME IN kTimeEvery, NOT EVERY OP.
+
+   qpc_now() was called on entry to stereo_begin and again at each of its four
+   exits - 2 QueryPerformanceCounter per op, 4 per duplicated op - and it was
+   not gated by stereo_perf. At the ~2245 draws a frame the 2026-09-17 capture
+   holds that is 4.5-9k QPC calls a frame, paid to measure a number that is
+   reported once every 5 s.
+
+   Sampling one frame in 23 gives the same ms-per-frame figure, because the
+   divisor counts timed frames rather than all of them. 23 is the cadence the
+   GPU-by-pass instrument already samples on (kPassEvery in stereo_perf.cpp),
+   picked there to be coprime with anything that alternates by eye or frame. */
+const uint64_t kTimeEvery = 23;
+std::atomic<bool> g_timeOps{false};
+std::atomic<uint64_t> g_timedFrames{0};
+
 std::atomic<uint64_t> g_tExamine{0}, g_tDup{0};
 std::atomic<uint64_t> g_declParsed{0}, g_declFailed{0}, g_declAgree{0}, g_declDiffer{0};
 std::atomic<uint64_t> g_declChecked{0};
@@ -110,6 +154,10 @@ bool ignored()
    failed for whole windows at a time ("0 of 22440 camera uploads were the main
    view"). Each failed upload left the second eye drawn from the FIRST eye's
    camera for that pass. */
+/* World units per metre of the published eyes (stereo_set_world_scale). */
+std::atomic<float> g_worldScale{ 1.0f };
+std::atomic<bool>  g_ipdResetPending{ false };
+
 struct PubEyes
 {
     float cur[3];    /* the eye the engine is drawing */
@@ -134,7 +182,12 @@ PubEyes published_eyes()
         p.d[i] = p.other[i] - p.cur[i];
     }
     p.ipd = sqrtf(p.d[0] * p.d[0] + p.d[1] * p.d[1] + p.d[2] * p.d[2]);
-    p.valid = p.ipd > 0.005f && p.ipd < 0.5f;      /* a plausible IPD and nothing else */
+    /* A plausible IPD and nothing else - in METRES, so scaled to the world the
+       eyes are published in. The campaign map table publishes ~15 units per
+       metre, and an unscaled 0.5 rejected every pair (TEST 286: "0 of 16465
+       camera uploads were the main view", IPD 0.000). */
+    const float s = g_worldScale.load(std::memory_order_relaxed);
+    p.valid = p.ipd > 0.005f * s && p.ipd < 0.5f * s;
     if (p.valid)
         for (int i = 0; i < 3; ++i)
             p.dir[i] = p.d[i] / p.ipd;
@@ -171,6 +224,18 @@ bool light_passes_shared()
     return cached;
 }
 
+bool vt_reads_shared()
+{
+    static bool cached = true;
+    static bool have = false;
+    if (!have)
+    {
+        have = true;
+        cached = config_bool("stereo_vt_shared", true);
+    }
+    return cached;
+}
+
 /* The main camera of the frame being drawn, and the one before - what the
    128- and 224-byte buffers, which carry no position of their own, are verified
    against. Render thread only. */
@@ -184,14 +249,125 @@ bool     g_prevMainValid = false;
 
 /* The main view's g_viewproj_unjittered (+304), engine bytes - what the
    per-mesh previous-frame transforms are corrected with (see
-   stereo_on_buffer_write). Render thread only. */
+   mesh_prev_copy). Render thread only. */
 float    g_mainVpU[16] = {};
 bool     g_mainVpUValid = false;
+
+/* TEST 793: the jitter the engine RENDERED, in NDC - g_view_proj (+240) minus
+   g_viewproj_unjittered (+304). A projection jitter adds j * w to clip x/y, so
+   column 0/1 of the difference is j times column 3. */
+std::atomic<float> g_renderJitterX{ 0.0f }, g_renderJitterY{ 0.0f };
+std::atomic<bool>  g_renderJitterValid{ false };
 
 /* How the eye offset agreed with the published one, for the log. */
 double   g_offsetCosSum = 0.0;
 double   g_offsetCosMin = 1.0;
 uint64_t g_offsetCosN = 0;
+
+/* THE IPD HOLDS STILL FOR A WHOLE FRAME (TEST 194).
+ *
+   "Black flicker on the horses' bright hair with DLSS, worse when I move my
+   head." Hair is drawn twice: the G-buffer pass writes its depth and a BLACK
+   albedo, and a forward pass later paints its real colour with the depth test
+   EQUAL and no depth write (capture 17:21:39: S104/S102 at #2134, fn3). EQUAL
+   holds for the engine's eye because the engine re-uploads per_framef bit for
+   bit within a frame - its G-buffer upload (#79) and its forward-pass upload
+   (#1982) hash the same at +240, +304, +688 and +928.
+ *
+   Eye 1's copy did not. Every upload rebuilt the offset from the published
+   eyes' IPD, which is the length of a difference of two float world positions
+   ~750 m out: 65.007, 65.028, 64.991, 65.021 mm on four consecutive frames of
+   that capture. Managed publishes on the game thread with no order against the
+   render thread, so a new value landed between the two uploads. Tens of
+   micrometres of sideways shift move every interpolated depth of a hair card,
+   EQUAL fails, and the pixels keep the black albedo - eye 1 only, and more the
+   more the head moves.
+ *
+   So the IPD changes at most once a frame, at its first use, and only when the
+   MEDIAN of the last 31 frames' published values has moved more than 0.2 mm from
+   the held one: the headset's IPD setting gets through in a fraction of a second,
+   float rounding never does. The same noise was in every frame-to-frame offset
+   change eye 1's motion vectors are corrected with (+752, the per-mesh transforms).
+   stereo_hold_ipd = 0 restores the per-upload IPD.
+ *
+   A median and not an average (TEST 195): managed publishes the other eye apart
+   from the eye being drawn (vp_publish_other writes both slots), so a read can
+   pair one frame's eye with the next frame's other eye, and riding that is up to
+   ~11 cm of travel. The 17:53 run's published IPD reached 113 and 176 mm. An
+   average would have taken 2 mm of such a spike and retuned on it; a median of
+   31 needs sixteen frames of it. */
+constexpr int kIpdRing = 31;
+float    g_ipdRing[kIpdRing] = {};
+int      g_ipdRingCount = 0;
+int      g_ipdRingPos = 0;
+float    g_ipdHeld = 0.0f;           /* m; 0 until the first valid publication */
+uint64_t g_ipdFrame = ~0ull;
+float    g_ipdFrameRaw = 0.0f;       /* the published IPD at the frame's first use */
+uint64_t g_ipdMidFrames = 0;         /* for the log: frames the published IPD changed in */
+uint64_t g_ipdMidLastFrame = ~0ull;
+double   g_ipdMidMaxUm = 0.0;
+float    g_ipdRawMin = 0.0f;
+float    g_ipdRawMax = 0.0f;
+uint64_t g_ipdRetunes = 0;
+
+bool hold_ipd_enabled()
+{
+    static bool cached = true;
+    static bool have = false;
+    if (!have) { have = true; cached = config_bool("stereo_hold_ipd", true); }
+    return cached;
+}
+
+float frame_ipd(float raw)
+{
+    if (g_ipdResetPending.exchange(false, std::memory_order_acquire))
+    {
+        g_ipdHeld = 0.0f;
+        g_ipdRingCount = 0;
+        g_ipdRingPos = 0;
+    }
+
+    if (g_ipdFrame != g_frame)
+    {
+        g_ipdFrame = g_frame;
+        g_ipdFrameRaw = raw;
+
+        g_ipdRing[g_ipdRingPos] = raw;
+        g_ipdRingPos = (g_ipdRingPos + 1) % kIpdRing;
+        if (g_ipdRingCount < kIpdRing)
+            ++g_ipdRingCount;
+
+        float sorted[kIpdRing];
+        memcpy(sorted, g_ipdRing, sizeof(float) * g_ipdRingCount);
+        std::sort(sorted, sorted + g_ipdRingCount);
+        const float median = sorted[g_ipdRingCount / 2];
+
+        if (g_ipdHeld <= 0.0f)
+            g_ipdHeld = raw;
+        else if (g_ipdRingCount >= 3 &&
+                 fabs(median - g_ipdHeld) > 0.0002f * g_worldScale.load(std::memory_order_relaxed))
+        {
+            g_ipdHeld = median;
+            ++g_ipdRetunes;
+        }
+    }
+    else if (raw != g_ipdFrameRaw)
+    {
+        if (g_ipdMidLastFrame != g_frame)
+        {
+            g_ipdMidLastFrame = g_frame;
+            ++g_ipdMidFrames;
+        }
+        const double um = fabs(static_cast<double>(raw) - g_ipdFrameRaw) * 1e6;
+        if (um > g_ipdMidMaxUm)
+            g_ipdMidMaxUm = um;
+    }
+    if (g_ipdRawMin == 0.0f || raw < g_ipdRawMin)
+        g_ipdRawMin = raw;
+    if (raw > g_ipdRawMax)
+        g_ipdRawMax = raw;
+    return hold_ipd_enabled() ? g_ipdHeld : raw;
+}
 
 void note_main_camera(const float cam[3], const float d[3])
 {
@@ -205,6 +381,30 @@ void note_main_camera(const float cam[3], const float d[3])
     memcpy(g_mainD, d, sizeof(g_mainD));
     g_mainFrame = g_frame;
     g_mainValid = true;
+}
+
+/* The main view's rotation this frame - g_view's 3x3 - which is what identifies
+   a camera-relative upload of the same view (TEST 340b). Render thread only. */
+float    g_mainRot[9] = {};
+uint64_t g_mainRotFrame = ~0ull;
+
+void note_main_rotation(const uint8_t* view)
+{
+    const float* v = reinterpret_cast<const float*>(view);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            g_mainRot[r * 3 + c] = v[r * 4 + c];
+    g_mainRotFrame = g_frame;
+}
+
+bool same_rotation(const uint8_t* view, const float rot[9])
+{
+    const float* v = reinterpret_cast<const float*>(view);
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            if (!(fabsf(v[r * 4 + c] - rot[r * 3 + c]) < 1e-5f))
+                return false;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,13 +482,22 @@ bool is_forward_camera(const float* m, const float c[3])
     const float tz = 3e-5f * g[2] + 1e-4f;
     const float tw = 3e-5f * g[3] + 1e-4f;
 
+    /* The guards ask whether the MATRIX is degenerate (a zero-filled site), not
+       how large the camera's terms are: a camera-relative view's camera is the
+       origin, and every one of its terms is zero (TEST 340b). */
+    const float persp = fabsf(m[3]) + fabsf(m[7]) + fabsf(m[11]);
+    float basis = 0.0f;
+    for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 3; ++k)
+            basis += fabsf(m[r * 4 + k]);
+
     /* world -> clip: the camera is where w vanishes, and x and y with it */
-    if (fabsf(v[3]) < tw && fabsf(v[0]) < tx && fabsf(v[1]) < ty && g[3] > 1e-3f)
+    if (fabsf(v[3]) < tw && fabsf(v[0]) < tx && fabsf(v[1]) < ty && persp > 1e-3f)
         return true;
 
     /* world -> view: the camera is the origin */
     if (fabsf(v[0]) < tx && fabsf(v[1]) < ty && fabsf(v[2]) < tz &&
-        fabsf(v[3] - 1.0f) < 1e-3f && (g[0] + g[1] + g[2]) > 1e-3f)
+        fabsf(v[3] - 1.0f) < 1e-3f && basis > 1e-3f)
         return true;
 
     return false;
@@ -453,6 +662,8 @@ struct ShaderDecl
     uint32_t uav;        /* bit per UAV slot, 0..31 */
     uint32_t pad;
     uint64_t t[2];       /* bit per texture/buffer slot, 0..127 */
+    uint64_t shared[2];  /* texture slots always read from the original (vt_*, TEST 288) */
+    SrvRuns srvRuns;
 };
 
 uint32_t rd32(const uint8_t* p)
@@ -625,6 +836,55 @@ bool reflect_decl(const void* code, size_t len, ShaderDecl& out)
     }
     r->Release();
     return ok;
+}
+
+/* THE TERRAIN'S VIRTUAL TEXTURE IS ONE CACHE, NOT A VIEW (TEST 288).
+ *
+   Campaign map, native stereo: "only terrain is missing [in the right eye],
+   bright void, no geometry", DLSS on or off. Frame map 20260927_012018 caught
+   eye 1's own terrain draw (#017133): every input the original's, except t47,
+   vt_translation_texture - the page table - swapped for its twin. The caches it
+   indexes (t44-t46) stayed shared; the CPU refills them from eye 0's feedback and
+   rewrites the page table to match, rarely (no write in 8 captured frames). A
+   twin of the table - per-eye since TEST 182's false positive, the passes that
+   update it bind the camera - goes stale in between and points eye 1 into the
+   wrong tiles.
+ *
+   Nothing in a vt_* texture depends on the eye, so those slots are read from the
+   original by both eyes, found by their names in the reflection chunk.
+   stereo_vt_shared = 0 restores the swap. */
+void mark_shared_slots(const void* code, size_t len, ShaderDecl& out)
+{
+    static PFN_D3DReflect fn = [] {
+        HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+        return m ? reinterpret_cast<PFN_D3DReflect>(GetProcAddress(m, "D3DReflect")) : nullptr;
+    }();
+    if (fn == nullptr)
+        return;
+
+    ID3D11ShaderReflection* r = nullptr;
+    if (FAILED(fn(code, len, kIidReflect, reinterpret_cast<void**>(&r))) || r == nullptr)
+        return;
+
+    D3D11_SHADER_DESC sd = {};
+    if (SUCCEEDED(r->GetDesc(&sd)))
+    {
+        for (UINT i = 0; i < sd.BoundResources; ++i)
+        {
+            D3D11_SHADER_INPUT_BIND_DESC bd = {};
+            if (FAILED(r->GetResourceBindingDesc(i, &bd)) || bd.Type != D3D_SIT_TEXTURE ||
+                bd.Name == nullptr || strncmp(bd.Name, "vt_", 3) != 0)
+                continue;
+            const UINT count = bd.BindCount ? bd.BindCount : 1;
+            for (UINT k = 0; k < count; ++k)
+            {
+                const UINT slot = bd.BindPoint + k;
+                if (slot < 128)
+                    out.shared[slot >> 6] |= 1ull << (slot & 63);
+            }
+        }
+    }
+    r->Release();
 }
 
 bool decl_of(ID3D11DeviceChild* sh, ShaderDecl& d)
@@ -1019,7 +1279,24 @@ struct SurfState
     uint64_t stale;
 };
 
-/* The state under the current epoch, or all-NONE (and false). */
+/* The state under the current epoch, or all-NONE (and false).
+
+   Deliberately NOT cached, though it is the hottest uncached lookup in the
+   file: a GetPrivateData per render target, UAV, depth target and shader
+   resource of every draw. A frame-scoped table keyed on the resource pointer
+   was written and then taken back out. Two reasons:
+
+     - state_put would have to write through it, and state_put is reachable
+       from the CopyResource / OMSetRenderTargets detours, which are not
+       guaranteed to be the Present thread (see the SetMultithreadProtected
+       note in d3d_hooks.cpp). A stale hit does not lose time, it makes the
+       wrong duplication decision, which is visible.
+     - It buys CPU on a thread that the render-thread profiler shows parked in
+       a kernel wait for 67-79% of every frame. Native stereo is GPU-bound; the
+       whole of stereo_begin costs 2.15 ms of a 21-31 ms frame.
+
+   Worth revisiting only if native stereo ever becomes CPU-bound - if the
+   submitted resolution comes down far enough, this is the first place to look. */
 bool state_get(ID3D11Resource* r, SurfState& s)
 {
     UINT size = sizeof(s);
@@ -1315,7 +1592,14 @@ bool prepare_write(ID3D11DeviceContext* c, ID3D11Resource* r, uint64_t mask)
 void mark_div(ID3D11Resource* r, uint64_t mask)
 {
     SurfState s;
-    state_get(r, s);
+    const bool had = state_get(r, s);
+
+    /* TEST 422: a target already diverged in these subresources - every
+       G-buffer draw after the first of a frame - would be written back
+       unchanged. Skip that Set; a missing or old-epoch state is still put. */
+    if (had && (s.div & mask) == mask && ((s.sync | s.stale) & mask) == 0)
+        return;
+
     s.div |= mask;
     s.sync &= ~mask;
     s.stale &= ~mask;
@@ -1468,6 +1752,7 @@ uint64_t  g_censusOverflow = 0;
 
 void census_note(ID3D11Resource* key, uint32_t why)
 {
+    if (!perf_diagnostics()) return;
     const uint32_t renderThread = present_thread_id();
     if (renderThread != 0 && GetCurrentThreadId() != renderThread)
         return;
@@ -1659,16 +1944,72 @@ void get_stage_cbs(ID3D11DeviceContext* c, int st, UINT lo, UINT n, ID3D11Buffer
     }
 }
 
-void set_stage_cb(ID3D11DeviceContext* c, int st, UINT slot, ID3D11Buffer* b)
+void set_stage_cbs(ID3D11DeviceContext* c, int st, UINT lo, UINT n, ID3D11Buffer** b)
 {
     switch (st)
     {
-    case 0: c->VSSetConstantBuffers(slot, 1, &b); break;
-    case 1: c->HSSetConstantBuffers(slot, 1, &b); break;
-    case 2: c->DSSetConstantBuffers(slot, 1, &b); break;
-    case 3: c->GSSetConstantBuffers(slot, 1, &b); break;
-    case 4: c->PSSetConstantBuffers(slot, 1, &b); break;
-    default: c->CSSetConstantBuffers(slot, 1, &b); break;
+    case 0: c->VSSetConstantBuffers(lo, n, b); break;
+    case 1: c->HSSetConstantBuffers(lo, n, b); break;
+    case 2: c->DSSetConstantBuffers(lo, n, b); break;
+    case 3: c->GSSetConstantBuffers(lo, n, b); break;
+    case 4: c->PSSetConstantBuffers(lo, n, b); break;
+    default: c->CSSetConstantBuffers(lo, n, b); break;
+    }
+}
+
+void set_stage_srvs(ID3D11DeviceContext* c, int st, UINT lo, UINT n,
+                    ID3D11ShaderResourceView** v)
+{
+    switch (st)
+    {
+    case 0: c->VSSetShaderResources(lo, n, v); break;
+    case 1: c->HSSetShaderResources(lo, n, v); break;
+    case 2: c->DSSetShaderResources(lo, n, v); break;
+    case 3: c->GSSetShaderResources(lo, n, v); break;
+    case 4: c->PSSetShaderResources(lo, n, v); break;
+    default: c->CSSetShaderResources(lo, n, v); break;
+    }
+}
+
+/* APPLY THE SWAPS IN CONTIGUOUS RUNS.
+ *
+ * stereo_bind and stereo_end each walked op.swap one entry at a time, so a
+ * duplicated op cost 2 x (1 + nSwap) single-slot Set calls, each with the
+ * driver's full dirty-state validation behind it.
+ *
+ * The swaps are already in run order: stereo_begin fills them stage by stage,
+ * constants before textures, slots ascending within each. So one linear pass
+ * finds every run of same stage, same kind, consecutive slots, and sets it in
+ * a single call. twin = true binds the second eye, false puts the engine's own
+ * bindings back. */
+void apply_swaps(ID3D11DeviceContext* c, const StereoOp& op, bool twin)
+{
+    int i = 0;
+    while (i < op.nSwap)
+    {
+        const StereoSwap& first = op.swap[i];
+        int n = 1;
+        while (i + n < op.nSwap)
+        {
+            const StereoSwap& s = op.swap[i + n];
+            if (s.stage != first.stage || s.isSrv != first.isSrv ||
+                s.slot != first.slot + n)
+                break;
+            ++n;
+        }
+
+        void* ptrs[kStereoSwapMax];
+        for (int k = 0; k < n; ++k)
+            ptrs[k] = twin ? op.swap[i + k].twin : op.swap[i + k].orig;
+
+        if (first.isSrv)
+            set_stage_srvs(c, first.stage, first.slot, static_cast<UINT>(n),
+                           reinterpret_cast<ID3D11ShaderResourceView**>(ptrs));
+        else
+            set_stage_cbs(c, first.stage, first.slot, static_cast<UINT>(n),
+                          reinterpret_cast<ID3D11Buffer**>(ptrs));
+
+        i += n;
     }
 }
 
@@ -1683,19 +2024,6 @@ void get_stage_srvs(ID3D11DeviceContext* c, int st, UINT lo, UINT n,
     case 3: c->GSGetShaderResources(lo, n, out); break;
     case 4: c->PSGetShaderResources(lo, n, out); break;
     default: c->CSGetShaderResources(lo, n, out); break;
-    }
-}
-
-void set_stage_srv(ID3D11DeviceContext* c, int st, UINT slot, ID3D11ShaderResourceView* v)
-{
-    switch (st)
-    {
-    case 0: c->VSSetShaderResources(slot, 1, &v); break;
-    case 1: c->HSSetShaderResources(slot, 1, &v); break;
-    case 2: c->DSSetShaderResources(slot, 1, &v); break;
-    case 3: c->GSSetShaderResources(slot, 1, &v); break;
-    case 4: c->PSSetShaderResources(slot, 1, &v); break;
-    default: c->CSSetShaderResources(slot, 1, &v); break;
     }
 }
 
@@ -1761,6 +2089,22 @@ DsUse depth_use(ID3D11DeviceContext* c)
 // public surface
 // ---------------------------------------------------------------------------
 
+void stereo_set_world_scale(float scale)
+{
+    if (!(scale > 0.01f) || !(scale < 10000.0f))
+        scale = 1.0f;
+
+    const float was = g_worldScale.exchange(scale, std::memory_order_relaxed);
+    if (fabs(was - scale) > 1e-3f * scale)
+    {
+        /* The held IPD belongs to the old world; frame_ipd starts it again on
+           the render thread, which owns the ring. */
+        g_ipdResetPending.store(true, std::memory_order_release);
+        BVR_INFO("Stereo world scale %.3f units per metre (IPD bounds %.3f - %.3f).",
+                 scale, 0.005f * scale, 0.5f * scale);
+    }
+}
+
 void stereo_set_active(bool active)
 {
     const bool was = g_active.exchange(active, std::memory_order_relaxed);
@@ -1792,12 +2136,16 @@ void stereo_note_shader(ID3D11DeviceChild* shader, const void* code, size_t len)
 
     ShaderDecl d;
     if (parse_decl(code, len, d))
+    {
         g_declParsed.fetch_add(1, std::memory_order_relaxed);
+        mark_shared_slots(code, len, d);
+    }
     else
     {
         g_declFailed.fetch_add(1, std::memory_order_relaxed);
         memset(&d, 0, sizeof(d));   /* unknown: every bound slot counts */
     }
+    d.srvRuns = build_srv_runs(d.t);
     shader->SetPrivateData(kShaderDecl, sizeof(d), &d);
 
     /* Cross-check the parse against the reflection chunk on the first few
@@ -1888,10 +2236,28 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
     {
         memcpy(cam, src, sizeof(cam));
         const float nearM = near_head_m();
+        bool relative = false;
         if (!(dist3(cam, pub.cur) <= nearM || dist3(cam, pub.other) <= nearM))
         {
-            g_cCbFar.fetch_add(1, std::memory_order_relaxed);
-            return;
+            /* CAMERA-RELATIVE per_framef (TEST 340b). A War Sails battle sits
+               ~6.8 km from the world origin, and the engine draws its G-buffer
+               in camera-relative space: g_camera_position = (0,0,0, FLT_MAX),
+               g_view and g_view_proj with no translation (frame map
+               20261003_194221). The 2 m gate threw every such upload out, so eye
+               1 drew ships and crew from eye 0's camera - everything flat except
+               the water, whose forward pass uses absolute coordinates. Taken as
+               the main view only when its rotation is exactly this frame's main
+               view's - in the capture an absolute main upload always came first
+               and matched to the bit. The camera is then the origin and eye 1 is
+               +d from it, so every site rule below applies unchanged. */
+            relative = cam[0] == 0.0f && cam[1] == 0.0f && cam[2] == 0.0f &&
+                       g_mainRotFrame == g_frame && same_rotation(src + 112, g_mainRot);
+            if (!relative)
+            {
+                g_cCbFar.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            g_cCbMainRel.fetch_add(1, std::memory_order_relaxed);
         }
 
         for (int i = 0; i < layout->count && !main; ++i)
@@ -1918,12 +2284,15 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
            pose a publication old. The published delta only chooses the side. */
         const float* r = reinterpret_cast<const float*>(src + 928);
         const float len = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        const float ipd = frame_ipd(pub.ipd);
         if (isfinite(len) && len > 0.9f && len < 1.1f)
         {
             const float cosPub = (r[0] * pub.dir[0] + r[1] * pub.dir[1] + r[2] * pub.dir[2]) / len;
             const float sign = cosPub >= 0.0f ? 1.0f : -1.0f;
             for (int i = 0; i < 3; ++i)
-                d[i] = r[i] / len * pub.ipd * sign;
+                d[i] = r[i] / len * ipd * sign;
+            /* The other eye sits along +right: the engine is drawing the left. */
+            g_drawnSide.store(sign > 0.0f ? 1 : -1, std::memory_order_relaxed);
             g_offsetCosSum += fabs(cosPub);
             if (fabs(cosPub) < g_offsetCosMin)
                 g_offsetCosMin = fabs(cosPub);
@@ -1931,14 +2300,33 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
         }
         else
         {
-            memcpy(d, pub.d, sizeof(d));
+            for (int i = 0; i < 3; ++i)
+                d[i] = pub.dir[i] * ipd;
             g_cOffsetFallback.fetch_add(1, std::memory_order_relaxed);
         }
-        note_main_camera(cam, d);
-        if (is_forward_camera(reinterpret_cast<const float*>(src + 304), cam))
+        /* g_mainCam stays the ABSOLUTE camera: the 128/224-byte buffers are
+           verified against it. */
+        if (!relative)
         {
-            memcpy(g_mainVpU, src + 304, sizeof(g_mainVpU));
-            g_mainVpUValid = true;
+            note_main_camera(cam, d);
+            note_main_rotation(src + 112);
+            if (is_forward_camera(reinterpret_cast<const float*>(src + 304), cam))
+            {
+                memcpy(g_mainVpU, src + 304, sizeof(g_mainVpU));
+                g_mainVpUValid = true;
+
+                const float* J = reinterpret_cast<const float*>(src + 240);
+                const float* U = reinterpret_cast<const float*>(src + 304);
+                int k = 0;
+                for (int row = 1; row < 4; ++row)
+                    if (fabsf(U[row * 4 + 3]) > fabsf(U[k * 4 + 3])) k = row;
+                if (fabsf(U[k * 4 + 3]) > 1e-6f)
+                {
+                    g_renderJitterX.store((J[k * 4 + 0] - U[k * 4 + 0]) / U[k * 4 + 3], std::memory_order_relaxed);
+                    g_renderJitterY.store((J[k * 4 + 1] - U[k * 4 + 1]) / U[k * 4 + 3], std::memory_order_relaxed);
+                    g_renderJitterValid.store(true, std::memory_order_relaxed);
+                }
+            }
         }
         g_cCbMain1760.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1946,6 +2334,8 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
     {
         const float* camCand[3] = {};
         const float* dCand[3] = {};
+        const float ipd = frame_ipd(pub.ipd);
+        const float pubD[3] = { pub.dir[0] * ipd, pub.dir[1] * ipd, pub.dir[2] * ipd };
         int n = 0;
         if (g_mainValid)
         {
@@ -1958,7 +2348,7 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
             dCand[n++] = g_prevMainD;
         }
         camCand[n] = pub.cur;
-        dCand[n++] = pub.d;
+        dCand[n++] = pubD;
 
         for (int k = 0; k < n && !main; ++k)
         {
@@ -2019,6 +2409,39 @@ void stereo_on_cb_upload(ID3D11Resource* resource, const void* data, uint32_t by
             m[1] += d[1];
             m[2] += d[2];
             ++verified;
+        }
+    }
+
+    /* g_curr_to_prev_frame_ss_matrix (+752), TEST 193. S082 builds the motion
+       vectors of pixels without their own velocity as (current NDC, depth) * S.
+       For eye 1, S1 = inv(VP) T(d - d_prev) VP_prev, which is S0 only while the
+       eye offset holds still - it rotates with the head, so turning left eye 1's
+       vectors off by the offset's change (1-3 px at 2 m turning fast): DLSS threw
+       its history away on thin bright detail - "horse hair flickers bright and
+       black in the right eye, worse moving fast".
+       S1 = C S0 with C = inv(VP) T(delta) VP = I + a (x) b, a = column 3 of the
+       inverse (+688), b = delta * VP rows (+304). */
+    if (bytes == 1760 && g_prevMainValid)
+    {
+        const double dl[3] = { static_cast<double>(d[0]) - g_prevMainD[0],
+                               static_cast<double>(d[1]) - g_prevMainD[1],
+                               static_cast<double>(d[2]) - g_prevMainD[2] };
+        if (dl[0] != 0.0 || dl[1] != 0.0 || dl[2] != 0.0)
+        {
+            const float* inv = reinterpret_cast<const float*>(src + 688);
+            const float* vp = reinterpret_cast<const float*>(src + 304);
+            float* S = reinterpret_cast<float*>(t_scratch + 752);
+            double bS[4] = {};
+            for (int c = 0; c < 4; ++c)
+                for (int k = 0; k < 4; ++k)
+                {
+                    const double b = dl[0] * vp[0 * 4 + k] + dl[1] * vp[1 * 4 + k] +
+                                     dl[2] * vp[2 * 4 + k];
+                    bS[c] += b * S[k * 4 + c];
+                }
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    S[r * 4 + c] = static_cast<float>(S[r * 4 + c] + inv[r * 4 + 3] * bS[c]);
         }
     }
 
@@ -2119,14 +2542,47 @@ void stereo_on_update(ID3D11DeviceContext* c, ID3D11Resource* r, UINT sub,
 namespace {
 
 constexpr uint32_t kMeshf1Stride = 304;
-constexpr uint32_t kMeshPrevRow3 = 128 + 48;
 
-std::vector<uint8_t> g_meshPatched;          /* render thread only */
-ID3D11Resource*      g_meshPendingSrc = nullptr;   /* compared, never dereferenced */
-uint32_t             g_meshPendingBytes = 0;
+/* ON THE GPU, NOT THE CPU (TEST 188). TEST 183 built the corrected copy on the
+   CPU, from the bytes the engine had just written into its DYNAMIC buffer. The
+   render-thread profiler then found that one memcpy at ~48% of the thread's
+   time at 64 fps: reading 2.5 MB back out of write-mapped GPU memory is slow,
+   whatever it looks like in the source. Nothing is read now. When the engine
+   copies its dynamic buffer into the one the shaders read, the same copy goes
+   into that buffer's twin - GPU to GPU - and a compute pass adds the row. */
+const char kMeshCs[] = R"HLSL(
+struct Elem
+{
+    float  head[44];   /* 176 bytes up to mesh_prev_frame_transform row 3 */
+    float4 row3;       /* +176 */
+    float  tail[28];   /* +192 .. +304 */
+};
+RWStructuredBuffer<Elem> Buf : register(u0);
+cbuffer P : register(b0) { float4 shift; uint first; uint count; uint pad0; uint pad1; };
 
-std::atomic<uint64_t> g_cMeshWrites{0}, g_cMeshElems{0}, g_cMeshApplied{0};
-std::atomic<uint64_t> g_cMeshNoView{0}, g_cMeshSane{0};
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= count) return;
+    uint i = first + id.x;
+    Buf[i].row3 += shift;
+}
+)HLSL";
+
+struct MeshParams
+{
+    float    shift[4];
+    uint32_t first, count, pad0, pad1;
+};
+
+/* {3A8F2C71-5D4E-4B6A-8C9D-0E1F2A3B4C5D} - the twin's UAV, owned by the twin. */
+const GUID kMeshUav = { 0x3a8f2c71, 0x5d4e, 0x4b6a, { 0x8c, 0x9d, 0x0e, 0x1f, 0x2a, 0x3b, 0x4c, 0x5d } };
+
+ID3D11ComputeShader* g_meshCs = nullptr;
+ID3D11Buffer*        g_meshCb = nullptr;
+bool                 g_meshFailed = false;
+
+std::atomic<uint64_t> g_cMeshApplied{0}, g_cMeshElems{0}, g_cMeshNoView{0}, g_cMeshRefused{0};
 
 bool mesh_prev_enabled()
 {
@@ -2136,52 +2592,236 @@ bool mesh_prev_enabled()
     return cached;
 }
 
-/* The engine is copying `src` into `dst`; when src is the buffer whose eye-1
-   version was just built, that version goes into dst's twin and dst becomes
-   per-eye. True when handled - the caller must do nothing else with this copy. */
+bool meshf1_desc(ID3D11Resource* r, D3D11_BUFFER_DESC& d)
+{
+    if (r == nullptr)
+        return false;
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    r->GetType(&dim);
+    if (dim != D3D11_RESOURCE_DIMENSION_BUFFER)
+        return false;
+    static_cast<ID3D11Buffer*>(r)->GetDesc(&d);
+    return d.StructureByteStride == kMeshf1Stride &&
+           (d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0 &&
+           d.ByteWidth >= kMeshf1Stride && d.ByteWidth % kMeshf1Stride == 0;
+}
+
+bool mesh_prepare(ID3D11Device* dev)
+{
+    if (g_meshFailed)
+        return false;
+    if (g_meshCs != nullptr)
+        return true;
+
+    ID3DBlob* code = nullptr;
+    ID3DBlob* err = nullptr;
+    HRESULT hr = D3DCompile(kMeshCs, strlen(kMeshCs), "bvr_mesh_prev", nullptr, nullptr, "main",
+                            "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    if (FAILED(hr) || code == nullptr)
+    {
+        BVR_ERR("Stereo motion vectors: shader compile failed (0x%08X) %s", hr,
+                err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+        if (err) err->Release();
+        if (code) code->Release();
+        g_meshFailed = true;
+        return false;
+    }
+    if (err) err->Release();
+    hr = dev->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &g_meshCs);
+    code->Release();
+
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = sizeof(MeshParams);
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(hr) || FAILED(dev->CreateBuffer(&bd, nullptr, &g_meshCb)))
+    {
+        BVR_ERR("Stereo motion vectors: could not create the compute shader or its constants.");
+        g_meshFailed = true;
+        return false;
+    }
+    return true;
+}
+
+/* The twin of dst WITH an unordered-access view, created here on first need so
+   the compute pass can write it. AddRef'd twin; the UAV is owned by the twin. */
+ID3D11Resource* mesh_twin(ID3D11Device* dev, ID3D11Resource* dst, const D3D11_BUFFER_DESC& dd,
+                          ID3D11UnorderedAccessView** uavOut)
+{
+    *uavOut = nullptr;
+    ID3D11Resource* twin = twin_lookup(dst);
+    if (twin == nullptr)
+    {
+        D3D11_BUFFER_DESC d = dd;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.CPUAccessFlags = 0;
+        d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+        d.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                         D3D11_RESOURCE_MISC_GDI_COMPATIBLE | D3D11_RESOURCE_MISC_SHARED_NTHANDLE);
+        ID3D11Buffer* made = nullptr;
+        if (FAILED(dev->CreateBuffer(&d, nullptr, &made)) || made == nullptr)
+        {
+            g_cTwinFail.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        dst->SetPrivateDataInterface(kTwinRes, made);
+        g_cTwins.fetch_add(1, std::memory_order_relaxed);
+        g_twinBytes.fetch_add(d.ByteWidth, std::memory_order_relaxed);
+        twin = made;    /* keep the creation reference as the caller's */
+    }
+
+    ID3D11UnorderedAccessView* uav = nullptr;
+    UINT size = sizeof(uav);
+    if (SUCCEEDED(twin->GetPrivateData(kMeshUav, &size, &uav)) && uav != nullptr)
+    {
+        *uavOut = uav;  /* AddRef'd by GetPrivateData */
+        return twin;
+    }
+
+    D3D11_BUFFER_DESC td = {};
+    static_cast<ID3D11Buffer*>(twin)->GetDesc(&td);
+    if ((td.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
+    {
+        /* A twin made by the generic path before this one could run. */
+        static bool warned = false;
+        if (!warned)
+        {
+            warned = true;
+            BVR_WARN("Stereo motion vectors: the per-mesh transform buffer already has a "
+                     "twin without unordered access, so eye 1's correction is off for this "
+                     "buffer.");
+        }
+        twin->Release();
+        return nullptr;
+    }
+
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_UNKNOWN;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.FirstElement = 0;
+    ud.Buffer.NumElements = td.ByteWidth / kMeshf1Stride;
+    if (FAILED(dev->CreateUnorderedAccessView(twin, &ud, &uav)) || uav == nullptr)
+    {
+        twin->Release();
+        return nullptr;
+    }
+    twin->SetPrivateDataInterface(kMeshUav, uav);
+    *uavOut = uav;      /* our creation reference */
+    return twin;
+}
+
+/* The engine is copying its CPU-written per-mesh transforms (`src`, dynamic)
+   into the buffer the shaders read (`dst`). The same copy goes into dst's twin,
+   eye 1's row is added there, and dst becomes per-eye. True when handled - the
+   caller must do nothing else with this copy. */
 bool mesh_prev_copy(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT dstSub, UINT x,
                     ID3D11Resource* src, const D3D11_BOX* box)
 {
-    if (src == nullptr || src != g_meshPendingSrc || dst == nullptr || dstSub != 0)
+    if (!mesh_prev_enabled() || src == nullptr || dst == nullptr || dstSub != 0)
         return false;
 
-    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-    dst->GetType(&dim);
-    if (dim != D3D11_RESOURCE_DIMENSION_BUFFER)
+    D3D11_BUFFER_DESC sd = {}, dd = {};
+    if (!meshf1_desc(src, sd) || sd.Usage != D3D11_USAGE_DYNAMIC || !meshf1_desc(dst, dd))
         return false;
-    D3D11_BUFFER_DESC dd = {};
-    static_cast<ID3D11Buffer*>(dst)->GetDesc(&dd);
 
     const uint32_t left = box ? box->left : 0u;
-    const uint32_t right = box ? box->right : g_meshPendingBytes;
-    if (right > g_meshPendingBytes || left >= right ||
-        static_cast<uint64_t>(x) + (right - left) > dd.ByteWidth)
+    const uint32_t right = box ? box->right : sd.ByteWidth;
+    if (right > sd.ByteWidth || left >= right || (right - left) % kMeshf1Stride != 0 ||
+        x % kMeshf1Stride != 0 || static_cast<uint64_t>(x) + (right - left) > dd.ByteWidth)
+    {
+        g_cMeshRefused.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    if (!g_mainValid || !g_mainVpUValid)
+    {
+        g_cMeshNoView.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    ID3D11Device* dev = engine_device();
+    if (dev == nullptr || !mesh_prepare(dev))
         return false;
 
-    bool readback = false;
-    ID3D11Resource* twin = twin_create(dst, readback);
+    ID3D11UnorderedAccessView* uav = nullptr;
+    ID3D11Resource* twin = mesh_twin(dev, dst, dd, &uav);
     if (twin == nullptr)
         return false;
+
+    /* b = (-d, 0) * VP, in double: VP carries a ~1 km battle origin. */
+    MeshParams prm = {};
+    for (int k = 0; k < 4; ++k)
+        prm.shift[k] = static_cast<float>(
+            -(static_cast<double>(g_mainD[0]) * g_mainVpU[0 * 4 + k] +
+              static_cast<double>(g_mainD[1]) * g_mainVpU[1 * 4 + k] +
+              static_cast<double>(g_mainD[2]) * g_mainVpU[2 * 4 + k]));
+    prm.first = x / kMeshf1Stride;
+    prm.count = (right - left) / kMeshf1Stride;
+
+    const bool was = t_inDup;
+    t_inDup = true;
 
     SurfState ds;
     state_get(dst, ds);
     const bool whole = x == 0 && (right - left) == dd.ByteWidth;
     if (!whole && ((ds.div | ds.sync) & 1ull) == 0)
-        copy_raw(c, twin, dst);       /* the rest of the buffer keeps what it has */
+        c->CopyResource(twin, dst);      /* the rest of the buffer keeps what it has */
 
-    D3D11_BOX b = { x, 0, 0, x + (right - left), 1, 1 };
-    const bool was = t_inDup;
-    t_inDup = true;
-    c->UpdateSubresource(twin, 0, whole ? nullptr : &b, g_meshPatched.data() + left, 0, 0);
+    /* Straight from the engine's source, GPU to GPU - nothing is read back. */
+    c->CopySubresourceRegion(twin, 0, x, 0, 0, src, 0, box);
+
+    bool ok = false;
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (SUCCEEDED(c->Map(g_meshCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        memcpy(mapped.pData, &prm, sizeof(prm));
+        c->Unmap(g_meshCb, 0);
+
+        ID3D11ComputeShader*       prevCs = nullptr;
+        ID3D11Buffer*              prevCb = nullptr;
+        ID3D11UnorderedAccessView* prevUav = nullptr;
+        c->CSGetShader(&prevCs, nullptr, nullptr);
+        c->CSGetConstantBuffers(0, 1, &prevCb);
+        c->CSGetUnorderedAccessViews(0, 1, &prevUav);
+
+        UINT zero = 0;
+        c->CSSetShader(g_meshCs, nullptr, 0);
+        c->CSSetConstantBuffers(0, 1, &g_meshCb);
+        c->CSSetUnorderedAccessViews(0, 1, &uav, &zero);
+        c->Dispatch((prm.count + 255) / 256, 1, 1);
+
+        ID3D11UnorderedAccessView* nullUav = nullptr;
+        c->CSSetUnorderedAccessViews(0, 1, &nullUav, &zero);
+        c->CSSetShader(prevCs, nullptr, 0);
+        c->CSSetConstantBuffers(0, 1, &prevCb);
+        UINT counts = static_cast<UINT>(-1);
+        c->CSSetUnorderedAccessViews(0, 1, &prevUav, &counts);
+        if (prevCs)  prevCs->Release();
+        if (prevCb)  prevCb->Release();
+        if (prevUav) prevUav->Release();
+        ok = true;
+    }
+
     t_inDup = was;
+    uav->Release();
     twin->Release();
+
+    if (!ok)
+    {
+        /* The twin holds the uncorrected copy - eye 0's velocities, as before
+           TEST 183 - rather than whatever it held last frame. */
+        g_cMeshRefused.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        g_cMeshApplied.fetch_add(1, std::memory_order_relaxed);
+        g_cMeshElems.fetch_add(prm.count, std::memory_order_relaxed);
+    }
 
     memset(&ds, 0, sizeof(ds));
     ds.div = 1ull;
     state_put(dst, ds);
-
-    g_meshPendingSrc = nullptr;
-    g_cMeshApplied.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -2354,67 +2994,228 @@ ID3D11Resource* stereo_readback_map(ID3D11DeviceContext* c, ID3D11Resource* r, U
     return SUCCEEDED(*hr) ? slot : nullptr;
 }
 
-bool stereo_wants_buffer_write(ID3D11Resource* r)
+// --- TEST 425: the strip the lens never shows -------------------------------
+//
+// symmetric_fov renders both eyes through one frustum that CONTAINS each eye's
+// asymmetric one - on the PSVR2 +-64.7 deg, where an eye only sees 47.4 deg
+// toward the nose. That strip is drawn, shaded and lit and never displayed.
+// Each view-dependent draw is scissored to the eye it is drawn for: the
+// engine's eye loses its nasal edge and the re-issue loses the mirror one.
+//
+// A scissor, not a depth mask: nothing is written, so no twin re-sync can
+// carry one eye's strip into the other, and the strip's depth stays at the
+// clear (far), which is what the depth layer hands SteamVR. The guard keeps
+// SteamVR's reprojection and the image latch inside what was drawn.
+// Exposure: the histogram (system_postfx_eye_adaptation) trims its darkest 70%,
+// where an undrawn strip lands.
+
+namespace {
+
+bool mask_enabled()
 {
-    if (!g_active.load(std::memory_order_relaxed) || r == nullptr || !mesh_prev_enabled())
-        return false;
-    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
-    r->GetType(&dim);
-    if (dim != D3D11_RESOURCE_DIMENSION_BUFFER)
-        return false;
-    D3D11_BUFFER_DESC d = {};
-    static_cast<ID3D11Buffer*>(r)->GetDesc(&d);
-    return d.StructureByteStride == kMeshf1Stride &&
-           (d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0 &&
-           d.ByteWidth >= kMeshf1Stride && d.ByteWidth % kMeshf1Stride == 0;
+    static const bool on = config_bool("stereo_fov_mask", false);
+    return on;
 }
 
-void stereo_on_buffer_write(ID3D11Resource* r, const void* data, uint32_t bytes)
+/* NDC x past which the drawn eye's nasal side is never seen, or >= 1 when there
+   is nothing to cut. Once per frame. */
+float mask_cut()
 {
-    g_meshPendingSrc = nullptr;
-    if (!g_active.load(std::memory_order_relaxed) || ignored() || r == nullptr ||
-        data == nullptr || bytes < kMeshf1Stride)
-        return;
-    g_cMeshWrites.fetch_add(1, std::memory_order_relaxed);
+    static uint64_t frame = ~0ull;
+    static float cut = 2.0f;
+    if (frame == g_frame)
+        return cut;
+    frame = g_frame;
+    cut = 2.0f;
 
-    if (!g_mainValid || !g_mainVpUValid)
+    static const float guard = config_float("stereo_fov_mask_guard_deg", 10.0f) * 0.0174533f;
+
+    const float nasal = g_maskNasalTan.load(std::memory_order_relaxed);
+    float l = 0.0f, r = 0.0f, u = 0.0f, d = 0.0f;
+    if (!(nasal > 0.0f) || !vp_measured_tangents(&l, &r, &u, &d))
+        return cut;
+    const float half = fabsf(r);
+    /* Only the symmetric frustum native stereo is built on. */
+    if (!(half > 0.0f) || fabsf(fabsf(l) - half) > 0.01f * half)
+        return cut;
+    const float edge = atanf(nasal) + guard;
+    if (edge < 1.55f)
+        cut = tanf(edge) / half;
+    return cut;
+}
+
+/* The scissor-enabled copy of `rs` (null = the default state), AddRef'd, or
+   null when the engine scissors this state itself. Kept on the state, so it
+   goes when the state does. */
+ID3D11RasterizerState* scissor_clone(ID3D11DeviceContext* c, ID3D11RasterizerState* rs)
+{
+    static ID3D11RasterizerState* defClone = nullptr;   /* the default state's, kept */
+
+    if (rs != nullptr)
     {
-        g_cMeshNoView.fetch_add(1, std::memory_order_relaxed);
+        UINT size = sizeof(void*);
+        IUnknown* held = nullptr;
+        if (SUCCEEDED(rs->GetPrivateData(kScissorClone, &size, &held)) && held != nullptr)
+            return static_cast<ID3D11RasterizerState*>(held);   /* AddRef'd by the get */
+        BYTE own = 0;
+        size = 1;
+        if (SUCCEEDED(rs->GetPrivateData(kScissorOwn, &size, &own)) && own != 0)
+            return nullptr;
+    }
+    else if (defClone != nullptr)
+    {
+        defClone->AddRef();
+        return defClone;
+    }
+
+    D3D11_RASTERIZER_DESC desc = {};
+    if (rs != nullptr)
+    {
+        rs->GetDesc(&desc);
+
+        /* A D3D11.1 state with a forced sample count would lose it in a copy
+           made from the base description - left alone, like a scissored one. */
+        bool forced = false;
+        ID3D11RasterizerState1* rs1 = nullptr;
+        if (SUCCEEDED(rs->QueryInterface(__uuidof(ID3D11RasterizerState1),
+                                         reinterpret_cast<void**>(&rs1))) && rs1 != nullptr)
+        {
+            D3D11_RASTERIZER_DESC1 d1 = {};
+            rs1->GetDesc1(&d1);
+            forced = d1.ForcedSampleCount != 0;
+            rs1->Release();
+        }
+
+        if (desc.ScissorEnable || forced)
+        {
+            const BYTE own = 1;
+            rs->SetPrivateData(kScissorOwn, 1, &own);
+            return nullptr;
+        }
+    }
+    else
+    {
+        desc.FillMode = D3D11_FILL_SOLID;
+        desc.CullMode = D3D11_CULL_BACK;
+        desc.DepthClipEnable = TRUE;
+    }
+    desc.ScissorEnable = TRUE;
+
+    ID3D11Device* dev = nullptr;
+    c->GetDevice(&dev);
+    ID3D11RasterizerState* clone = nullptr;
+    const bool ok = dev != nullptr && SUCCEEDED(dev->CreateRasterizerState(&desc, &clone));
+    if (dev) dev->Release();
+    if (!ok || clone == nullptr)
+        return nullptr;
+
+    if (rs != nullptr)
+        rs->SetPrivateDataInterface(kScissorClone, clone);   /* rs holds one ref */
+    else
+    {
+        defClone = clone;
+        clone->AddRef();
+    }
+    return clone;
+}
+
+/* A viewport shaped like the eye is the camera's projection; shadow maps,
+   cube faces, lookup tables and atlases are not. TEST 425 and 427. */
+bool eye_viewport(ID3D11DeviceContext* c, D3D11_VIEWPORT& vp)
+{
+    vp = {};
+    UINT n = 1;
+    c->RSGetViewports(&n, &vp);
+    const float aspect = g_maskEyeAspect.load(std::memory_order_relaxed);
+    if (n == 0 || vp.Width < 256.0f || vp.Height < 64.0f || !(aspect > 0.0f) ||
+        fabsf(vp.Width / vp.Height - aspect) > 0.02f * aspect)
+        return false;
+    auto is = [&](uint32_t w, uint32_t h) {
+        return w != 0 && fabsf(vp.Width - w) <= 2.0f && fabsf(vp.Height - h) <= 2.0f;
+    };
+    return is(g_maskRenderW.load(std::memory_order_relaxed), g_maskRenderH.load(std::memory_order_relaxed)) ||
+           is(g_maskOutW.load(std::memory_order_relaxed), g_maskOutH.load(std::memory_order_relaxed));
+}
+
+/* Scissors the engine's eye before the original draw runs; stereo_bind moves
+   the rect to the other eye and stereo_end puts the engine's state back. */
+void mask_apply(ID3D11DeviceContext* c, StereoOp& op)
+{
+    const int side = g_drawnSide.load(std::memory_order_relaxed);
+    const float cut = mask_cut();
+    if (side == 0 || !(cut < 0.98f))
+        return;
+
+    D3D11_VIEWPORT vp;
+    if (!eye_viewport(c, vp))
+    {
+        g_cMaskShape.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    /* b = (-d, 0) * VP, in double: VP carries a ~1 km battle origin. */
-    double b[4];
-    for (int c = 0; c < 4; ++c)
-        b[c] = -(static_cast<double>(g_mainD[0]) * g_mainVpU[0 * 4 + c] +
-                 static_cast<double>(g_mainD[1]) * g_mainVpU[1 * 4 + c] +
-                 static_cast<double>(g_mainD[2]) * g_mainVpU[2 * 4 + c]);
-
-    g_meshPatched.resize(bytes);
-    memcpy(g_meshPatched.data(), data, bytes);
-
-    const uint32_t n = bytes / kMeshf1Stride;
-    uint64_t sane = 0;
-    for (uint32_t k = 0; k < n; ++k)
+    ID3D11RasterizerState* rs = nullptr;
+    c->RSGetState(&rs);
+    ID3D11RasterizerState* clone = scissor_clone(c, rs);
+    if (clone == nullptr)
     {
-        float* row = reinterpret_cast<float*>(g_meshPatched.data() + k * kMeshf1Stride +
-                                              kMeshPrevRow3);
-        /* An element past the ones the engine wrote this frame is whatever the
-           allocation held; shifting it is harmless and nothing reads it. */
-        if (isfinite(row[3]) && row[3] > 0.0f)
-            ++sane;
-        for (int c = 0; c < 4; ++c)
-            row[c] = static_cast<float>(row[c] + b[c]);
+        if (rs) rs->Release();
+        g_cMaskEngineScissor.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
 
-    g_meshPendingSrc = r;
-    g_meshPendingBytes = bytes;
-    g_cMeshElems.fetch_add(n, std::memory_order_relaxed);
-    g_cMeshSane.fetch_add(sane, std::memory_order_relaxed);
+    op.maskSaved = 0;
+    c->RSGetScissorRects(&op.maskSaved, nullptr);
+    if (op.maskSaved > D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+        op.maskSaved = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    if (op.maskSaved != 0)
+        c->RSGetScissorRects(&op.maskSaved, op.maskSavedRects);
+
+    const LONG x0 = static_cast<LONG>(vp.TopLeftX);
+    const LONG y0 = static_cast<LONG>(vp.TopLeftY);
+    const LONG w = static_cast<LONG>(vp.Width);
+    const LONG h = static_cast<LONG>(vp.Height);
+    const LONG keep = static_cast<LONG>(ceilf(vp.Width * (1.0f + cut) * 0.5f));
+    const D3D11_RECT leftEye  = { x0, y0, x0 + keep, y0 + h };       /* loses its right edge */
+    const D3D11_RECT rightEye = { x0 + w - keep, y0, x0 + w, y0 + h }; /* loses its left */
+    op.maskRect[0] = side > 0 ? leftEye : rightEye;
+    op.maskRect[1] = side > 0 ? rightEye : leftEye;
+
+    op.maskRs = rs;                     /* held until stereo_end */
+    c->RSSetState(clone);
+    clone->Release();                   /* the context and rs keep it alive */
+    c->RSSetScissorRects(1, &op.maskRect[0]);
+    op.masked = true;
+    g_cMasked.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
+void mask_restore(ID3D11DeviceContext* c, StereoOp& op)
 {
+    if (!op.masked)
+        return;
+    c->RSSetState(op.maskRs);
+    c->RSSetScissorRects(op.maskSaved, op.maskSaved != 0 ? op.maskSavedRects : nullptr);
+    if (op.maskRs) op.maskRs->Release();
+    op.maskRs = nullptr;
+    op.masked = false;
+}
+
+} // namespace
+
+void stereo_set_eye_fov(float nasalTan, float eyeAspect, uint32_t renderW, uint32_t renderH, uint32_t outW, uint32_t outH)
+{
+    g_maskRenderW.store(renderW, std::memory_order_relaxed);
+    g_maskRenderH.store(renderH, std::memory_order_relaxed);
+    g_maskOutW.store(outW, std::memory_order_relaxed);
+    g_maskOutH.store(outH, std::memory_order_relaxed);
+    g_maskNasalTan.store(nasalTan, std::memory_order_relaxed);
+    g_maskEyeAspect.store(eyeAspect, std::memory_order_relaxed);
+}
+
+
+static bool begin_op(ID3D11DeviceContext* c, StereoOp& op, bool compute)
+{
+    op.masked = false;
+    op.maskRs = nullptr;
     op.duplicate = false;
     op.compute = compute;
     op.nSwap = 0;
@@ -2428,7 +3229,8 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
     if (!g_active.load(std::memory_order_relaxed) || c == nullptr || ignored())
         return false;
 
-    const int64_t t0 = qpc_now();
+    /* Zero means this frame is not being timed - see kTimeEvery. */
+    const int64_t t0 = g_timeOps.load(std::memory_order_relaxed) ? qpc_now() : 0;
     g_cOps.fetch_add(1, std::memory_order_relaxed);
 
     static const int kDrawStages[5] = { 0, 1, 2, 3, 4 };
@@ -2460,6 +3262,7 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
             d.cb = (1u << 14) - 1;
             d.uav = 0xFFu;
             d.t[0] = d.t[1] = ~0ull;
+            d.shared[0] = d.shared[1] = 0;
         }
 
         if (st == 5)
@@ -2503,39 +3306,104 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
             }
         }
 
-        /* textures: the declared slots whose subresources differ between the eyes */
+        /* textures: the declared slots whose subresources differ between the eyes.
+         *
+         * FETCHED IN RUNS, NOT AS ONE RANGE.
+         *
+         * This used to ask for everything between the lowest and highest
+         * declared slot and then skip what it did not want. The shadow casters
+         * declare t0 alongside the terrain virtual texture's t44 and t47, so
+         * that was 48 views fetched for three - and every fetched view is an
+         * AddRef the loop then has to Release, per stage, per draw, for ~810
+         * cascade draws a frame.
+         *
+         * Runs are merged across gaps of up to kSrvGap because the opposite
+         * mistake is just as easy: one call per scattered slot pays more in
+         * call overhead than the refcounts it saves. Measured, not guessed -
+         * the 187 shaders with texture declarations in the 20260917_201428
+         * capture, costed as (views fetched) + ratio * (Get* calls), where
+         * ratio is what one locked Get* costs against one AddRef/Release:
+         *
+         *     ratio   gap=2    gap=4    gap=8    gap=12   gap=16
+         *       4    -42.5%   -45.4%   -43.1%   -40.3%   -32.3%
+         *      10     -6.3%   -18.6%   -23.0%   -23.3%   -21.0%
+         *      20    +32.1%   +10.0%    -1.5%    -5.3%    -9.0%
+         *
+         * Note gap=0 (split on every gap) is +69.6% - WORSE than fetching the
+         * whole range. 8 sits in the flat optimum for every plausible ratio and
+         * is the last value that is still a win if Get* turns out to be dear.
+         * The shadow-caster shape t0 + t44/t47 comes out as 5 views in two
+         * fetches instead of 48 in one. */
         if ((d.t[0] | d.t[1]) != 0)
         {
-            const int lo = d.t[0] ? lowest_bit(d.t[0]) : 64 + lowest_bit(d.t[1]);
-            const int hi = d.t[1] ? 64 + highest_bit(d.t[1]) : highest_bit(d.t[0]);
+            const bool cachedRuns = known && perf_shader_runs();
+            int runIndex = 0;
+            const int kSrvGap = 8;
+            const int last = d.t[1] ? 64 + highest_bit(d.t[1]) : highest_bit(d.t[0]);
+            int lo = d.t[0] ? lowest_bit(d.t[0]) : 64 + lowest_bit(d.t[1]);
+
+            /* Zeroed once per stage, as before - get_stage_srvs fills exactly
+               the slots it is asked for, so runs after the first reuse it. */
             ID3D11ShaderResourceView* v[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
-            get_stage_srvs(c, st, static_cast<UINT>(lo), static_cast<UINT>(hi - lo + 1), v);
-            for (int i = 0; i <= hi - lo; ++i)
+
+            while (cachedRuns ? runIndex < d.srvRuns.count : lo <= last)
             {
-                if (v[i] == nullptr)
-                    continue;
-                const int slot = lo + i;
-                ViewInfo vi;
-                if (slot_declared(d, slot) && view_info(v[i], 3, vi) &&
-                    (div_of(vi.res) & vi.mask) != 0)
+                if (!cachedRuns && !slot_declared(d, lo)) { ++lo; continue; }
+
+                /* Extend while the next declared slot is within kSrvGap of the
+                   run so far - the bound grows with hi, so a contiguous block
+                   is taken whole and only a real gap ends the run. */
+                int hi = lo;
+                if (cachedRuns)
                 {
-                    if (op.nSwap < kStereoSwapMax)
-                    {
-                        StereoSwap& s = op.swap[op.nSwap++];
-                        s.stage = static_cast<uint8_t>(st);
-                        s.isSrv = 1;
-                        s.slot = static_cast<uint8_t>(slot);
-                        s.orig = v[i];
-                        s.twin = nullptr;   /* made below, only if duplicating */
-                        if (why == 0)
-                            why = why_code(WHY_SRV, st, slot);
-                        vd = true;
-                        continue;
-                    }
-                    g_cSwapOverflow.fetch_add(1, std::memory_order_relaxed);
-                    refuse = true;
+                    const SrvRun& run = d.srvRuns.runs[runIndex++];
+                    lo = run.first;
+                    hi = run.last;
                 }
-                v[i]->Release();
+                else
+                {
+                    for (int look = lo + 1; look <= last && look <= hi + kSrvGap; ++look)
+                        if (slot_declared(d, look)) hi = look;
+                }
+
+                get_stage_srvs(c, st, static_cast<UINT>(lo), static_cast<UINT>(hi - lo + 1), v);
+                for (int i = 0; i <= hi - lo; ++i)
+                {
+                    if (v[i] == nullptr)
+                        continue;
+                    const int slot = lo + i;
+                    const bool shared = ((d.shared[slot >> 6] >> (slot & 63)) & 1ull) != 0 &&
+                                        vt_reads_shared();
+                    ViewInfo vi;
+                    if (slot_declared(d, slot) && view_info(v[i], 3, vi) &&
+                        (div_of(vi.res) & vi.mask) != 0)
+                    {
+                        if (shared)
+                        {
+                            g_cVtShared.fetch_add(1, std::memory_order_relaxed);
+                            v[i]->Release();
+                            continue;
+                        }
+                        if (op.nSwap < kStereoSwapMax)
+                        {
+                            StereoSwap& s = op.swap[op.nSwap++];
+                            s.stage = static_cast<uint8_t>(st);
+                            s.isSrv = 1;
+                            s.slot = static_cast<uint8_t>(slot);
+                            s.orig = v[i];
+                            s.twin = nullptr;   /* made below, only if duplicating */
+                            if (why == 0)
+                                why = why_code(WHY_SRV, st, slot);
+                            vd = true;
+                            continue;
+                        }
+                        g_cSwapOverflow.fetch_add(1, std::memory_order_relaxed);
+                        refuse = true;
+                    }
+                    v[i]->Release();
+                }
+
+                lo = hi + 1;
             }
         }
     }
@@ -2590,6 +3458,25 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
         }
     }
 
+    /* TEST 196: the GPU time of each pass, on a sampled frame (stereo_perf). */
+    {
+        ID3D11Resource* first = nullptr;
+        int count = 0;
+        for (int i = 0; i < kStereoOutSlots; ++i)
+        {
+            ID3D11Resource* r = compute ? uavInfo[i].res : rtvInfo[i].res;
+            if (r == nullptr)
+                continue;
+            if (first == nullptr)
+                first = r;
+            ++count;
+        }
+        if (first == nullptr && !compute && dsvInfo.res != nullptr)
+            stereo_perf_pass(c, dsvInfo.res, 1, 0);
+        else
+            stereo_perf_pass(c, first, compute ? 2 : 0, count);
+    }
+
     const bool dsvOut = op.dsv != nullptr && ds.write;
 
     /* A LIGHT-SPACE PASS IS SHARED, WHATEVER IT SAMPLES (TEST 182).
@@ -2628,7 +3515,7 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
         if (dsvOut && dsvInfo.res != nullptr)
             mark_shared_write(dsvInfo.res, dsvInfo.mask);
         release_all(op);
-        g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
+        if (t0) g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
         return false;
     }
 
@@ -2644,7 +3531,11 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
 
     /* What this operation writes, subresource by subresource. */
     struct Out { ID3D11Resource* r; uint64_t mask; };
-    Out outs[kStereoOutSlots * 2 + 1] = {};
+    /* Not zeroed: nOut bounds every read of this, and every entry below it is
+       fully assigned. (rtvInfo/uavInfo/dsvInfo above are a different case and
+       must stay zeroed - the branch not taken never fills its array, and the
+       loop that builds outs reads both.) */
+    Out outs[kStereoOutSlots * 2 + 1];
     int nOut = 0;
     for (int i = 0; i < kStereoOutSlots; ++i)
     {
@@ -2665,7 +3556,7 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
             mark_shared_write(outs[i].r, outs[i].mask);
         g_cRefused.fetch_add(1, std::memory_order_relaxed);
         release_all(op);
-        g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
+        if (t0) g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
         return false;
     }
 
@@ -2692,7 +3583,9 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
        those cascades in the second eye. Any subresource of a read view that is
        not in step is filled from the original first. */
     struct Read { ID3D11Resource* r; uint64_t mask; };
-    Read reads[kStereoSwapMax] = {};
+    /* Not zeroed - nRead bounds it. 96 entries is 1536 bytes of memset that
+       every duplicated op was paying for entries it never looked at. */
+    Read reads[kStereoSwapMax];
     int nRead = 0;
     for (int i = 0; i < op.nSwap; ++i)
     {
@@ -2768,7 +3661,7 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
             mark_shared_write(outs[i].r, outs[i].mask);
         g_cRefused.fetch_add(1, std::memory_order_relaxed);
         release_all(op);
-        g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
+        if (t0) g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
         return false;
     }
 
@@ -2776,8 +3669,36 @@ bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
         mark_div(outs[i].r, outs[i].mask);
 
     op.duplicate = true;
-    g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
+    if (!compute && mask_enabled())
+        mask_apply(c, op);
+    if (t0) g_tExamine.fetch_add(static_cast<uint64_t>(qpc_now() - t0), std::memory_order_relaxed);
     return true;
+}
+
+bool stereo_begin(ID3D11DeviceContext* c, StereoOp& op, bool compute)
+{
+    /* TEST 548: a probed water op is not issued at all - the caller checks
+       op.skip - and nothing is held, so there is no stereo_end to come. */
+    op.skip = water_probe_skip(c, compute);
+    if (op.skip)
+    {
+        op.duplicate = false;
+        return false;
+    }
+
+    const bool dup = begin_op(c, op, compute);
+
+    /* TEST 427: VRS on for a re-issued eye-shaped draw, off for every other
+       draw - our own work included, which reaches here as an ignored op. The
+       re-issue keeps it: one map serves both eyes. A dispatch has no pixel
+       shading to rate, so it leaves the state alone. */
+    if (!compute && c != nullptr)
+    {
+        D3D11_VIEWPORT vp;
+        const bool eye = dup && vrs_preset() > 0 && vrs_supported() != 0 && eye_viewport(c, vp);
+        vrs_draw(c, eye ? &vp : nullptr);
+    }
+    return dup;
 }
 
 void stereo_bind(ID3D11DeviceContext* c, StereoOp& op)
@@ -2785,7 +3706,7 @@ void stereo_bind(ID3D11DeviceContext* c, StereoOp& op)
     if (!op.duplicate)
         return;
 
-    op.t0 = qpc_now();
+    op.t0 = g_timeOps.load(std::memory_order_relaxed) ? qpc_now() : 0;
     t_inDup = true;
 
     if (op.compute)
@@ -2798,16 +3719,11 @@ void stereo_bind(ID3D11DeviceContext* c, StereoOp& op)
     else
     {
         c->OMSetRenderTargets(kStereoOutSlots, op.trtv, op.tdsv);
+        if (op.masked)
+            c->RSSetScissorRects(1, &op.maskRect[1]);
     }
 
-    for (int i = 0; i < op.nSwap; ++i)
-    {
-        const StereoSwap& s = op.swap[i];
-        if (s.isSrv)
-            set_stage_srv(c, s.stage, s.slot, static_cast<ID3D11ShaderResourceView*>(s.twin));
-        else
-            set_stage_cb(c, s.stage, s.slot, static_cast<ID3D11Buffer*>(s.twin));
-    }
+    apply_swaps(c, op, true);
 
     g_cDup.fetch_add(1, std::memory_order_relaxed);
 }
@@ -2826,22 +3742,34 @@ void stereo_end(ID3D11DeviceContext* c, StereoOp& op)
         else
         {
             c->OMSetRenderTargets(kStereoOutSlots, op.rtv, op.dsv);
+            mask_restore(c, op);
         }
 
-        for (int i = 0; i < op.nSwap; ++i)
-        {
-            const StereoSwap& s = op.swap[i];
-            if (s.isSrv)
-                set_stage_srv(c, s.stage, s.slot, static_cast<ID3D11ShaderResourceView*>(s.orig));
-            else
-                set_stage_cb(c, s.stage, s.slot, static_cast<ID3D11Buffer*>(s.orig));
-        }
+        apply_swaps(c, op, false);
         t_inDup = false;
-        g_tDup.fetch_add(static_cast<uint64_t>(qpc_now() - op.t0), std::memory_order_relaxed);
+        if (op.t0) g_tDup.fetch_add(static_cast<uint64_t>(qpc_now() - op.t0), std::memory_order_relaxed);
     }
 
     release_all(op);
     op.duplicate = false;
+}
+
+/* INDIRECT OPERATIONS ARE RE-ISSUED TOO (TEST 340). The campaign map's ground
+   is the engine's adaptive terrain: compute passes cull it into a patch list
+   and write the draw arguments, and DrawIndexedInstancedIndirect draws it with
+   g_view_proj. Only the direct draws were re-issued, so eye 1 had no ground at
+   all - forests, towns and the sea plane over nothing. The arguments come from
+   the buffer the eye's own pass wrote, when that buffer is per-eye. */
+ID3D11Buffer* stereo_eye1_args(ID3D11Buffer* b)
+{
+    g_cIndirect.fetch_add(1, std::memory_order_relaxed);
+    if (b == nullptr || (div_of(b) & 1ull) == 0)
+        return b;
+    ID3D11Resource* t = twin_lookup(b);      /* AddRef'd */
+    if (t == nullptr)
+        return b;
+    t->Release();       /* the original holds its twin for as long as it lives */
+    return static_cast<ID3D11Buffer*>(t);
 }
 
 // --- the operations that write without drawing ------------------------------
@@ -3288,6 +4216,14 @@ void stereo_frame_boundary()
 {
     ++g_frame;
 
+    /* Which frames pay for the per-op timers - see kTimeEvery. */
+    static const bool opsTiming = perf_legacy() || config_bool("stereo_perf", true);
+    const bool timing = opsTiming && g_active.load(std::memory_order_relaxed) &&
+                        (g_frame % kTimeEvery) == 0;
+    g_timeOps.store(timing, std::memory_order_relaxed);
+    if (timing)
+        g_timedFrames.fetch_add(1, std::memory_order_relaxed);
+
     static uint64_t frames = 0;
     ++frames;
 
@@ -3302,6 +4238,7 @@ void stereo_frame_boundary()
     static uint64_t lastMs = 0;
     static uint64_t lastCensusMs = 0;
     static uint64_t captureAtMs = 0;
+    static bool     captureDone = false;   /* survives deactivation on purpose */
     const uint64_t now = GetTickCount64();
 
     /* Switched on: the first report covers this session, not everything since the
@@ -3320,31 +4257,50 @@ void stereo_frame_boundary()
         g_offsetCosSum = 0.0;
         g_offsetCosMin = 1.0;
         g_offsetCosN = 0;
+        g_ipdMidFrames = 0;
+        g_ipdMidMaxUm = 0.0;
+        g_ipdRawMin = g_ipdRawMax = 0.0f;
+        g_ipdRetunes = 0;
         for (auto* a : { &g_cOps, &g_cTainted, &g_cDup, &g_cCbUpload, &g_cCbCamera, &g_cCbLight,
                          &g_cRefused, &g_cSync, &g_cUnknownDecl, &g_cSwapOverflow, &g_cCpuMirror,
                          &g_tExamine, &g_tDup, &g_cReadback, &g_cCbMain1760, &g_cCbMain128,
                          &g_cCbMain224, &g_cCbFar, &g_cOffsetFallback, &g_cLightShared,
-                         &g_cReadSync, &g_syncBytes ,
-                         &g_cMeshWrites, &g_cMeshElems, &g_cMeshApplied, &g_cMeshNoView,
-                         &g_cMeshSane })
+                         &g_cReadSync, &g_cVtShared, &g_syncBytes, &g_timedFrames,
+                         &g_cMeshApplied, &g_cMeshElems, &g_cMeshNoView, &g_cMeshRefused,
+                         &g_cIndirect, &g_cCbMainRel })
             a->store(0, std::memory_order_relaxed);
         captureAtMs = 0;
-        const float after = config_float("stereo_capture_after", 15.0f);
-        if (after > 0.0f)
+        const float after = config_float("stereo_capture_after", perf_legacy() ? 15.0f : 0.0f);
+        BVR_INFO("Performance paths: legacy=%d, cached shader ranges=%d, lazy sharpen input=%d, "
+                 "detailed diagnostics=%d, stereo auto-capture=%.1f s. Restart after config edits.",
+                 perf_legacy(), perf_shader_runs(), perf_lazy_sharpen(), perf_diagnostics(), after);
+        if (after > 0.0f && !captureDone)
             captureAtMs = now + static_cast<uint64_t>(after * 1000.0f);
         return;
     }
 
-    /* One frame map of THIS mode per activation, so the next replay has native
-       stereo's own frame to work on rather than whichever mode ran 20 s into the
-       mission (TEST 181's capture caught AFR). stereo_capture_after = 0 skips it. */
+    /* ONE frame map per PROCESS, not per activation.
+     *
+     * The point of it is to give the next replay native stereo's own frame to
+     * work on rather than whichever mode ran 20 s into the mission (TEST 181's
+     * capture caught AFR). One capture does that.
+     *
+     * Per activation was costing far more than one. g_active drops on every
+     * scene teardown, so re-entering a mission re-armed this: the 2026-09-17
+     * run fired at 20:08:11, 20:08:42 and 20:14:28 in six minutes, and a
+     * capture is a stall of a few frames each time.
+     *
+     * Nothing is lost - a second capture on demand is what the trigger file
+     * Logs\BannerlordVR.FrameMap.trigger is for. stereo_capture_after = 0
+     * skips the automatic one entirely. */
     if (captureAtMs != 0 && now >= captureAtMs)
     {
         captureAtMs = 0;
+        captureDone = true;
         frame_map_request_capture("native stereo has been running for a while");
     }
 
-    if (now - lastCensusMs >= 10000)
+    if (perf_diagnostics() && now - lastCensusMs >= 10000)
     {
         lastCensusMs = now;
         census_report();
@@ -3371,14 +4327,19 @@ void stereo_frame_boundary()
     const uint64_t readbacks = g_cReadback.exchange(0, std::memory_order_relaxed);
     const uint64_t tEx = g_tExamine.exchange(0, std::memory_order_relaxed);
     const uint64_t tDup = g_tDup.exchange(0, std::memory_order_relaxed);
+    /* tEx and tDup only accumulate on timed frames, so they divide by those. */
+    const uint64_t tFrames = g_timedFrames.exchange(0, std::memory_order_relaxed);
+    const double tDiv = static_cast<double>(tFrames ? tFrames : 1);
     const uint64_t twinBytes = g_twinBytes.load(std::memory_order_relaxed);
     const uint64_t main1760 = g_cCbMain1760.exchange(0, std::memory_order_relaxed);
     const uint64_t main128 = g_cCbMain128.exchange(0, std::memory_order_relaxed);
     const uint64_t main224 = g_cCbMain224.exchange(0, std::memory_order_relaxed);
     const uint64_t farCams = g_cCbFar.exchange(0, std::memory_order_relaxed);
+    const uint64_t mainRel = g_cCbMainRel.exchange(0, std::memory_order_relaxed);
     const uint64_t offsetFallback = g_cOffsetFallback.exchange(0, std::memory_order_relaxed);
     const uint64_t lightShared = g_cLightShared.exchange(0, std::memory_order_relaxed);
     const uint64_t readSyncs = g_cReadSync.exchange(0, std::memory_order_relaxed);
+    const uint64_t vtShared = g_cVtShared.exchange(0, std::memory_order_relaxed);
     const uint64_t syncBytes = g_syncBytes.exchange(0, std::memory_order_relaxed);
     const double cosMean = g_offsetCosN ? g_offsetCosSum / static_cast<double>(g_offsetCosN) : 0.0;
     const double cosMin = g_offsetCosN ? g_offsetCosMin : 0.0;
@@ -3391,23 +4352,47 @@ void stereo_frame_boundary()
        cameras where there should be none, says the gate is wrong. */
     BVR_INFO("Stereo main view: per-frame buffer %llu (%.1f a frame), per-pass %llu, compute "
              "%llu; %llu light view(s) at the player; %llu camera(s) beyond %.1f m of the head "
-             "left alone; eye offset along the frame's right axis, |cos| to the published "
+             "left alone; %llu of the per-frame buffers camera-relative (TEST 340b); eye "
+             "offset along the frame's "
+             "right axis, |cos| to the published "
              "eyes mean %.4f / min %.4f (%llu from the published delta instead); %llu "
-             "light-space op(s) kept shared; %llu read view(s) brought into step; %.1f MB a "
+             "light-space op(s) kept shared; %llu per-eye virtual-texture read(s) given the "
+             "original (stereo_vt_shared); %llu read view(s) brought into step; %.1f MB a "
              "frame copied into twins.",
              static_cast<unsigned long long>(main1760),
              static_cast<double>(main1760) / static_cast<double>(nFrames),
              static_cast<unsigned long long>(main128),
              static_cast<unsigned long long>(main224),
              static_cast<unsigned long long>(cbLight),
-             static_cast<unsigned long long>(farCams), near_head_m(), cosMean, cosMin,
+             static_cast<unsigned long long>(farCams), near_head_m(),
+             static_cast<unsigned long long>(mainRel),
+             cosMean, cosMin,
              static_cast<unsigned long long>(offsetFallback),
              static_cast<unsigned long long>(lightShared),
+             static_cast<unsigned long long>(vtShared),
              static_cast<unsigned long long>(readSyncs),
              static_cast<double>(syncBytes) / (1024.0 * 1024.0) / static_cast<double>(nFrames));
 
+    /* TEST 194: a count of frames near zero means nothing was moving eye 1 between
+       passes; hundreds, with stereo_hold_ipd = 0, is the black hair flicker. */
+    BVR_INFO("Stereo eye offset: IPD %s %.3f mm (published %.3f - %.3f mm, %llu retune(s)); "
+             "in %llu of %llu frame(s) the published IPD changed between two camera uploads "
+             "of the same frame, by up to %.0f um - unheld, each of those drew eye 1's "
+             "depth-EQUAL passes (hair) with another offset than its depth, leaving black "
+             "pixels.",
+             hold_ipd_enabled() ? "held at" : "NOT held (stereo_hold_ipd = 0), last held value",
+             g_ipdHeld * 1000.0, g_ipdRawMin * 1000.0, g_ipdRawMax * 1000.0,
+             static_cast<unsigned long long>(g_ipdRetunes),
+             static_cast<unsigned long long>(g_ipdMidFrames),
+             static_cast<unsigned long long>(nFrames), g_ipdMidMaxUm);
+    g_ipdMidFrames = 0;
+    g_ipdMidMaxUm = 0.0;
+    g_ipdRawMin = g_ipdRawMax = 0.0f;
+    g_ipdRetunes = 0;
+
     BVR_INFO("Stereo: %llu op(s) examined, %llu view-dependent (%.0f%%), %llu re-issued "
-             "for the second eye, %llu refused; %llu of %llu camera upload(s) were the "
+             "for the second eye (%llu of them indirect, TEST 340), %llu refused; %llu of "
+             "%llu camera upload(s) were the "
              "main view, %llu a light view carrying our position (left shared); %llu "
              "twin re-sync(s); %llu twin surface(s) ever made, ~%llu MB at their real "
              "formats; %llu twin creation(s) failed; %llu readback(s) of a per-eye "
@@ -3416,6 +4401,7 @@ void stereo_frame_boundary()
              static_cast<unsigned long long>(tainted),
              ops ? 100.0 * static_cast<double>(tainted) / static_cast<double>(ops) : 0.0,
              static_cast<unsigned long long>(dup),
+             static_cast<unsigned long long>(g_cIndirect.exchange(0, std::memory_order_relaxed)),
              static_cast<unsigned long long>(refused),
              static_cast<unsigned long long>(cbCam),
              static_cast<unsigned long long>(cbUp),
@@ -3431,8 +4417,8 @@ void stereo_frame_boundary()
              "cross-check %llu agree / %llu differ; %llu op(s) bound a shader with none "
              "(every bound slot counted); %llu swap overflow(s); %llu CPU write(s) "
              "mirrored; constant-buffer table full %llu time(s).",
-             qpc_ms(tEx) / static_cast<double>(nFrames),
-             qpc_ms(tDup) / static_cast<double>(nFrames),
+             qpc_ms(tEx) / tDiv,
+             qpc_ms(tDup) / tDiv,
              static_cast<unsigned long long>(nFrames),
              static_cast<unsigned long long>(g_declParsed.load(std::memory_order_relaxed)),
              static_cast<unsigned long long>(g_declFailed.load(std::memory_order_relaxed)),
@@ -3443,24 +4429,46 @@ void stereo_frame_boundary()
              static_cast<unsigned long long>(mirror),
              static_cast<unsigned long long>(g_cCbFull.load(std::memory_order_relaxed)));
 
-    /* TEST 183: healthy is one write and one twin copy a frame, "no main view"
-       at zero, and a stable in-front share (the engine's live meshes; the rest
-       of the 8192 slots are whatever the allocation held). */
+    /* TEST 425: healthy is the scene's draws scissored and a cut near 0.74
+       (47.4 deg + 10 guard of a 64.7 deg half-frustum). */
+    if (mask_enabled())
     {
-        const uint64_t writes = g_cMeshWrites.exchange(0, std::memory_order_relaxed);
-        const uint64_t elems = g_cMeshElems.exchange(0, std::memory_order_relaxed);
+        const uint64_t masked = g_cMasked.exchange(0, std::memory_order_relaxed);
+        const uint64_t own = g_cMaskEngineScissor.exchange(0, std::memory_order_relaxed);
+        const uint64_t shape = g_cMaskShape.exchange(0, std::memory_order_relaxed);
+        const float cut = mask_cut();
+        BVR_INFO("Stereo FOV mask (TEST 425): %.1f draws a frame scissored to the eye's own "
+                 "field of view; %.1f left alone (the engine scissors them itself), %.1f not "
+                 "shaped like the eye. Drawn: %s eye. Each eye keeps %.1f%% of its width "
+                 "(cut at NDC %.3f; >= 1 means nothing is cut).",
+                 static_cast<double>(masked) / static_cast<double>(nFrames),
+                 static_cast<double>(own) / static_cast<double>(nFrames),
+                 static_cast<double>(shape) / static_cast<double>(nFrames),
+                 g_drawnSide.load() > 0 ? "the engine draws the LEFT" :
+                 g_drawnSide.load() < 0 ? "the engine draws the RIGHT" : "not known which",
+                 cut < 1.0f ? 50.0 * (1.0 + cut) : 100.0, cut);
+    }
+
+    /* TEST 427/428: healthy is most of the scene's draws (the TEST 425 line's
+       count) shaded at a variable rate, and with an eye tracker nearly all of
+       them around the gaze. 0 draws with a preset on = no eye-shaped re-issue,
+       or the GPU said no (the "NVIDIA VRS" line at the first draw). */
+    vrs_report(nFrames);
+
+    /* TEST 188: healthy is one corrected copy a frame and nothing skipped or
+       refused. */
+    {
         const uint64_t applied = g_cMeshApplied.exchange(0, std::memory_order_relaxed);
+        const uint64_t elems = g_cMeshElems.exchange(0, std::memory_order_relaxed);
         const uint64_t noView = g_cMeshNoView.exchange(0, std::memory_order_relaxed);
-        const uint64_t sane = g_cMeshSane.exchange(0, std::memory_order_relaxed);
-        BVR_INFO("Stereo motion vectors: %.2f per-mesh previous-transform buffer write(s) a "
-                 "frame corrected for eye 1, %.2f a frame reached its shader copy; %llu "
-                 "skipped before any main view; %.0f of %.0f element(s) a write in front of "
-                 "the previous camera.%s",
-                 static_cast<double>(writes - noView) / static_cast<double>(nFrames),
+        const uint64_t meshRefused = g_cMeshRefused.exchange(0, std::memory_order_relaxed);
+        BVR_INFO("Stereo motion vectors: %.2f per-mesh previous-transform copies a frame "
+                 "corrected for eye 1 on the GPU (%.0f element(s) each); %llu skipped before "
+                 "any main view, %llu refused.%s",
                  static_cast<double>(applied) / static_cast<double>(nFrames),
+                 applied ? static_cast<double>(elems) / static_cast<double>(applied) : 0.0,
                  static_cast<unsigned long long>(noView),
-                 writes > noView ? static_cast<double>(sane) / static_cast<double>(writes - noView) : 0.0,
-                 writes > noView ? static_cast<double>(elems) / static_cast<double>(writes - noView) : 0.0,
+                 static_cast<unsigned long long>(meshRefused),
                  mesh_prev_enabled() ? "" : " (stereo_prev_transform = 0: off)");
 
         /* TEST 185: with DLSS on, copies ~1 a frame and nearly all maps fresh;
@@ -3476,8 +4484,18 @@ void stereo_frame_boundary()
                      static_cast<unsigned long long>(rbWaited));
     }
 
-    stereo_perf_report(qpc_ms(tEx) / static_cast<double>(nFrames),
-                       qpc_ms(tDup) / static_cast<double>(nFrames), nFrames, twinBytes);
+    /* TEST 420: tDiv, not nFrames - the timing only accumulates on sampled
+       frames, so dividing by every frame under-read "deciding" ~23x. */
+    stereo_perf_report(qpc_ms(tEx) / tDiv, qpc_ms(tDup) / tDiv, nFrames, twinBytes);
+}
+
+/* TEST 793. */
+bool stereo_render_jitter(float* ndcX, float* ndcY)
+{
+    if (!g_renderJitterValid.load(std::memory_order_relaxed)) return false;
+    *ndcX = g_renderJitterX.load(std::memory_order_relaxed);
+    *ndcY = g_renderJitterY.load(std::memory_order_relaxed);
+    return true;
 }
 
 } // namespace bvr

@@ -17,18 +17,22 @@
 #include "bvr_api.h"
 
 #include <cstring>
+#include <string>
 
 #ifdef BVR_ENABLE_OPENXR
+#  include "bvr_config.h"
 #  include "bvr_log.h"
 #  include "bvr_crash.h"
-#  include "afw_warp.h"
+#  include "depth_reproject.h"
 #  include "d3d_hooks.h"
 #  include "late_latch.h"
+#  include "ngx_hook.h"
 #  include "stereo_dup.h"
 #  include "vp_patch.h"
 #  include "vr_overlay.h"
 #  include "xr_context.h"
 #  include "xr_input.h"
+#  include "ui_supersample.h"
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -47,14 +51,146 @@ static_assert(sizeof(BvrInputState) == 184, "BvrInputState layout drifted");
 namespace {
 
 #ifdef BVR_ENABLE_OPENXR
-const char kVersion[] = "0.2.0-openxr";
+const char kVersion[] = "0.2.7-openxr";
 #else
-const char kVersion[] = "0.2.0-stub";
+const char kVersion[] = "0.2.7-stub";
 #endif
 
 bool g_initialized = false;
 
 #ifdef BVR_ENABLE_OPENXR
+/* Cheeky Foveated DLSS without its dxgi.dll proxy (cheeky_foveated = 1). The
+   proxy fail-fasts in the launcher: AcGenral's DXGI compat shim calls
+   SetAppCompatStringPointer on whatever module is named dxgi.dll, and the
+   proxy's System32 LoadLibraryExW inside that callback returns
+   STATUS_DLL_NOT_FOUND. All the proxy does on success is load the host and
+   call CheekyHost_Start(1), so do that here. Host stays in
+   <game bin>\CheekyFoveatedDLSS\; no dxgi.dll or version.dll in the game folder.
+
+   The user installs only that folder (Cheeky is GPLv3 and not redistributed
+   with the mod). Everything else is set here, every launch. */
+const char kCheekyTested[] = "0.5.5";
+
+/* "Cheeky 0.5.5 %s initializing" is in the runtime DLL; it carries no version
+   resource. Empty when the file is unreadable or the string moved. */
+std::string cheeky_version(const wchar_t* runtimePath)
+{
+    std::string version;
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, runtimePath, L"rb") != 0 || f == nullptr)
+        return version;
+    std::string bytes;
+    char buf[65536];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0)
+        bytes.append(buf, got);
+    fclose(f);
+
+    const std::string tag = "Cheeky ";
+    for (size_t at = bytes.find(tag); at != std::string::npos; at = bytes.find(tag, at + 1))
+    {
+        size_t end = at + tag.size();
+        while (end < bytes.size() && (isdigit(static_cast<unsigned char>(bytes[end])) || bytes[end] == '.'))
+            ++end;
+        if (end > at + tag.size() && bytes.compare(end, 4, " %s ") == 0)
+            return bytes.substr(at + tag.size(), end - at - tag.size());
+    }
+    return version;
+}
+
+/* cheeky_foveated: below zero (default) starts Cheeky when its folder is in the
+   game's bin - copying the folder in is the opt-in - 0 never, 1 always (and say
+   so if the folder is missing). */
+void start_cheeky_host()
+{
+    const float choice = bvr::config_float("cheeky_foveated", -1.0f);
+    if (choice > -0.5f && choice < 0.5f)
+        return;
+    const bool forced = choice >= 0.5f;
+
+    wchar_t dir[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, dir, MAX_PATH);
+    wchar_t* slash = (n > 0 && n < MAX_PATH) ? wcsrchr(dir, L'\\') : nullptr;
+    if (slash == nullptr)
+    {
+        BVR_WARN("Cheeky: could not find the game folder.");
+        return;
+    }
+    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - dir), L"CheekyFoveatedDLSS\\");
+    wchar_t path[MAX_PATH], runtime[MAX_PATH], ini[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%sCheekyFoveatedDLSSHost.dll", dir);
+    _snwprintf_s(runtime, _TRUNCATE, L"%sCheekyFoveatedDLSSRuntime.dll", dir);
+    _snwprintf_s(ini, _TRUNCATE, L"%sCheekyFoveatedDLSS.ini", dir);
+
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
+    {
+        if (forced)
+            BVR_WARN("Cheeky: cheeky_foveated = 1 but %ls is missing. Copy Cheeky's "
+                     "CheekyFoveatedDLSS folder (only that folder) next to the game exe.", path);
+        return;
+    }
+
+    /* Tested only with native stereo: AFR hands it one eye per frame through one
+       feature. The mode can change in the VR menu later; Cheeky cannot be
+       unloaded, so this is decided at launch. */
+    if (!bvr::config_is("stereo_mode", "nativestereo"))
+    {
+        BVR_WARN("Cheeky: found but not started - it is supported with stereo_mode = "
+                 "nativestereo only.");
+        return;
+    }
+
+    const std::string version = cheeky_version(runtime);
+    if (version != kCheekyTested && !bvr::config_bool("cheeky_allow_untested", false))
+    {
+        BVR_WARN("Cheeky: version '%s' found, %s is the tested one - not started "
+                 "(cheeky_allow_untested = 1 starts it anyway).",
+                 version.empty() ? "unknown" : version.c_str(), kCheekyTested);
+        return;
+    }
+
+    /* Cheeky rewrites its ini and once saved the periphery DLAA and the DX11
+       transport off by itself: raw jittered periphery, flicker. The marker eye
+       calibration drifts with late latch (window jumps, history resets, 3D
+       breaks on every feature re-create); call order is always eye 0 then 1.
+       A partial ini is accepted - Cheeky fills in the rest and keeps these. */
+    static const wchar_t* const kForced[][2] = {
+        { L"PeripheralDlaa",      L"1" },
+        { L"D3D11D3D12Transport", L"1" },
+        { L"AutoStereoAlignment", L"0" },
+        { L"ManualStereoMapping", L"1" },
+    };
+    bool written = true;
+    for (const auto& kv : kForced)
+        written &= WritePrivateProfileStringW(L"CheekyFoveatedDLSS", kv[0], kv[1], ini) != FALSE;
+    if (!written)
+        BVR_WARN("Cheeky: could not write %ls (Win32 %lu); its own settings are used.", ini, GetLastError());
+
+    HMODULE host = LoadLibraryExW(path, nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (host == nullptr)
+    {
+        BVR_WARN("Cheeky: %ls did not load (Win32 %lu).", path, GetLastError());
+        return;
+    }
+
+    typedef bool(__cdecl* PFN_CheekyStart)(unsigned mode);
+    auto start = reinterpret_cast<PFN_CheekyStart>(GetProcAddress(host, "CheekyHost_Start"));
+    if (start == nullptr)
+    {
+        BVR_WARN("Cheeky: host has no CheekyHost_Start export.");
+        return;
+    }
+    const bool started = start(1);
+    if (started)
+        ngx_set_cheeky_running();
+    BVR_INFO("Cheeky %s: CheekyHost_Start(1) = %d (%s); forced PeripheralDlaa=1 D3D11D3D12Transport=1 "
+             "AutoStereoAlignment=0 ManualStereoMapping=1%s. Its own logs are in CheekyFoveatedDLSS\\. "
+             "cheeky_foveated = 0 keeps it off.",
+             version.empty() ? "(version unknown)" : version.c_str(), started ? 1 : 0,
+             forced ? "cheeky_foveated = 1" : "its folder is in bin", written ? "" : " (NOT written)");
+}
+
 /* Render thread. Installed as the Present hook's per-frame callback. */
 void present_tick(IDXGISwapChain* swapChain,
                   ID3D11Device* device,
@@ -118,6 +254,8 @@ int32_t BVR_CALL bvr_init(void)
         BVR_WARN("No usable OpenXR system (status %d); leaving the render path untouched.", rc);
         return rc;
     }
+
+    start_cheeky_host();
 
     if (!bvr::install_present_hook(&present_tick))
     {
@@ -226,6 +364,73 @@ int32_t BVR_CALL bvr_end_texture_capture(int32_t eye)
 #endif
 }
 
+int32_t BVR_CALL bvr_begin_ui_capture(uint32_t width, uint32_t height)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::arm_ui_capture(width, height) ? BVR_OK : BVR_NOT_INITIALIZED;
+#else
+    (void)width; (void)height;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_end_ui_capture(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::finish_ui_capture();
+#else
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_ui_source(int32_t fromTarget)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_ui_source(fromTarget);
+#else
+    (void)fromTarget;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_begin_hand_capture(uint32_t width, uint32_t height)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::arm_hand_capture(width, height) ? BVR_OK : BVR_NOT_INITIALIZED;
+#else
+    (void)width; (void)height;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_end_hand_capture(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::finish_hand_capture();
+#else
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_hand_source(int32_t live)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_hand_source(live);
+#else
+    (void)live;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_get_hand_source_state(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_hand_source_state();
+#else
+    return 0;
+#endif
+}
+
 int32_t BVR_CALL bvr_set_used_views(const BvrEyeView* views, int64_t displayTime)
 {
 #ifdef BVR_ENABLE_OPENXR
@@ -322,6 +527,16 @@ int32_t BVR_CALL bvr_repin_flat_screen(void)
 #endif
 }
 
+int32_t BVR_CALL bvr_repin_flat_screen_if_turned(float degrees)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_repin_flat_screen_if_turned(degrees);
+#else
+    (void)degrees;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
 int32_t BVR_CALL bvr_set_screen_geometry(float width, float distance)
 {
 #ifdef BVR_ENABLE_OPENXR
@@ -352,6 +567,128 @@ int32_t BVR_CALL bvr_set_in_mission(int32_t active)
 #endif
 }
 
+int32_t BVR_CALL bvr_set_ui_projection(int32_t eye, float px, float py, float pz,
+                                       float qx, float qy, float qz, float qw)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_ui_projection(eye, px, py, pz, qx, qy, qz, qw);
+#else
+    (void)eye; (void)px; (void)py; (void)pz; (void)qx; (void)qy; (void)qz; (void)qw;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_wrist_regions(const BvrWristRegions* regions)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_wrist_regions(regions);
+#else
+    (void)regions;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_ui_supersample(float factor)
+{
+#ifdef BVR_ENABLE_OPENXR
+    bvr::ui_ss_set_factor(factor);
+    return BVR_OK;
+#else
+    (void)factor;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_get_ui_supersample(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::ui_ss_state();
+#else
+    return 0;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_ui_split(const BvrUiSplit* split)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_ui_split(split);
+#else
+    (void)split;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_wrist_pose(int32_t hand, int32_t valid, float px, float py, float pz,
+                                    float qx, float qy, float qz, float qw)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_wrist_pose(hand, valid, px, py, pz, qx, qy, qz, qw);
+#else
+    (void)hand; (void)valid; (void)px; (void)py; (void)pz; (void)qx; (void)qy; (void)qz; (void)qw;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_laser(int32_t enabled, int32_t hand, int32_t beamToUi, int32_t click,
+                                float groundDistance)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_laser(enabled, hand, beamToUi, click, groundDistance);
+#else
+    (void)enabled; (void)hand; (void)beamToUi; (void)click; (void)groundDistance;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_get_laser(BvrLaser* out)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_get_laser(out);
+#else
+    (void)out;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_get_laser_ray(int32_t hand, BvrVec3* origin, BvrVec3* dir)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_get_laser_ray(hand, origin, dir);
+#else
+    (void)hand; (void)origin; (void)dir;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_ui_pin(int32_t pinned)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_ui_pin(pinned);
+#else
+    (void)pinned;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+float BVR_CALL bvr_get_periods_per_frame(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_get_periods_per_frame();
+#else
+    return 1.0f;
+#endif
+}
+
+int32_t BVR_CALL bvr_set_ui_eye_lag(int32_t lag)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_set_ui_eye_lag(lag);
+#else
+    (void)lag;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
 int32_t BVR_CALL bvr_set_ui_overlay(int32_t active)
 {
 #ifdef BVR_ENABLE_OPENXR
@@ -372,22 +709,61 @@ int32_t BVR_CALL bvr_set_mission_active(int32_t active)
 #endif
 }
 
+/* --- the live resolution rescale ----------------------------------------- */
+
+int32_t BVR_CALL bvr_request_rescale(float scale)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_request_rescale(scale);
+#else
+    (void)scale;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_rescale_swap(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_rescale_swap();
+#else
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_rescale_abort(float previousScale)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_rescale_abort(previousScale);
+#else
+    (void)previousScale;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_rescale_stage(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_rescale_stage();
+#else
+    return 0;
+#endif
+}
+
+int32_t BVR_CALL bvr_rescale_finish(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::xr_rescale_finish();
+#else
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
 int32_t BVR_CALL bvr_set_sim_generation(int32_t generation)
 {
 #ifdef BVR_ENABLE_OPENXR
     return bvr::xr_set_sim_generation(generation);
 #else
     (void)generation;
-    return BVR_SESSION_NOT_READY;
-#endif
-}
-
-int32_t BVR_CALL bvr_set_full_afr(int32_t active)
-{
-#ifdef BVR_ENABLE_OPENXR
-    return bvr::xr_set_full_afr(active);
-#else
-    (void)active;
     return BVR_SESSION_NOT_READY;
 #endif
 }
@@ -403,6 +779,17 @@ int32_t BVR_CALL bvr_set_draw_stereo(int32_t active)
 #endif
 }
 
+int32_t BVR_CALL bvr_set_stereo_world_scale(float unitsPerMetre)
+{
+#ifdef BVR_ENABLE_OPENXR
+    bvr::stereo_set_world_scale(unitsPerMetre);
+    return BVR_OK;
+#else
+    (void)unitsPerMetre;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
 int32_t BVR_CALL bvr_set_native_stereo(int32_t active)
 {
 #ifdef BVR_ENABLE_OPENXR
@@ -414,21 +801,21 @@ int32_t BVR_CALL bvr_set_native_stereo(int32_t active)
 #endif
 }
 
-int32_t BVR_CALL bvr_set_afw(int32_t mode, float focalPx, float baseline,
+int32_t BVR_CALL bvr_set_depth_reproject(int32_t mode, float focalPx, float baseline,
                              float zNear, float zFar)
 {
 #ifdef BVR_ENABLE_OPENXR
-    return bvr::xr_set_afw(mode, focalPx, baseline, zNear, zFar);
+    return bvr::xr_set_depth_reproject(mode, focalPx, baseline, zNear, zFar);
 #else
     (void)mode; (void)focalPx; (void)baseline; (void)zNear; (void)zFar;
     return BVR_SESSION_NOT_READY;
 #endif
 }
 
-int32_t BVR_CALL bvr_afw_ready(void)
+int32_t BVR_CALL bvr_depth_reproject_ready(void)
 {
 #ifdef BVR_ENABLE_OPENXR
-    return bvr::afw_ready() ? 1 : 0;
+    return bvr::dr_ready() ? 1 : 0;
 #else
     return 0;
 #endif
@@ -455,11 +842,32 @@ int32_t BVR_CALL bvr_overlay_visible(void)
 
 /* The overlay struct crosses a P/Invoke boundary, where a layout mismatch does
    not fail to compile - it reads the stack wrong and hands the game a world
-   scale built out of whatever was in the next register. Ten four-byte fields,
-   no padding anywhere, so both sides can agree on one number. The managed test
-   suite asserts the same 40 against Marshal.SizeOf. */
-static_assert(sizeof(BvrOverlayState) == 104,
+   scale built out of whatever was in the next register. All forty-seven fields
+   are four bytes wide and there is no padding anywhere, so both sides can agree
+   on one number. The managed test suite asserts the same 176 against
+   Marshal.SizeOf. 188 since TEST 428 (vrsEye), 192 since TEST 442 (headUpMounted),
+   200 since TEST 450 (armScale, bodyWeight), 208 since TEST 462 (hudHitMarker,
+   hudPrompts), 212 since TEST 485 (handFingers), 216 since TEST 527 (mapHandUiWidth),
+   220 for dpadThumbrest, 228 since TEST 620 (uiWorldScaleBattle/Map), 232 since
+   TEST 645 (ownShieldBash), 236 since TEST 648 (uiWorldScaleDeploy), 244 since
+   TEST 711 (uiRecenterNewScreen, uiRecenterAngle), 248 for fovTrueVertical, 544 since
+   TEST 750 (the Calibration tool: four ints, six floats, two 128-byte texts), 744
+   since TEST 751 (toolProfile, toolWielded, four 48-byte slot names), 752 since
+   TEST 770 (fovCropH, fovCropV), 772 since TEST 785 (fovCropDetailed + four edges),
+   776 since TEST 790 (sharpenMode), 780 since TEST 797 (dlssPreset), 784 with gripToggle. */
+static_assert(sizeof(BvrOverlayState) == 784,
               "BvrOverlayState changed size; update BannerlordVR.Interop and its test.");
+
+#ifdef BVR_ENABLE_OPENXR
+/* TEST 785: simple mode crops each axis evenly; detailed mode per edge. */
+static void apply_fov_crop(int32_t detailed, float h, float v, float l, float r, float u, float d)
+{
+    if (detailed != 0)
+        bvr::xr_set_fov_crop(l, r, u, d, true);    /* TEST 785c: Left/Right = outer edges */
+    else
+        bvr::xr_set_fov_crop(h, h, v, v, false);
+}
+#endif
 
 int32_t BVR_CALL bvr_overlay_show(int32_t visible)
 {
@@ -468,6 +876,17 @@ int32_t BVR_CALL bvr_overlay_show(int32_t visible)
     return BVR_OK;
 #else
     (void)visible;
+    return BVR_SESSION_NOT_READY;
+#endif
+}
+
+int32_t BVR_CALL bvr_overlay_scroll(float notches)
+{
+#ifdef BVR_ENABLE_OPENXR
+    bvr::overlay_scroll(notches);
+    return BVR_OK;
+#else
+    (void)notches;
     return BVR_SESSION_NOT_READY;
 #endif
 }
@@ -489,6 +908,7 @@ int32_t BVR_CALL bvr_overlay_push(const BvrOverlayState* state)
     settings.calibSpread = state->calibSpread;
     settings.calibHave = state->calibHave;
     settings.hideBody = state->hideBody;
+    settings.handsOnly = state->handsOnly;
     settings.motionHands = state->motionHands;
     settings.uiShow = state->uiShow;
     settings.uiWidth = state->uiWidth;
@@ -496,10 +916,103 @@ int32_t BVR_CALL bvr_overlay_push(const BvrOverlayState* state)
     settings.screenWidth = state->screenWidth;
     settings.screenDistance = state->screenDistance;
     settings.sharpen = state->sharpen;
+    settings.sharpenMode = state->sharpenMode;
+    settings.dlssPreset = state->dlssPreset;
+    settings.gripToggle = state->gripToggle;
+    settings.stickMouseSpeed = state->stickMouseSpeed;
+
+    /* Two-way toggle like hideBody above: managed tells the panel what physical
+       combat is set to, and the panel's checkbox tells managed to change it. */
+    settings.physicalCombat = state->physicalCombat;
+
+    /* The full-body IK, the same way: managed says whether it is on, the
+       panel's checkbox can turn it off and get the animated body back. */
+    settings.bodyIk = state->bodyIk;
+
+    /* Motion-control combat, the same way again: managed says whether the
+       gesture melee is on, the panel's checkbox can put the game's own combat
+       back. */
+    settings.motionMelee = state->motionMelee;
+
+    /* Friendly fire (TEST 261), the same way: managed says whether swings can
+       land on friends and neutrals, the panel's checkbox changes it live. */
+    settings.friendlyFire = state->friendlyFire;
+
+    /* The grip's controller, the same way: managed says which one is loaded,
+       the panel's dropdown switches it. */
+    settings.gripController = state->gripController;
+
+    /* Body holsters (TEST 271), the same two-way way. */
+    settings.holster = state->holster;
+    settings.mapVr = state->mapVr;
+
+    /* The VR tab (TEST 293). recenter deliberately not copied, like
+       resolutionApply below. */
+    settings.headUp = state->headUp;
+    settings.headForward = state->headForward;
+    settings.bodyTurnDeg = state->bodyTurnDeg;
+    /* TEST 356; heightMeasure deliberately not copied, like recenter. */
+    settings.playerHeight = state->playerHeight;
+    settings.bodyScale = state->bodyScale;
+    settings.wristHudWidth = state->wristHudWidth;
+    settings.vrs = state->vrs;
+    settings.vrsEye = state->vrsEye;
+    settings.headUpMounted = state->headUpMounted;
+    settings.armScale = state->armScale;
+    settings.bodyWeight = state->bodyWeight;
+    settings.hudHitMarker = state->hudHitMarker;
+    settings.hudPrompts = state->hudPrompts;
+    settings.handFingers = state->handFingers;
+    settings.mapHandUiWidth = state->mapHandUiWidth;
+    settings.dpadThumbrest = state->dpadThumbrest;
+    settings.uiWorldScaleBattle = state->uiWorldScaleBattle;
+    settings.uiWorldScaleMap = state->uiWorldScaleMap;
+    settings.ownShieldBash = state->ownShieldBash;
+    settings.uiWorldScaleDeploy = state->uiWorldScaleDeploy;
+    settings.uiRecenterNewScreen = state->uiRecenterNewScreen;
+    settings.uiRecenterAngle = state->uiRecenterAngle;
+    settings.fovTrueVertical = state->fovTrueVertical;
+    settings.fovCropH = state->fovCropH;
+    settings.fovCropV = state->fovCropV;
+    settings.fovCropDetailed = state->fovCropDetailed;
+    settings.fovCropLeft = state->fovCropLeft;
+    settings.fovCropRight = state->fovCropRight;
+    settings.fovCropUp = state->fovCropUp;
+    settings.fovCropDown = state->fovCropDown;
+
+    /* TEST 750: the Calibration tool. toolCommand deliberately not copied, like
+       calibCommand below. */
+    settings.toolMode = state->toolMode;
+    settings.toolHand = state->toolHand;
+    settings.toolLive = state->toolLive;
+    for (int i = 0; i < 6; ++i)
+        settings.toolValue[i] = state->toolValue[i];
+    memcpy(settings.toolLabel, state->toolLabel, sizeof settings.toolLabel);
+    memcpy(settings.toolStatus, state->toolStatus, sizeof settings.toolStatus);
+    settings.toolLabel[sizeof settings.toolLabel - 1] = 0;
+    settings.toolStatus[sizeof settings.toolStatus - 1] = 0;
+    settings.toolProfile = state->toolProfile;
+    settings.toolWielded = state->toolWielded;
+    memcpy(settings.toolSlot, state->toolSlot, sizeof settings.toolSlot);
+    for (int i = 0; i < 4; ++i)
+        settings.toolSlot[i][sizeof settings.toolSlot[i] - 1] = 0;
+#ifdef BVR_ENABLE_OPENXR
+    bvr::xr_set_fov_true_vertical(state->fovTrueVertical != 0);
+    apply_fov_crop(state->fovCropDetailed, state->fovCropH, state->fovCropV, state->fovCropLeft,
+                   state->fovCropRight, state->fovCropUp, state->fovCropDown);
+#endif
 
     /* Push-only: managed reporting what the probe is doing, so the button can
        say so without the player reading a log. */
     settings.tableauProbeState = state->tableauProbeState;
+
+    /* Push-only too: managed telling the panel how the rebuild is going, so
+       the button can say "rebuilding" rather than looking inert while the
+       headset is black. */
+    settings.resolutionState = state->resolutionState;
+
+    /* resolutionApply deliberately not copied, exactly like tableauProbe
+       below: it is the PANEL's to raise and managed's to consume. */
 
     /* tableauProbe deliberately not copied, for the same reason as
        calibCommand below: it is the PANEL's to raise and managed's to consume,
@@ -536,6 +1049,7 @@ int32_t BVR_CALL bvr_overlay_poll(BvrOverlayState* outState)
     outState->calibSpread = settings.calibSpread;
     outState->calibHave = settings.calibHave;
     outState->hideBody = settings.hideBody;
+    outState->handsOnly = settings.handsOnly;
     outState->motionHands = settings.motionHands;
     outState->uiShow = settings.uiShow;
     outState->uiWidth = settings.uiWidth;
@@ -543,8 +1057,68 @@ int32_t BVR_CALL bvr_overlay_poll(BvrOverlayState* outState)
     outState->screenWidth = settings.screenWidth;
     outState->screenDistance = settings.screenDistance;
     outState->sharpen = settings.sharpen;
+    outState->sharpenMode = settings.sharpenMode;
+    outState->dlssPreset = settings.dlssPreset;
+    outState->gripToggle = settings.gripToggle;
+    outState->stickMouseSpeed = settings.stickMouseSpeed;
+    outState->physicalCombat = settings.physicalCombat;
+    outState->bodyIk = settings.bodyIk;
+    outState->motionMelee = settings.motionMelee;
+    outState->friendlyFire = settings.friendlyFire;
+    outState->gripController = settings.gripController;
+    outState->holster = settings.holster;
+    outState->mapVr = settings.mapVr;
+    outState->headUp = settings.headUp;
+    outState->headForward = settings.headForward;
+    outState->bodyTurnDeg = settings.bodyTurnDeg;
+    outState->recenter = settings.recenter;
+    outState->playerHeight = settings.playerHeight;
+    outState->heightMeasure = settings.heightMeasure;
+    outState->bodyScale = settings.bodyScale;
+    outState->wristHudWidth = settings.wristHudWidth;
+    outState->vrs = settings.vrs;
+    outState->vrsEye = settings.vrsEye;
+    outState->headUpMounted = settings.headUpMounted;
+    outState->armScale = settings.armScale;
+    outState->bodyWeight = settings.bodyWeight;
+    outState->hudHitMarker = settings.hudHitMarker;
+    outState->hudPrompts = settings.hudPrompts;
+    outState->handFingers = settings.handFingers;
+    outState->mapHandUiWidth = settings.mapHandUiWidth;
+    outState->dpadThumbrest = settings.dpadThumbrest;
+    outState->uiWorldScaleBattle = settings.uiWorldScaleBattle;
+    outState->uiWorldScaleMap = settings.uiWorldScaleMap;
+    outState->ownShieldBash = settings.ownShieldBash;
+    outState->uiWorldScaleDeploy = settings.uiWorldScaleDeploy;
+    outState->uiRecenterNewScreen = settings.uiRecenterNewScreen;
+    outState->uiRecenterAngle = settings.uiRecenterAngle;
+    outState->fovTrueVertical = settings.fovTrueVertical;
+    /* Native-side consumers, applied here: managed pushes only at start and on
+       a few events, so a panel edit never comes back through bvr_overlay_push. */
+    bvr::xr_set_fov_true_vertical(settings.fovTrueVertical != 0);
+    outState->fovCropH = settings.fovCropH;
+    outState->fovCropV = settings.fovCropV;
+    outState->fovCropDetailed = settings.fovCropDetailed;
+    outState->fovCropLeft = settings.fovCropLeft;
+    outState->fovCropRight = settings.fovCropRight;
+    outState->fovCropUp = settings.fovCropUp;
+    outState->fovCropDown = settings.fovCropDown;
+    apply_fov_crop(settings.fovCropDetailed, settings.fovCropH, settings.fovCropV, settings.fovCropLeft,
+                   settings.fovCropRight, settings.fovCropUp, settings.fovCropDown);
+    outState->toolMode = settings.toolMode;
+    outState->toolHand = settings.toolHand;
+    outState->toolLive = settings.toolLive;
+    outState->toolCommand = settings.toolCommand;
+    for (int i = 0; i < 6; ++i)
+        outState->toolValue[i] = settings.toolValue[i];
+    memcpy(outState->toolLabel, settings.toolLabel, sizeof outState->toolLabel);
+    memcpy(outState->toolStatus, settings.toolStatus, sizeof outState->toolStatus);
+    outState->toolProfile = settings.toolProfile;
+    outState->toolWielded = settings.toolWielded;
+    memcpy(outState->toolSlot, settings.toolSlot, sizeof outState->toolSlot);
     outState->calibCommand = settings.calibCommand;
     outState->tableauProbe = settings.tableauProbe;
+    outState->resolutionApply = settings.resolutionApply;
     return BVR_OK;
 #else
     (void)outState;
@@ -631,15 +1205,46 @@ int32_t BVR_CALL bvr_get_input_state(BvrInputState* outState)
     std::memset(outState, 0, sizeof(BvrInputState));
 
 #ifdef BVR_ENABLE_OPENXR
-    return bvr::input_read(outState) ? BVR_OK : BVR_SESSION_NOT_READY;
+    return bvr::input_read_game(outState) ? BVR_OK : BVR_SESSION_NOT_READY;   /* TEST 452 */
 #else
     return BVR_SESSION_NOT_READY;
 #endif
 }
 
-int32_t BVR_CALL bvr_trigger_haptic(int32_t /*hand*/, float /*amplitude*/, float /*durationSeconds*/)
+int32_t BVR_CALL bvr_latch_input(float leadFrames)
 {
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::input_latch(leadFrames) ? BVR_OK : BVR_SESSION_NOT_READY;
+#else
+    (void)leadFrames;
     return BVR_SESSION_NOT_READY;
+#endif
+}
+
+uint32_t BVR_CALL bvr_get_finger_touch(void)
+{
+#ifdef BVR_ENABLE_OPENXR
+    return bvr::input_finger_touch();
+#else
+    return 0;
+#endif
+}
+
+int32_t BVR_CALL bvr_trigger_haptic(int32_t hand, float amplitude, float durationSeconds)
+{
+#ifdef BVR_ENABLE_OPENXR
+    /* A pulse is a request, not a guarantee: no session, no binding or a runtime
+       that ignores haptics all return SESSION_NOT_READY and the caller carries
+       on. The managed side reports the first failure once. */
+    return bvr::input_haptic(hand, amplitude, durationSeconds)
+        ? BVR_OK
+        : BVR_SESSION_NOT_READY;
+#else
+    (void)hand;
+    (void)amplitude;
+    (void)durationSeconds;
+    return BVR_SESSION_NOT_READY;
+#endif
 }
 
 /* --- teardown ------------------------------------------------------------ */
