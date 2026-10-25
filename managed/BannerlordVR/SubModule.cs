@@ -52,6 +52,8 @@ namespace BannerlordVR
                 VrLog.Error("Could not add the pre-display weapon behavior; weapons stay on "
                             + "the AfterMissionTick seam. Nothing else is affected.", ex);
             }
+
+            VR.Physics.VrEnemyPhysics.MissionBehaviorInitialize(mission);
         }
         protected override void OnSubModuleLoad()
         {
@@ -105,6 +107,13 @@ namespace BannerlordVR
 
             VrHandCalibration.Load();
             VrSystem.Initialize();
+            VR.Physics.VrEnemyPhysics.Load();
+        }
+
+        protected override void AfterAsyncTickTick(float dt)
+        {
+            base.AfterAsyncTickTick(dt);
+            VR.Physics.VrEnemyPhysics.AfterAsyncTick();
         }
 
         protected override void OnBeforeInitialModuleScreenSetAsRoot()
@@ -289,6 +298,7 @@ namespace BannerlordVR
             VrBreadcrumb.Set(VrBreadcrumb.AppTick);
 
             VrSystem.Tick();
+            VR.Physics.VrEnemyPhysics.ApplicationTick();
 
             // BEFORE the IsActive gate below, and that is the point: this is what
             // puts the main menu and the campaign map in the headset, and neither

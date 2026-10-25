@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Equipped on a beheaded agent just before the kill: no mesh (the view
+     skips armour without a mesh) and covers_head, which removes
+     SkinMask.HeadVisible so the head skin, hair and beard are not drawn. -->
+<Items>
+  <Item id="bvr_severed_head" name="{=!}Severed head" mesh="" culture="Culture.neutral_culture"
+        weight="0" appearance="0" is_merchandise="false" Type="HeadArmor">
+    <ItemComponent>
+      <Armor head_armor="0" has_gender_variations="false" covers_head="true"
+             hair_cover_type="all" beard_cover_type="all" material_type="Cloth" />
+    </ItemComponent>
+  </Item>
+</Items>
