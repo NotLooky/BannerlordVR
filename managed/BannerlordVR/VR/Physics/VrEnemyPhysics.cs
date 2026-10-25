@@ -23,6 +23,17 @@ namespace BannerlordVR.VR.Physics
             }
         }
 
+        // The VR panel's Enemy physics box: -1 hides it (enemy_physics = 0).
+        public static int PanelState => !EnemyPhysicsSettings.Configured ? -1 : EnemyPhysicsSettings.Active ? 1 : 0;
+        public static void FromPanel(int state)
+        {
+            if (!EnemyPhysicsSettings.Configured || state < 0 || (state != 0) == EnemyPhysicsSettings.Active) return;
+            EnemyPhysicsSettings.Active = state != 0;
+            VrConfig.Save("enemy_physics_active", EnemyPhysicsSettings.Active ? "1" : "0");
+            PhysicsLog.Info("VR panel: enemy physics " + (EnemyPhysicsSettings.Active ? "ON" : "off (BannerlordVR's own physical combat)") + ", saved.");
+            VrLog.Info("VR panel: enemy physics " + (EnemyPhysicsSettings.Active ? "ON" : "off") + ", saved.");
+        }
+
         public static void ApplicationTick()
         {
             if (!EnemyPhysicsSettings.Configured) return;

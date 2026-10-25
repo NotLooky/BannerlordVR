@@ -476,6 +476,11 @@ namespace BannerlordVR.Interop
         /// -1 DLSS's own). Two-way; managed saves it. Appended LAST.</summary>
         public int DlssPreset;
         public int GripToggle;
+
+        /// <summary>Enemy physics: -1 hides the panel's box (enemy_physics = 0),
+        /// else 0 off / 1 on. Two-way; managed saves enemy_physics_active.
+        /// Appended LAST.</summary>
+        public int EnemyPhysics;
     }
 
     /// <summary>TEST 750: the Calibration tool's buttons. SAME VALUES as

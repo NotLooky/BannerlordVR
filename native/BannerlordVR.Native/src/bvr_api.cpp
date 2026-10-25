@@ -854,8 +854,9 @@ int32_t BVR_CALL bvr_overlay_visible(void)
    TEST 750 (the Calibration tool: four ints, six floats, two 128-byte texts), 744
    since TEST 751 (toolProfile, toolWielded, four 48-byte slot names), 752 since
    TEST 770 (fovCropH, fovCropV), 772 since TEST 785 (fovCropDetailed + four edges),
-   776 since TEST 790 (sharpenMode), 780 since TEST 797 (dlssPreset), 784 with gripToggle. */
-static_assert(sizeof(BvrOverlayState) == 784,
+   776 since TEST 790 (sharpenMode), 780 since TEST 797 (dlssPreset), 784 with gripToggle,
+   788 with enemyPhysics. */
+static_assert(sizeof(BvrOverlayState) == 788,
               "BvrOverlayState changed size; update BannerlordVR.Interop and its test.");
 
 #ifdef BVR_ENABLE_OPENXR
@@ -919,6 +920,7 @@ int32_t BVR_CALL bvr_overlay_push(const BvrOverlayState* state)
     settings.sharpenMode = state->sharpenMode;
     settings.dlssPreset = state->dlssPreset;
     settings.gripToggle = state->gripToggle;
+    settings.enemyPhysics = state->enemyPhysics;
     settings.stickMouseSpeed = state->stickMouseSpeed;
 
     /* Two-way toggle like hideBody above: managed tells the panel what physical
@@ -1060,6 +1062,7 @@ int32_t BVR_CALL bvr_overlay_poll(BvrOverlayState* outState)
     outState->sharpenMode = settings.sharpenMode;
     outState->dlssPreset = settings.dlssPreset;
     outState->gripToggle = settings.gripToggle;
+    outState->enemyPhysics = settings.enemyPhysics;
     outState->stickMouseSpeed = settings.stickMouseSpeed;
     outState->physicalCombat = settings.physicalCombat;
     outState->bodyIk = settings.bodyIk;

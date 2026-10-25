@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Reflection;
@@ -739,7 +739,7 @@ namespace BannerlordVR.MathTests
 
             Type t = typeof(BvrOverlayState);
 
-            Report(Marshal.SizeOf(t) == 784 && Marshal.OffsetOf(t, "WristHudWidth").ToInt32() == 176
+            Report(Marshal.SizeOf(t) == 788 && Marshal.OffsetOf(t, "WristHudWidth").ToInt32() == 176
                    && Marshal.OffsetOf(t, "Vrs").ToInt32() == 180
                    && Marshal.OffsetOf(t, "VrsEye").ToInt32() == 184
                    && Marshal.OffsetOf(t, "HeadUpMounted").ToInt32() == 188
@@ -770,9 +770,10 @@ namespace BannerlordVR.MathTests
                    && Marshal.OffsetOf(t, "FovCropDown").ToInt32() == 768
                    && Marshal.OffsetOf(t, "SharpenMode").ToInt32() == 772
                    && Marshal.OffsetOf(t, "DlssPreset").ToInt32() == 776
-                   && Marshal.OffsetOf(t, "GripToggle").ToInt32() == 780,
+                   && Marshal.OffsetOf(t, "GripToggle").ToInt32() == 780
+                   && Marshal.OffsetOf(t, "EnemyPhysics").ToInt32() == 784,
                 string.Format(
-                "BvrOverlayState is {0} bytes (want 784, GripToggle last at 780; bvr_api.cpp static_asserts it)",
+                "BvrOverlayState is {0} bytes (want 788, EnemyPhysics last at 784; bvr_api.cpp static_asserts it)",
                 Marshal.SizeOf(t)));
 
             // Forty-one four-byte fields in declared order. Named individually

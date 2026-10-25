@@ -10,10 +10,10 @@ Code: `managed/BannerlordVR/VR/Physics/`, the ragdoll bridge
 - `enemy_physics = 1` in `BannerlordVR.cfg`. **Off by default**: with the key
   off no physics patch is applied (each patch's `Prepare` returns false), its
   native DLL is not loaded, and the game plays as without this code.
-- On, the VR panel's **Physical combat** box switches it in game, together
-  with BannerlordVR's own collisions (`VrPhysicalCombat.Enabled`, saved as
-  `combat`). Unticked, the game's trigger and motion attacks fight as they do
-  without the physics.
+- On, the VR panel shows an **Enemy physics** box under Motion controls
+  (`enemy_physics_active`, default 1). Unticked, the mod's own physical
+  combat fights, with motion controls as they are. It needs the panel's
+  motion controls on (`VrPhysicalCombat.Enabled`).
 - On, the VR panel opens on **both stick clicks held 1 s**
   (`menu_chord_seconds`; 0 gives back both triggers held 2 s). With the
   physics, squeezing both hands is a grab, a fist or a neck cut held on an
@@ -41,7 +41,8 @@ All under `enemy_physics = 1`. The tested setup is the defaults.
 
 | Key | Default | |
 |---|---|---|
-| `enemy_physics` | 0 | master switch |
+| `enemy_physics` | 0 | master switch: builds the physics in |
+| `enemy_physics_active` | 1 | the panel's Enemy physics box |
 | `enemy_physics_weapon_damage` | 1 | the physics deals blade damage on the bodies it tracks |
 | `enemy_physics_living_ragdoll` | 1 | living ragdolls (needs `BannerlordVR.Physics.Native.dll`) |
 | `enemy_physics_active_ragdoll` | 1 | balanced active ragdolls, stab joints, axe bites |
@@ -61,6 +62,13 @@ Calls added to `SubModule.cs` (one line each, all return at once while
 `enemy_physics` is 0): `VrEnemyPhysics.Load` (end of `OnSubModuleLoad`),
 `ApplicationTick` (after `VrSystem.Tick`), `AfterAsyncTick` (new override),
 `MissionBehaviorInitialize` (end of `OnMissionBehaviorInitialize`).
+
+The panel box: `BvrOverlayState.enemyPhysics` appended last (788 bytes, the
+size checks in `bvr_api.cpp` and `BannerlordVR.MathTests` updated), copied in
+`bvr_api.cpp` and `vr_overlay.cpp` like `gripToggle`, drawn in
+`vr_overlay.cpp` under Motion controls (hidden while managed sends -1), and
+one line each in `VrMenu` (`Push`: `VrEnemyPhysics.PanelState`, `Poll`:
+`VrEnemyPhysics.FromPanel`).
 
 Everything else is a Harmony patch in `VR/Physics/`, applied by the mod's
 own patch loop, so no existing file changes:
