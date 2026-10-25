@@ -925,7 +925,7 @@ void build_calibration_ui(OverlaySettings& local, bool& changed)
     if (local.enemyPhysics >= 0)
     {
         bool physics = local.enemyPhysics != 0;
-        if (ImGui::Checkbox("Enemy physics (Blade & Sorcery / Tales of Glory style)", &physics))
+        if (ImGui::Checkbox("Enemy physics", &physics))
         {
             local.enemyPhysics = physics ? 1 : 0;
             changed = true;
