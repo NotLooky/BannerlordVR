@@ -414,7 +414,7 @@ The DLSS upgrade remains in the game bin after removing the mod. To restore the 
 
 ## Credits
 
-The optional enemy physics (`enemy_physics = 1`, see [docs/enemy-physics.md](docs/enemy-physics.md)) is modelled on two VR melee games, whose mechanics and tuning it reproduces for Bannerlord:
+The enemy physics (on by default; `enemy_physics = 0` turns it off, see [docs/enemy-physics.md](docs/enemy-physics.md)) is modelled on two VR melee games, whose mechanics and tuning it reproduces for Bannerlord:
 
 - **[Blade & Sorcery](https://warpfrog.com/)** by **Warpfrog**: damagers and penetration, material and armour modifiers, dismemberment, blade stops on shields and weapons, grabbing, and the push and stagger reactions.
 - **Tales of Glory** by **BlackTale Games**: the stab entry test (kinetic energy and thresholds by armour, helmet and mount), the stab joint, axe bites, blade recoil, killing-blow pushes, and the mounted hand-speed model.

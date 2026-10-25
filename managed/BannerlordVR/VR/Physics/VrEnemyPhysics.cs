@@ -5,11 +5,11 @@ using TaleWorlds.MountAndBlade.View.Screens;
 
 namespace BannerlordVR.VR.Physics
 {
-    // Blade & Sorcery / Tales of Glory style enemy physics (docs/physical-enemies.md).
-    // Off unless enemy_physics = 1; on, the VR panel's physical combat switches
-    // it with BannerlordVR's own collisions. SubModule calls these four hooks;
+    // Blade & Sorcery / Tales of Glory style enemy physics (docs/enemy-physics.md).
+    // On by default; enemy_physics = 0 leaves it out entirely. The VR panel's
+    // Enemy physics box switches it in game. SubModule calls these four hooks;
     // the patch classes in this folder apply with the mod's own and stand
-    // aside (Prepare) while the key is off.
+    // aside (Prepare) while the key is 0.
     public static class VrEnemyPhysics
     {
         public static void Load()

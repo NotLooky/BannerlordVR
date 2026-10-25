@@ -5,12 +5,13 @@ namespace BannerlordVR.VR.Physics
 {
     public static class EnemyPhysicsSettings
     {
-        // enemy_physics = 1 builds the physics in (its patches apply at load);
+        // enemy_physics (default 1) builds the physics in (its patches apply
+        // at load; 0 leaves every one out);
         // the VR panel's Enemy physics box (enemy_physics_active, saved by the
         // panel) switches it in game: off, the mod's own physical combat
         // fights, motion controls as they are. It needs the panel's motion
         // controls (VrPhysicalCombat) on as well.
-        public static readonly bool Configured = VrConfig.Bool("enemy_physics", false);
+        public static readonly bool Configured = VrConfig.Bool("enemy_physics", true);
         public static bool Active = VrConfig.Bool("enemy_physics_active", true);
         public static bool Enabled => Configured && Active && VrPhysicalCombat.Enabled;
         public static readonly int Capacity = Math.Max(1, Math.Min(12, VrConfig.Int("enemy_physics_max_agents", 6)));
