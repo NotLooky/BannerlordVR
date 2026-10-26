@@ -893,6 +893,11 @@ typedef struct BvrOverlayState
     int32_t dlssPreset;
     int32_t gripToggle;
 
+    /* --- Enemy physics (docs/enemy-physics.md) -------------------------------
+       Two-way. -1 from managed hides the box (enemy_physics = 0 in the cfg),
+       else 0 off / 1 on; managed saves `enemy_physics_active`. Appended LAST. */
+    int32_t enemyPhysics;
+
 } BvrOverlayState;
 
 /* TEST 750: toolCommand values. SAME VALUES as BvrToolCommand in NativeBridge.cs. */

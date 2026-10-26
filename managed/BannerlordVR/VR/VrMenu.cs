@@ -188,6 +188,7 @@ namespace BannerlordVR.VR
                 SharpenMode = _sharpenMode,
                 DlssPreset = _dlssPreset,
                 GripToggle = VrGrip.Toggle ? 1 : 0,
+                EnemyPhysics = Physics.VrEnemyPhysics.PanelState,
                 WristHudWidth = _wristWidth,
                 MapHandUiWidth = _mapHandWidth,
                 Vrs = _vrs,
@@ -460,6 +461,7 @@ namespace BannerlordVR.VR
                 VrConfig.Save("sharpen", Format(_sharpen));
                 VrLog.Info("VR panel: sharpening " + Format(_sharpen) + ", saved.");
             }
+            Physics.VrEnemyPhysics.FromPanel(panel.EnemyPhysics);
             if ((panel.GripToggle != 0) != VrGrip.Toggle)
             {
                 VrGrip.Toggle = panel.GripToggle != 0;

@@ -33,6 +33,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 - [Troubleshooting](#troubleshooting)
 - [Bug reports and feedback](#bug-reports-and-feedback)
 - [Updating and uninstalling](#updating-and-uninstalling)
+- [Credits](#credits)
 - [Development and license](#development-and-license)
 
 ## Features
@@ -410,6 +411,15 @@ The DLSS upgrade remains in the game bin after removing the mod. To restore the 
 **Disable:** untick **Bannerlord VR** in the launcher and restart the game.
 
 **Uninstall:** close the game and remove `Modules\BannerlordVR`. Optionally remove its personal config and logs from Documents. Leave Harmony installed if other mods need it.
+
+## Credits
+
+The enemy physics (on by default; `enemy_physics = 0` turns it off, see [docs/enemy-physics.md](docs/enemy-physics.md)) is modelled on two VR melee games, whose mechanics and tuning it reproduces for Bannerlord:
+
+- **[Blade & Sorcery](https://warpfrog.com/)** by **Warpfrog**: damagers and penetration, material and armour modifiers, dismemberment, blade stops on shields and weapons, grabbing, and the push and stagger reactions.
+- **Tales of Glory** by **BlackTale Games**: the stab entry test (kinetic energy and thresholds by armour, helmet and mount), the stab joint, axe bites, blade recoil, killing-blow pushes, and the mounted hand-speed model.
+
+No code, models, sounds or other assets from either game are included or redistributed. BannerlordVR is not affiliated with, approved by, or endorsed by Warpfrog or BlackTale Games.
 
 ## Development and license
 

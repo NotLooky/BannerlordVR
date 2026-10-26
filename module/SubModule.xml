@@ -45,4 +45,18 @@
       </Tags>
     </SubModule>
   </SubModules>
+
+  <!-- bvr_severed_head: the meshless head armour a beheaded agent wears
+       (enemy physics, VR/Physics/DismemberFx). Sold nowhere; only the
+       physics equips it. -->
+  <Xmls>
+    <XmlNode>
+      <XmlName id="Items" path="bvr_items" />
+      <IncludedGameTypes>
+        <GameType value="Campaign" />
+        <GameType value="CampaignStoryMode" />
+        <GameType value="CustomGame" />
+      </IncludedGameTypes>
+    </XmlNode>
+  </Xmls>
 </Module>

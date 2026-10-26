@@ -920,6 +920,20 @@ void build_calibration_ui(OverlaySettings& local, bool& changed)
     /* Greyed rather than hidden while off, like the HUD sliders. */
     ImGui::BeginDisabled(!full);
 
+    /* Enemy physics (docs/enemy-physics.md). -1 from managed hides it: the
+       physics is built in but enemy_physics = 0 in the cfg. */
+    if (local.enemyPhysics >= 0)
+    {
+        bool physics = local.enemyPhysics != 0;
+        if (ImGui::Checkbox("Enemy physics", &physics))
+        {
+            local.enemyPhysics = physics ? 1 : 0;
+            changed = true;
+        }
+        hint("On: blades meet the bodies they touch - stabs stay in, blades stop and "
+             "recoil, ragdolls and dismemberment. Off: the mod's own physical combat.");
+    }
+
     bool toggleGrip = local.gripToggle != 0;
     if (ImGui::Checkbox("Toggle battle grips", &toggleGrip))
     {
@@ -1347,6 +1361,7 @@ void build_ui()
         g_ov.settings.sharpenMode = local.sharpenMode;
         g_ov.settings.dlssPreset = local.dlssPreset;
         g_ov.settings.gripToggle = local.gripToggle;
+        g_ov.settings.enemyPhysics = local.enemyPhysics;
         g_ov.settings.vrs = local.vrs;
         g_ov.settings.vrsEye = local.vrsEye;
         g_ov.settings.headUpMounted = local.headUpMounted;
@@ -1552,6 +1567,7 @@ void overlay_set_settings(const OverlaySettings& in)
         g_ov.settings.sharpenMode = held.sharpenMode;
         g_ov.settings.dlssPreset = held.dlssPreset;
         g_ov.settings.gripToggle = held.gripToggle;
+        g_ov.settings.enemyPhysics = held.enemyPhysics;
         g_ov.settings.vrs = held.vrs;
         g_ov.settings.vrsEye = held.vrsEye;
         g_ov.settings.headUpMounted = held.headUpMounted;

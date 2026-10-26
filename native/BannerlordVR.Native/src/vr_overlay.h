@@ -235,6 +235,8 @@ struct OverlaySettings
     /* TEST 797: the cfg's dlss_preset (0 auto, 10-13 J-M, -1 DLSS's own). */
     int32_t dlssPreset = 0;
     int32_t gripToggle = 0;
+    /* Enemy physics: -1 hidden (enemy_physics = 0), 0 off, 1 on. */
+    int32_t enemyPhysics = -1;
 
     /* Menu pointer speed, in screen widths per second at full stick. Nothing
        native reads it - it is a managed setting that happens to need a slider,

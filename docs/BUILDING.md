@@ -48,6 +48,10 @@ git submodule update --init --recursive
 cmake -S native/BannerlordVR.Native -B build/native-cmake -A x64
 cmake --build build/native-cmake --config Release
 
+# enemy physics' ragdoll bridge (no submodules), into build\native as well
+cmake -S native/BannerlordVR.Physics.Native -B build/physics-native-cmake -A x64
+cmake --build build/physics-native-cmake --config Release
+
 # stage into the game + purge strays
 powershell -ExecutionPolicy Bypass -File tools\deploy.ps1
 ```
@@ -60,6 +64,9 @@ Different install path: `-p:BannerlordDir="D:\...\Mount & Blade II Bannerlord"`
 # coordinate maths - run after touching VrMath or VrCameraDriver
 dotnet build tests\BannerlordVR.MathTests
 build\tests\BannerlordVR.MathTests.exe      # exit 0 = pass
+
+# enemy physics - run after touching VR\Physics
+dotnet run --project tests\BannerlordVR.PhysicsTests   # PASS: ... physics checks
 ```
 
 ## Two rules that are not negotiable
