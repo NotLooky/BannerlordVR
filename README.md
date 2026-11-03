@@ -8,14 +8,11 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 [Downloads](https://github.com/NotLooky/BannerlordVR/releases) · [Report a bug](https://github.com/NotLooky/BannerlordVR/issues/new/choose)
 
-
 <img width="385" height="209" alt="14011-1791990479-900614996" src="https://github.com/user-attachments/assets/181151a1-4797-4197-978b-8de1a4c47185" />
 
 <img width="385" height="208" alt="14011-1791990474-1915983548" src="https://github.com/user-attachments/assets/53226c20-1bcf-4640-bd6b-77f784679401" />
 
-
-
-> **v0.2.6-alpha.2 is available:** [download the alpha](https://github.com/NotLooky/BannerlordVR/releases/tag/v0.2.6-alpha.2). Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Other game versions are unverified. Expect glitches, unfinished UI, and crashes. Headset acceptance with this exact ZIP is pending.
+> **v0.3.0.** Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending. Expect glitches, unfinished UI, and crashes.
 
 ## Contents
 
@@ -53,7 +50,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 - **Mount & Blade II: Bannerlord v1.4.8 or v1.5.5 .** This package was built against this version; other game versions are not verified. Steam is the tested installation.
 - **Windows 10 or 11, 64-bit**, with a PCVR-capable system.
-- **AMD graphics cards are not fully supported.**
+- **AMD graphics cards are not fully supported.** v0.3.0 includes a fix aimed at very low native-stereo frame rates on AMD; it has not yet been tested on AMD hardware.
 - **[Bannerlord.Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)** installed and enabled.
 - A PCVR headset, tracked motion controllers, and an active **OpenXR runtime**.
 
@@ -74,7 +71,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Use the included **BannerlordVR-0.2.6-alpha.2.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Use the included **BannerlordVR-0.3.0.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text
@@ -105,7 +102,7 @@ The package includes NVIDIA DLSS **310.9.1.0**. When the mod loads, it upgrades 
 ## First-time setup
 
 1. Enter a mission, stand in a comfortable neutral pose, and recenter with **F10**. You can also hold the **left stick click for 3 seconds**, keeping the right stick centered.
-2. Open the VR panel with **End**. With both hands empty, holding **both grips for 2 seconds** also toggles it with the shipped control layout.
+2. Open the VR panel with **End**. Clicking in **both sticks for 1.5 seconds** also toggles it, even with a weapon in hand.
 3. Under **Motion controls**, enable **Motion controls - full physical combat**. This combines tracked hands, physical combat, body IK, and room-scale movement.
 4. Check height, world scale, and hand alignment. Use the panel's calibration tools if weapons sit incorrectly in your hands.
 
@@ -138,10 +135,11 @@ These instructions use the new build's shipped layout: `controls_swap_trigger_gr
 | Right secondary button (Quest B / PSVR2 Circle) | Gamepad B: back / cancel / leave, depending on context |
 | Left primary button (Quest X / PSVR2 Square) | Gamepad X: kick or context action |
 | Left secondary button (Quest Y / PSVR2 Triangle) | Gamepad Y: interact / use |
+| Hold left secondary button (Quest Y / PSVR2 Triangle) for 0.6 seconds | Open encyclopedia; once per hold |
 | Left menu button | Gamepad Start / menu, where supplied by the runtime |
 | Hold left stick click + tilt right stick | D-pad direction; see below |
 | Hold left stick click for 3 seconds | Recenter; keep right stick centered |
-| Both grips held for 2 seconds, hands empty | Toggle VR settings panel |
+| Both stick clicks held for 1.5 seconds | Toggle VR settings panel |
 
 Face-button names above describe the equivalent button positions. PSVR2 can report as a Touch controller through SteamVR; use the game's Xbox prompts as the reference. Context actions follow Bannerlord's own gamepad bindings and can change if you rebind them.
 
@@ -176,14 +174,15 @@ Reach to an equipped item's holster, squeeze the grip, and bring your hand forwa
 
 | Default reach zone | Item / hand |
 | --- | --- |
-| Left hip | One-handed weapon |
-| Behind left shoulder | Bow; normally held in the left hand |
-| Behind right shoulder | Shield with the left hand; two-handed weapon, polearm, throwing weapon, crossbow, or sling with the appropriate hand |
+| Hip | One-handed weapon; one-handers may share a hip |
+| Behind a shoulder | One back item per shoulder: the shield first, on the off-hand side, then two-handed weapons and polearms, bows and crossbows, and throwing weapons. Extra back items move to the hips |
 | Behind either shoulder, with bow/crossbow already held | Arrow or bolt with the free loading hand |
 
-Zones depend on equipped items and the build's holster placement. Reach near or behind ear level for shoulder grabs. A loading-hand reach while holding a bow takes an arrow rather than drawing another weapon.
+Zones depend on equipped items; each weapon keeps its spot for the session. Reach near or behind ear level for shoulder grabs; shoulder draws are instant. A loading-hand reach while holding a bow takes an arrow rather than drawing another weapon.
 
 To pick up a weapon from the ground, bring the correct hand close and squeeze the grip. Shields and bows use the off hand; ordinary melee weapons use the main hand. Pickup follows the game's inventory rules and can replace an occupied slot.
+
+**Left-handed play:** set **Main hand** in the VR panel. With both hands empty, the hand that takes a weapon holds it; letting go of a two-handed hold passes the weapon to the other hand. Thrown or dropped weapons can be caught again.
 
 Releasing an ordinary weapon away from a holster tosses a visual copy that returns to its holster. **Tossed ordinary swords and shields do not deal throw damage.** Actual throwing weapons use the ranged damage system.
 
@@ -278,7 +277,7 @@ These are context bindings, not fixed troop commands. Follow the current on-scre
 
 ## VR settings and calibration
 
-Open the panel with **End**, or hold both grips for **2 seconds with empty hands**. Point at its controls and click with A / Cross. Changes are saved as you make them, except calibration edits that have an explicit **Save** button.
+Open the panel with **End**, or click in both sticks for **1.5 seconds**. Point at its controls and click with A / Cross. Changes are saved as you make them, except calibration edits that have an explicit **Save** button.
 
 | Panel area | Useful settings |
 | --- | --- |
@@ -358,7 +357,7 @@ Keep the shipped default file with its build. Edit your **personal** file rather
 | `render_scale = 1.00` | Default per-eye resolution scale |
 | `dpad_chord = 1` | Left-stick-click + right-stick D-pad shortcut |
 | `recenter_hold_seconds = 3` | Controller recenter hold time; `0` disables it |
-| `menu_hold_seconds = 2` | Empty-hand panel shortcut hold time; `0` disables it |
+| `menu_hold_seconds = 1.5` | Both-sticks panel shortcut hold time |
 | `gamepad_deadzone` | Stick deadzone |
 | `bow_full_draw_m` | Physical draw distance for full bow power |
 
@@ -414,7 +413,7 @@ The DLSS upgrade remains in the game bin after removing the mod. To restore the 
 
 ## Credits
 
-The enemy physics (on by default; `enemy_physics = 0` turns it off, see [docs/enemy-physics.md](docs/enemy-physics.md)) is modelled on two VR melee games, whose mechanics and tuning it reproduces for Bannerlord:
+The enemy physics (optional and off by default: tick **Enemy physics** under Motion controls in the VR panel; see [docs/enemy-physics.md](docs/enemy-physics.md)) is modelled on two VR melee games, whose mechanics and tuning it reproduces for Bannerlord:
 
 - **[Blade & Sorcery](https://warpfrog.com/)** by **Warpfrog**: damagers and penetration, material and armour modifiers, dismemberment, blade stops on shields and weapons, grabbing, and the push and stagger reactions.
 - **Tales of Glory** by **BlackTale Games**: the stab entry test (kinetic energy and thresholds by armour, helmet and mount), the stab joint, axe bites, blade recoil, killing-blow pushes, and the mounted hand-speed model.

@@ -7,18 +7,22 @@ Code: `managed/BannerlordVR/VR/Physics/`, the ragdoll bridge
 
 ## Turning it on
 
-- **On by default** (`enemy_physics = 1`). `enemy_physics = 0` in
+- **Optional, off by default.** `enemy_physics = 1` (default) builds it in,
+  and the panel box below turns it on. `enemy_physics = 0` in
   `BannerlordVR.cfg` takes it out entirely: no physics patch is applied (each
   patch's `Prepare` returns false), its native DLL is not loaded, the panel
   box is hidden, and the game plays as without this code.
 - On, the VR panel shows an **Enemy physics** box under Motion controls
-  (`enemy_physics_active`, default 1). Unticked, the mod's own physical
-  combat fights, with motion controls as they are. It needs the panel's
+  (`enemy_physics_active`, default 0: off until ticked). Unticked, everything held is let go,
+  the physics' mission logics are removed and every physics patch is
+  unpatched (its own Harmony id), so the mod's own physical combat fights
+  exactly as without it. Ticking it applies them again, mid-battle too; the
+  native DLL loads on the first tick. It needs the panel's
   motion controls on (`VrPhysicalCombat.Enabled`).
-- On, the VR panel opens on **both stick clicks held 1 s**
-  (`menu_chord_seconds`; 0 gives back both triggers held 2 s). With the
-  physics, squeezing both hands is a grab, a fist or a neck cut held on an
-  enemy. `End` still opens the panel.
+- The VR panel opens on **both stick clicks held 1.5 s**
+  (`menu_hold_seconds`), ticked or not. With the physics, squeezing both
+  hands is a grab, a fist or a neck cut held on an enemy. `End` still opens
+  the panel.
 
 ## What it does
 
@@ -46,6 +50,7 @@ All under `enemy_physics = 1`. The tested setup is the defaults.
 | `enemy_physics_active` | 1 | the panel's Enemy physics box |
 | `enemy_physics_weapon_damage` | 1 | the physics deals blade damage on the bodies it tracks |
 | `enemy_physics_living_ragdoll` | 1 | living ragdolls (needs `BannerlordVR.Physics.Native.dll`) |
+| `enemy_physics_swing_vanilla_death` | 1 | the panel's Vanilla death on swing kills box: a swing's kill plays the game's death animation, no ragdoll (a rider's kill always does) |
 | `enemy_physics_active_ragdoll` | 1 | balanced active ragdolls, stab joints, axe bites |
 | `enemy_physics_neck_cut` | 1 | drawing the blade across a held neck |
 | `enemy_physics_stab_model` | tog | `tog` (Tales of Glory) or `bs` (Blade & Sorcery penetration) |

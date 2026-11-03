@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.0 - 2026-11-03
+
+Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending.
+
+- Added enemy physics, contributed by heurazy: grabs, fists, cuts and ragdolls. Optional, off by default for now. Tick the **Enemy physics** box under Motion controls to turn it on or off, even mid-battle. **Vanilla death on swing kills** (on) leaves swing kills and kills of mounted enemies to the game's death animation.
+- Right- and left-handed combat: set **Main hand** in the VR panel.
+- Improved arm IK for cross-body reaches, added a wrist bend limit, held the last arm pose when tracking drops, and steadied the mounted upper body.
+- Hands, weapons and shields collide with the world; turn off with **Solid world** in the VR panel.
+- Fingers bend against surfaces and weapons.
+- Overhauled crossbows: string pulling speed is based on your character's crossbow skill, with better alignment and smoother transitions.
+- The VR panel opens when you hold both stick clicks for 1.5 seconds.
+- Added a crouch key and sitting on chairs.
+- With toggle grips on, throwing weapons and the crossbow's loading hand stay hold-to-grip.
+- Fire the ship's ballista while sailing: at the helm, the left index trigger toggles ballista mode, a laser pointer from the right hand aims, and the right index trigger fires.
+- Campaign map: siege navigation works on the 3D map (pan, zoom and turn).
+- **AMD:** a likely fix for very low frame rates in native stereo; not yet tested on AMD.
+
+## v0.2.7-alpha.1 - 2026-10-20
+
+Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending.
+
+- Hold the left secondary button (Quest Y / PSVR2 Triangle) for 0.6 seconds to open the encyclopedia. Fires once per hold; normal Y interaction remains available.
+- Fixed saved crossbow calibration being overridden after closing the calibration tool.
+- Restored vanilla rein textures with the static rein renderer.
+- Fixed silent player voices caused by stale startup voice IDs.
+- Improved ship ballista positioning and reload reach, and corrected swing sounds on stairs.
+- Preserved controller and equipment calibration. Native stereo at 1.00 render scale, hold-to-grab, and optional toggle battle grips off remain the release defaults.
+
+
 ## v0.2.6-alpha.2 ? 2026-10-20
 
 Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Headset testing of this exact ZIP is pending.
