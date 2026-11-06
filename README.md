@@ -12,7 +12,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 <img width="385" height="208" alt="14011-1791990474-1915983548" src="https://github.com/user-attachments/assets/53226c20-1bcf-4640-bd6b-77f784679401" />
 
-> **v0.3.0.** Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending. Expect glitches, unfinished UI, and crashes.
+> **v0.3.1.** Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending. Expect glitches, unfinished UI, and crashes.
 
 ## Contents
 
@@ -50,7 +50,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 - **Mount & Blade II: Bannerlord v1.4.8 or v1.5.5 .** This package was built against this version; other game versions are not verified. Steam is the tested installation.
 - **Windows 10 or 11, 64-bit**, with a PCVR-capable system.
-- **AMD graphics cards are not fully supported.** v0.3.0 includes a fix aimed at very low native-stereo frame rates on AMD; it has not yet been tested on AMD hardware.
+- **AMD graphics cards are not supported yet.** The game can crash or run very slowly on AMD.
 - **[Bannerlord.Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)** installed and enabled.
 - A PCVR headset, tracked motion controllers, and an active **OpenXR runtime**.
 
@@ -71,7 +71,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Use the included **BannerlordVR-0.3.0.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Use the included **BannerlordVR-0.3.1.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text

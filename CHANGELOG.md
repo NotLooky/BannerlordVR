@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.3.1 - 2026-11-06
+
+Alpha build for **Bannerlord v1.4.8** (stable, Steam build 24573425) and the v1.5.6 beta.
+
+### Changes
+
+- New **Holsters** tab in the VR panel. Pick where each weapon hangs, or put it there with your hand, then fine-tune it. Save it for one weapon or for all weapons of that type.
+- Holster mode: **ours** (long weapons on the shoulders, two per shoulder), **classic** (as in v0.2.7), or **the game's spots** (the default).
+- Swords fill the left hip, then the right hip, then any free shoulder.
+- New option: **Two-handed swords on the shoulders only**.
+- To draw the second weapon on a shoulder, hold the stick or thumb rest while you grip.
+- New option: **Hide shoulder pads, capes and scarves**, so they do not block your view.
+- Torches work in your hand, with fire and light.
+- Cloth on weapons moves for real while you hold or throw them.
+- Slings do not work in VR yet. They are hidden, and the chat tells you so.
+- The tournament bracket screen now fills your view, not a small square.
+- Town and village menus on the campaign map stay still until you turn your head away.
+- The laser pointer no longer fights with the mouse.
+- Also works on the new Bannerlord 1.5.6 beta patch.
+- Enemy physics: your weapon hits now spray blood.
+- Fixed: opening the order menu with a weapon in hand made a fake attack sound.
+- Fixed: a crash in the new campaign tutorial, when the game takes your weapons away. Other places that could crash the same way are now protected too.
+
+### Known limits
+
+- This is an alpha build. Expect bugs and crashes.
+- AMD graphics cards are not supported yet. The game can crash or run very slowly on AMD.
+
 ## v0.3.0 - 2026-11-03
 
 Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending.
