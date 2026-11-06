@@ -12,7 +12,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 <img width="385" height="208" alt="14011-1791990474-1915983548" src="https://github.com/user-attachments/assets/53226c20-1bcf-4640-bd6b-77f784679401" />
 
-> **v0.3.1.** Built against **Bannerlord v1.4.8** (stable, Steam build 24573425). Exact-package headset acceptance is pending. Expect glitches, unfinished UI, and crashes.
+> **v0.3.1 (alpha).** Built for **Bannerlord v1.4.8** (stable, Steam build 24573425); also works on the **v1.5.6 beta**. Expect glitches, unfinished UI, and crashes. See the [changelog](CHANGELOG.md) for what is new.
 
 ## Contents
 
@@ -39,6 +39,11 @@ Disclaimer: The mod is build with the help of Claude Code.
 - **Tracked hands and weapons:** your controllers position your hands; weapon weight adds resistance and lag.
 - **Physical melee:** swing and thrust to attack, with weapon and shield contact, game damage rules, and haptic feedback.
 - **Body holsters and grabbing:** draw equipped weapons by reaching for them, pick up nearby weapons, and release to stow or drop them.
+- **Holsters your way:** in the **Holsters** tab, choose where each weapon hangs or put it there with your hand. A shoulder can carry two weapons.
+- **Right- or left-handed:** set **Main hand** in the VR panel.
+- **Solid world:** hands, weapons, and shields stop at walls and objects; fingers bend against surfaces and weapons.
+- **Torches:** hold a torch in your hand, with its fire and light.
+- **Enemy physics (optional, off by default):** grab and punch enemies, cut them, knock them into ragdolls, and see blood on your weapon hits. See [docs/enemy-physics.md](docs/enemy-physics.md).
 - **Two-handed weapons:** hold a sword or polearm with both hands and adjust your grip along the shaft.
 - **Manual ranged combat:** take arrows and bolts from behind your shoulder, draw bows, span crossbows, and physically throw throwing weapons.
 - **Body tracking from head and hands:** body movement, arm IK, and room-scale movement without requiring external body trackers.
@@ -48,7 +53,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 ## Requirements and headset support
 
-- **Mount & Blade II: Bannerlord v1.4.8 or v1.5.5 .** This package was built against this version; other game versions are not verified. Steam is the tested installation.
+- **Mount & Blade II: Bannerlord v1.4.8** (stable) or the **v1.5.6 beta**. Other game versions are not verified. Steam is the tested installation.
 - **Windows 10 or 11, 64-bit**, with a PCVR-capable system.
 - **AMD graphics cards are not supported yet.** The game can crash or run very slowly on AMD.
 - **[Bannerlord.Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)** installed and enabled.
@@ -81,10 +86,13 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
            |-- SubModule.xml
            |-- BannerlordVR.default.cfg
            |-- NVIDIA-DLSS-LICENSE.txt
+           |-- ModuleData/
+           |   `-- bvr_items.xml
            `-- bin/
                `-- Win64_Shipping_Client/
                    |-- BannerlordVR.dll
                    |-- BannerlordVR.Native.dll
+                   |-- BannerlordVR.Physics.Native.dll
                    `-- nvngx_dlss.dll
    ```
 
@@ -95,7 +103,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 
 
-Keep the managed DLL, native DLL, bundled DLSS DLL, NVIDIA license, and shipped default config from the **same build** together.
+Keep all three mod DLLs, the bundled DLSS DLL, `ModuleData`, the NVIDIA license, and the shipped default config from the **same build** together.
 
 The package includes NVIDIA DLSS **310.9.1.0**. When the mod loads, it upgrades an older game `bin/Win64_Shipping_Client/nvngx_dlss.dll` and saves the first original beside it as `nvngx_dlss.dll.bannerlordvr-original.bak`. Equal or newer versions are preserved. If the old DLSS was already loaded, restart Bannerlord once to use the upgrade; the managed log records this. The game bin folder must be writable; failures are logged and the game continues with its existing DLL.
 
@@ -172,13 +180,25 @@ The left stick click also reaches the game as L3, so its normal action can occur
 
 Reach to an equipped item's holster, squeeze the grip, and bring your hand forward **without releasing it**. To stow it, bring it back to its holster and release.
 
-| Default reach zone | Item / hand |
-| --- | --- |
-| Hip | One-handed weapon; one-handers may share a hip |
-| Behind a shoulder | One back item per shoulder: the shield first, on the off-hand side, then two-handed weapons and polearms, bows and crossbows, and throwing weapons. Extra back items move to the hips |
-| Behind either shoulder, with bow/crossbow already held | Arrow or bolt with the free loading hand |
+By default (**Holster mode: The game's own spots**) each weapon hangs where the game puts it, and you reach for it there:
 
-Zones depend on equipped items; each weapon keeps its spot for the session. Reach near or behind ear level for shoulder grabs; shoulder draws are instant. A loading-hand reach while holding a bow takes an arrow rather than drawing another weapon.
+| Reach zone | Item / hand |
+| --- | --- |
+| Hip | One-handed swords and other hip weapons |
+| Behind a shoulder | Shield, two-handed weapons and polearms, bows, crossbows; longbows hang on your back |
+| Behind either shoulder, with bow/crossbow already held | Arrow or bolt with the free loading hand |
+| Second weapon on the same shoulder | Hold the stick or thumb rest while you grip |
+
+Reach near or behind ear level for shoulder grabs; a shoulder weapon is taken by a hand at or behind your neck, not from inside your chest. A loading-hand reach while holding a bow takes an arrow rather than drawing another weapon.
+
+### Holsters tab
+
+Open the VR panel and pick the **Holsters** tab.
+
+- **Holster mode:** **Our holsters** (long weapons on the shoulders, two per shoulder; swords fill the left hip, then the right hip, then a free shoulder), **Classic holsters** (as in v0.2.7), or **The game's own spots** (default).
+- **Two-handed swords on the shoulders:** hang every two-handed sword on a shoulder, even one the game puts on a hip.
+- **Move one weapon:** 1. pick the weapon, and it goes to your hand. 2. Hold it on your body where it should hang, then hold a grip for half a second. 3. Save it for **this item** or for its **class** (every weapon of that type). You can also choose the spot from a list (automatic, left or right shoulder, left or right hip, or where the game hangs it) and fine-tune its position and rotation.
+- **Hide shoulder pads, capes and scarves** (VR tab): stops your shoulder-slot armour from blocking your view. Others still see it.
 
 To pick up a weapon from the ground, bring the correct hand close and squeeze the grip. Shields and bows use the off hand; ordinary melee weapons use the main hand. Pickup follows the game's inventory rules and can replace an occupied slot.
 
@@ -194,7 +214,7 @@ Releasing an ordinary weapon away from a holster tosses a visual copy that retur
 - **Two hands:** hold the main grip, bring the other hand near the shaft, and hold its grip. Your hand positions determine the weapon's direction.
 - **Slide a grip:** while holding with both hands, click and hold the weapon-hand stick and move that hand along the shaft. Release the click to fix the grip again.
 
-Weapon weight can make the weapon lag behind quick controller movements. Friendly fire is a separate setting: **My swings can hit friends and neutrals**. Missions that forbid friendly fire still take priority.
+Weapon weight can make the weapon lag behind quick controller movements. By default your swings only hit enemies; set `combat_friendly_fire = 1` in your personal config to hit friends and neutrals too. Missions that forbid friendly fire still take priority.
 
 ### Bow
 
@@ -217,6 +237,8 @@ Seating the bolt and spanning the string can happen in either order; both are re
 ### Throwing weapons
 
 Draw a javelin, throwing axe, knife, or other throwing weapon, hold the grip, then make a throwing motion and **release the grip**. Hand velocity determines the throw. A release that is too slow is treated as a drop rather than a damaging throw.
+
+**Slings do not work in VR yet.** They are hidden, and the chat tells you so.
 
 ## Movement, riding, and siege equipment
 
@@ -283,8 +305,10 @@ Open the panel with **End**, or click in both sticks for **1.5 seconds**. Point 
 | --- | --- |
 | Render | Stereo mode, resolution scale, sharpening, NVIDIA VRS and eye-tracking options |
 | Display | HUD size and placement, campaign-map VR, interface geometry, hit markers and pickup prompts |
-| Motion controls | Full physical combat, friendly fire, body holsters, hand calibration |
-| VR | Height and body fit, head offsets, body turning, and hand appearance |
+| Motion controls | Full physical combat, main hand, solid world, enemy physics, hand calibration |
+| Holsters | Holster mode, where each weapon hangs, two-handed swords on the shoulders |
+| Calibration tool | Weapon and hand poses, saved per item or class |
+| VR | Height and body fit, head offsets, body turning, hand appearance, hiding shoulder armour |
 
 ### Hand calibration
 
@@ -350,7 +374,8 @@ Keep the shipped default file with its build. Edit your **personal** file rather
 | --- | --- |
 | `controls_swap_trigger_grip = 1` | Grips hold items; index triggers serve firing / bumper actions |
 | `grip_hold = 1` | Hold to keep an item; release to stow, drop, or throw |
-| `holster = 1` | Enable body holsters |
+| `holster = 1` | Enable body holsters (`0` turns them off) |
+| `combat_friendly_fire = 0` | `1` lets your swings hit friends and neutrals |
 | `bow_manual = 1` | Manual arrow pickup, nocking, and drawing |
 | `xbow_manual = 1` | Manual crossbow loading and spanning |
 | `stereo_mode = nativestereo` | Default; alternatives are `afr` and `depth` |
