@@ -151,15 +151,7 @@ These instructions use the new build's shipped layout: `controls_swap_trigger_gr
 
 Face-button names above describe the equivalent button positions. PSVR2 can report as a Touch controller through SteamVR; use the game's Xbox prompts as the reference. Context actions follow Bannerlord's own gamepad bindings and can change if you rebind them.
 
-### Trigger/grip swap
 
-The new layout uses **grips for holding** and index triggers for firing or bumper actions. If your buttons behave the other way around, check your personal config:
-
-```ini
-controls_swap_trigger_grip = 1
-```
-
-Restart after changing it. With `0`, **swap grip and trigger throughout these instructions**, including holsters, bow drawing, menu shortcuts, and the gamepad mapping. Stick and face-button bindings stay the same.
 
 ### D-pad without a D-pad
 
@@ -172,7 +164,7 @@ Restart after changing it. With `0`, **swap grip and trigger throughout these in
 | Left | View character | Previous formation |
 | Right | Push-to-talk binding | Next formation |
 
-The left stick click also reaches the game as L3, so its normal action can occur when you start the chord. Moving the right stick cancels the recenter hold for that press. Set `dpad_chord = 0` to disable the chord, or `recenter_hold_seconds = 0` to disable controller recentering.
+
 
 ## Weapons and physical combat
 
