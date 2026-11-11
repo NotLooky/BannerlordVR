@@ -53,7 +53,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 ## Requirements and headset support
 
-- **Mount & Blade II: Bannerlord v1.4.8** (stable) or the **v1.5.6 beta**. Other game versions are not verified. Steam is the tested installation.
+- **Mount & Blade II: Bannerlord v1.4.8** (stable) or the **v1.5.7**. Other game versions are not verified. Steam is the tested installation.
 - **Windows 10 or 11, 64-bit**, with a PCVR-capable system.
 - **AMD graphics cards are not supported yet.** The game can crash or run very slowly on AMD.
 - **[Bannerlord.Harmony](https://www.nexusmods.com/mountandblade2bannerlord/mods/2006)** installed and enabled.
