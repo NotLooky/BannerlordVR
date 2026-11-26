@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.3.5 - 2026-11-26
+
+Alpha build for **Bannerlord v1.4.8** (stable), **v1.5.6** and **v1.5.7**. Expect bugs and crashes. AMD graphics cards are not supported yet.
+
+### Performance
+
+- Atsuko and I made many optimizations, and the game now runs much better, mostly in busy towns and big battles.
+- New **Foveated rendering** in VR Settings: the middle of your view stays sharp and the edges are drawn at lower resolution, for a much higher frame rate. On headsets with eye tracking, the sharp part follows your eyes. On some PCs it can crash; if it does, turn it off.
+- Changing the resolution or foveated rendering no longer needs a restart.
+- Fixed several crashes and freezes, and the log now says where a crash happened.
+
+### Gameplay
+
+- **VR tutorials** the first time you fight, sail, ride, use the map, a bow, a crossbow or a ladder.
+- **VR mode on/off** from VR Settings, any time, even mid-battle.
+- New **VR Settings** window in the game's own style, from the main menu and the pause menus.
+- Fists, shield bash and kicks land as real hits. Enemy weapons are solid, and parries bounce off.
+- Pull stuck arrows out by hand, and take arrows from the ground with your string hand.
+- Reverse grip, and a quick trigger click flips the weapon in your hand.
+- Flails swing for real, with chain and ball.
+- Ships: steer by hand with the tiller, throw the boarding hook, cut ropes, climb nets and ladders.
+- Smooth mounting and dismounting, and a smoother recentre.
+- A holster map shows where each weapon hangs. Daggers and one-handed weapons get better hip spots.
+- Quest 3, Steam Frame and Index button icons.
+- Campaign map: zoom with the grips, or with the index triggers (option in VR Settings). The map bar, army tab and chat sit in one panel.
+
 ## v0.3.1 - 2026-11-06
 
 Alpha build for **Bannerlord v1.4.8** (stable, Steam build 24573425) and the v1.5.6 beta.

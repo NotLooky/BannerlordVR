@@ -12,7 +12,7 @@ Disclaimer: The mod is build with the help of Claude Code.
 
 <img width="385" height="208" alt="14011-1791990474-1915983548" src="https://github.com/user-attachments/assets/53226c20-1bcf-4640-bd6b-77f784679401" />
 
-> **v0.3.1 (alpha).** Built for **Bannerlord v1.4.8** (stable, Steam build 24573425); also works on the **v1.5.6 beta**. Expect glitches, unfinished UI, and crashes. See the [changelog](CHANGELOG.md) for what is new.
+> **v0.3.5 (alpha).** Built for **Bannerlord v1.4.8** (stable, Steam build 24573425); also works on **v1.5.6** and **v1.5.7**. Expect glitches, unfinished UI, and crashes. See the [changelog](CHANGELOG.md) for what is new.
 
 ## Contents
 
@@ -49,7 +49,9 @@ Disclaimer: The mod is build with the help of Claude Code.
 - **Body tracking from head and hands:** body movement, arm IK, and room-scale movement without requiring external body trackers.
 - **Physical interactions:** horse reins, saddle mounting, ladder climbing, and siege controls.
 - **VR interface:** controller pointing, wrist HUD, campaign-map controls, and an in-headset settings panel.
-- **Rendering options:** AFR, native stereo, experimental depth reprojection, DLSS support, and optional NVIDIA variable rate shading.
+- **VR tutorials:** a short tour the first time you fight, sail, ride, use the map, a bow, a crossbow or a ladder.
+- **VR mode on/off:** turn VR off and on from VR Settings at any time, even mid-battle.
+- **Rendering options:** AFR, native stereo, experimental depth reprojection, DLSS support, foveated rendering (quad views), and optional NVIDIA variable rate shading.
 
 ## Requirements and headset support
 
@@ -76,7 +78,7 @@ Other headsets may work through SteamVR, but are unverified. Controllers with fe
 
 1. Check your Bannerlord version before installing.
 2. Install **Bannerlord.Harmony** and enable it in the launcher.
-3. Use the included **BannerlordVR-0.3.1.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
+3. Use the included **BannerlordVR-0.3.5.zip**, or download the matching build from [Releases](https://github.com/NotLooky/BannerlordVR/releases) once published. GitHub's **Code → Download ZIP** downloads source code, not an installable mod.
 4. Extract the release into your Bannerlord installation folder. The result should look like this:
 
    ```text
@@ -273,6 +275,8 @@ With the VR map enabled, point the right controller at terrain and press **A / C
 | Right index trigger | RB: fast-forward |
 | Left stick click | L3: camera follow mode |
 | Right stick click | R3: track settlement |
+
+To zoom with the index triggers instead, turn off **Zoom with the grips** in VR Settings > Interface. The grips then work as the bumpers.
 
 ### Army orders
 
